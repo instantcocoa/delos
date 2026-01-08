@@ -3,11 +3,19 @@ FROM golang:1.25-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
 
+# Install buf
+RUN go install github.com/bufbuild/buf/cmd/buf@v1.47.2
+
 WORKDIR /app
 
 # Copy go mod files
 COPY go.mod go.sum ./
 RUN go mod download
+
+# Copy proto files and generate code
+COPY buf.yaml buf.gen.yaml ./
+COPY proto/ proto/
+RUN buf generate
 
 # Copy source
 COPY . .
