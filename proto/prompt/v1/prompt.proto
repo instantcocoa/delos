@@ -1,0 +1,208 @@
+syntax = "proto3";
+
+package delos.prompt.v1;
+
+option go_package = "github.com/instantcocoa/delos/proto/prompt/v1;promptv1";
+
+import "google/protobuf/timestamp.proto";
+
+// PromptService manages prompt versioning and collaboration
+service PromptService {
+  // CreatePrompt creates a new prompt
+  rpc CreatePrompt(CreatePromptRequest) returns (CreatePromptResponse);
+
+  // GetPrompt retrieves a prompt by ID or reference
+  rpc GetPrompt(GetPromptRequest) returns (GetPromptResponse);
+
+  // UpdatePrompt creates a new version of an existing prompt
+  rpc UpdatePrompt(UpdatePromptRequest) returns (UpdatePromptResponse);
+
+  // ListPrompts returns all prompts with optional filtering
+  rpc ListPrompts(ListPromptsRequest) returns (ListPromptsResponse);
+
+  // DeletePrompt deletes a prompt (soft delete)
+  rpc DeletePrompt(DeletePromptRequest) returns (DeletePromptResponse);
+
+  // GetPromptHistory returns version history for a prompt
+  rpc GetPromptHistory(GetPromptHistoryRequest) returns (GetPromptHistoryResponse);
+
+  // CompareVersions performs semantic diff between versions
+  rpc CompareVersions(CompareVersionsRequest) returns (CompareVersionsResponse);
+
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// Prompt represents a versioned prompt template
+message Prompt {
+  string id = 1;
+  string name = 2;
+  string slug = 3;  // URL-friendly name (e.g., "summarizer")
+  int32 version = 4;
+  string description = 5;
+
+  // Template content
+  repeated PromptMessage messages = 6;
+
+  // Variables that can be interpolated
+  repeated PromptVariable variables = 7;
+
+  // Default generation parameters
+  GenerationConfig default_config = 8;
+
+  // Metadata
+  repeated string tags = 9;
+  map<string, string> metadata = 10;
+
+  // Audit
+  string created_by = 11;
+  google.protobuf.Timestamp created_at = 12;
+  string updated_by = 13;
+  google.protobuf.Timestamp updated_at = 14;
+
+  // Status
+  PromptStatus status = 15;
+}
+
+message PromptMessage {
+  string role = 1;  // system, user, assistant
+  string content = 2;  // can contain {{variable}} placeholders
+}
+
+message PromptVariable {
+  string name = 1;
+  string description = 2;
+  string type = 3;  // string, number, boolean, json
+  bool required = 4;
+  string default_value = 5;
+}
+
+message GenerationConfig {
+  double temperature = 1;
+  int32 max_tokens = 2;
+  double top_p = 3;
+  repeated string stop = 4;
+  string output_schema = 5;  // JSON schema for structured output
+}
+
+enum PromptStatus {
+  PROMPT_STATUS_UNSPECIFIED = 0;
+  PROMPT_STATUS_DRAFT = 1;
+  PROMPT_STATUS_ACTIVE = 2;
+  PROMPT_STATUS_DEPRECATED = 3;
+  PROMPT_STATUS_ARCHIVED = 4;
+}
+
+// CreatePrompt
+message CreatePromptRequest {
+  string name = 1;
+  string slug = 2;
+  string description = 3;
+  repeated PromptMessage messages = 4;
+  repeated PromptVariable variables = 5;
+  GenerationConfig default_config = 6;
+  repeated string tags = 7;
+  map<string, string> metadata = 8;
+}
+
+message CreatePromptResponse {
+  Prompt prompt = 1;
+}
+
+// GetPrompt
+message GetPromptRequest {
+  // Either id or reference (slug:version) can be used
+  string id = 1;
+  string reference = 2;  // e.g., "summarizer:v2" or "summarizer:latest"
+}
+
+message GetPromptResponse {
+  Prompt prompt = 1;
+}
+
+// UpdatePrompt
+message UpdatePromptRequest {
+  string id = 1;
+  string description = 2;
+  repeated PromptMessage messages = 3;
+  repeated PromptVariable variables = 4;
+  GenerationConfig default_config = 5;
+  repeated string tags = 6;
+  map<string, string> metadata = 7;
+  string change_description = 8;  // description of what changed
+}
+
+message UpdatePromptResponse {
+  Prompt prompt = 1;
+  int32 previous_version = 2;
+}
+
+// ListPrompts
+message ListPromptsRequest {
+  string search = 1;  // search in name/description
+  repeated string tags = 2;
+  PromptStatus status = 3;
+  int32 limit = 4;
+  int32 offset = 5;
+  string order_by = 6;  // created_at, updated_at, name
+  bool descending = 7;
+}
+
+message ListPromptsResponse {
+  repeated Prompt prompts = 1;
+  int32 total_count = 2;
+}
+
+// DeletePrompt
+message DeletePromptRequest {
+  string id = 1;
+}
+
+message DeletePromptResponse {
+  bool success = 1;
+}
+
+// GetPromptHistory
+message GetPromptHistoryRequest {
+  string id = 1;
+  int32 limit = 2;
+}
+
+message PromptVersion {
+  int32 version = 1;
+  string change_description = 2;
+  string updated_by = 3;
+  google.protobuf.Timestamp updated_at = 4;
+}
+
+message GetPromptHistoryResponse {
+  string prompt_id = 1;
+  repeated PromptVersion versions = 2;
+}
+
+// CompareVersions
+message CompareVersionsRequest {
+  string prompt_id = 1;
+  int32 version_a = 2;
+  int32 version_b = 3;
+}
+
+message VersionDiff {
+  string field = 1;
+  string old_value = 2;
+  string new_value = 3;
+  string diff_type = 4;  // added, removed, modified
+}
+
+message CompareVersionsResponse {
+  repeated VersionDiff diffs = 1;
+  double semantic_similarity = 2;  // 0-1 score of semantic similarity
+}
+
+// Health
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string version = 2;
+}

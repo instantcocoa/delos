@@ -1,0 +1,276 @@
+syntax = "proto3";
+
+package delos.deploy.v1;
+
+option go_package = "github.com/instantcocoa/delos/proto/deploy/v1;deployv1";
+
+import "google/protobuf/timestamp.proto";
+
+// DeployService manages safe deployments with quality gates
+service DeployService {
+  // CreateDeployment creates a new deployment
+  rpc CreateDeployment(CreateDeploymentRequest) returns (CreateDeploymentResponse);
+
+  // GetDeployment retrieves a deployment by ID
+  rpc GetDeployment(GetDeploymentRequest) returns (GetDeploymentResponse);
+
+  // ListDeployments returns deployments
+  rpc ListDeployments(ListDeploymentsRequest) returns (ListDeploymentsResponse);
+
+  // ApproveDeployment approves a pending deployment
+  rpc ApproveDeployment(ApproveDeploymentRequest) returns (ApproveDeploymentResponse);
+
+  // RollbackDeployment rolls back to a previous version
+  rpc RollbackDeployment(RollbackDeploymentRequest) returns (RollbackDeploymentResponse);
+
+  // CancelDeployment cancels a pending/in-progress deployment
+  rpc CancelDeployment(CancelDeploymentRequest) returns (CancelDeploymentResponse);
+
+  // GetDeploymentStatus gets real-time deployment status
+  rpc GetDeploymentStatus(GetDeploymentStatusRequest) returns (GetDeploymentStatusResponse);
+
+  // CreateQualityGate creates a quality gate configuration
+  rpc CreateQualityGate(CreateQualityGateRequest) returns (CreateQualityGateResponse);
+
+  // ListQualityGates lists quality gates for a prompt
+  rpc ListQualityGates(ListQualityGatesRequest) returns (ListQualityGatesResponse);
+
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// Deployment represents a prompt version deployment
+message Deployment {
+  string id = 1;
+
+  // What's being deployed
+  string prompt_id = 2;
+  int32 from_version = 3;
+  int32 to_version = 4;
+
+  // Target environment
+  string environment = 5;  // production, staging, etc.
+
+  // Strategy
+  DeploymentStrategy strategy = 6;
+
+  // Status
+  DeploymentStatus status = 7;
+  string status_message = 8;
+
+  // Quality gate results
+  repeated QualityGateResult gate_results = 9;
+  bool gates_passed = 10;
+
+  // Rollout progress (for gradual deployments)
+  RolloutProgress rollout = 11;
+
+  // Timing
+  google.protobuf.Timestamp created_at = 12;
+  google.protobuf.Timestamp started_at = 13;
+  google.protobuf.Timestamp completed_at = 14;
+
+  // Audit
+  string created_by = 15;
+  string approved_by = 16;
+  map<string, string> metadata = 17;
+}
+
+enum DeploymentStatus {
+  DEPLOYMENT_STATUS_UNSPECIFIED = 0;
+  DEPLOYMENT_STATUS_PENDING_APPROVAL = 1;
+  DEPLOYMENT_STATUS_PENDING_GATES = 2;
+  DEPLOYMENT_STATUS_GATES_FAILED = 3;
+  DEPLOYMENT_STATUS_IN_PROGRESS = 4;
+  DEPLOYMENT_STATUS_COMPLETED = 5;
+  DEPLOYMENT_STATUS_ROLLED_BACK = 6;
+  DEPLOYMENT_STATUS_CANCELLED = 7;
+  DEPLOYMENT_STATUS_FAILED = 8;
+}
+
+message DeploymentStrategy {
+  DeploymentType type = 1;
+
+  // For gradual rollouts
+  int32 initial_percentage = 2;  // starting traffic percentage
+  int32 increment = 3;           // percentage increase per step
+  int32 interval_seconds = 4;    // time between increments
+
+  // Auto-rollback settings
+  bool auto_rollback = 5;
+  double rollback_threshold = 6;  // quality score below which to rollback
+}
+
+enum DeploymentType {
+  DEPLOYMENT_TYPE_UNSPECIFIED = 0;
+  DEPLOYMENT_TYPE_IMMEDIATE = 1;   // switch all traffic at once
+  DEPLOYMENT_TYPE_GRADUAL = 2;     // gradually shift traffic
+  DEPLOYMENT_TYPE_CANARY = 3;      // small percentage first, then full
+  DEPLOYMENT_TYPE_BLUE_GREEN = 4;  // full parallel environment
+}
+
+message RolloutProgress {
+  int32 current_percentage = 1;
+  int32 target_percentage = 2;
+  google.protobuf.Timestamp last_increment_at = 3;
+  google.protobuf.Timestamp next_increment_at = 4;
+}
+
+// QualityGate defines conditions that must pass before deployment
+message QualityGate {
+  string id = 1;
+  string name = 2;
+  string prompt_id = 3;
+
+  // Gate conditions
+  repeated GateCondition conditions = 4;
+
+  // Whether this gate is required
+  bool required = 5;
+
+  // Audit
+  google.protobuf.Timestamp created_at = 6;
+  string created_by = 7;
+}
+
+message GateCondition {
+  string type = 1;  // eval_score, latency, cost, custom
+  string operator = 2;  // gte, lte, eq
+  double threshold = 3;
+  string eval_run_id = 4;  // for eval_score type
+  string dataset_id = 5;   // which dataset to evaluate against
+}
+
+message QualityGateResult {
+  string gate_id = 1;
+  string gate_name = 2;
+  bool passed = 3;
+  string message = 4;
+  repeated ConditionResult condition_results = 5;
+}
+
+message ConditionResult {
+  string type = 1;
+  double expected = 2;
+  double actual = 3;
+  bool passed = 4;
+}
+
+// CreateDeployment
+message CreateDeploymentRequest {
+  string prompt_id = 1;
+  int32 to_version = 2;  // version to deploy
+  string environment = 3;
+  DeploymentStrategy strategy = 4;
+  bool skip_approval = 5;  // auto-approve if gates pass
+  map<string, string> metadata = 6;
+}
+
+message CreateDeploymentResponse {
+  Deployment deployment = 1;
+}
+
+// GetDeployment
+message GetDeploymentRequest {
+  string id = 1;
+}
+
+message GetDeploymentResponse {
+  Deployment deployment = 1;
+}
+
+// ListDeployments
+message ListDeploymentsRequest {
+  string prompt_id = 1;
+  string environment = 2;
+  DeploymentStatus status = 3;
+  int32 limit = 4;
+  int32 offset = 5;
+}
+
+message ListDeploymentsResponse {
+  repeated Deployment deployments = 1;
+  int32 total_count = 2;
+}
+
+// ApproveDeployment
+message ApproveDeploymentRequest {
+  string id = 1;
+  string comment = 2;
+}
+
+message ApproveDeploymentResponse {
+  Deployment deployment = 1;
+}
+
+// RollbackDeployment
+message RollbackDeploymentRequest {
+  string id = 1;
+  string reason = 2;
+}
+
+message RollbackDeploymentResponse {
+  Deployment deployment = 1;
+  Deployment rollback_deployment = 2;  // the new deployment created for rollback
+}
+
+// CancelDeployment
+message CancelDeploymentRequest {
+  string id = 1;
+  string reason = 2;
+}
+
+message CancelDeploymentResponse {
+  Deployment deployment = 1;
+}
+
+// GetDeploymentStatus
+message GetDeploymentStatusRequest {
+  string id = 1;
+}
+
+message GetDeploymentStatusResponse {
+  DeploymentStatus status = 1;
+  RolloutProgress rollout = 2;
+  repeated QualityGateResult gate_results = 3;
+
+  // Real-time metrics during rollout
+  DeploymentMetrics current_metrics = 4;
+  DeploymentMetrics baseline_metrics = 5;
+}
+
+message DeploymentMetrics {
+  double avg_latency_ms = 1;
+  double error_rate = 2;
+  double quality_score = 3;
+  int32 request_count = 4;
+}
+
+// CreateQualityGate
+message CreateQualityGateRequest {
+  string name = 1;
+  string prompt_id = 2;
+  repeated GateCondition conditions = 3;
+  bool required = 4;
+}
+
+message CreateQualityGateResponse {
+  QualityGate quality_gate = 1;
+}
+
+// ListQualityGates
+message ListQualityGatesRequest {
+  string prompt_id = 1;
+}
+
+message ListQualityGatesResponse {
+  repeated QualityGate quality_gates = 1;
+}
+
+// Health
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string version = 2;
+}

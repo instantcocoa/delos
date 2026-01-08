@@ -1,0 +1,200 @@
+x-service-defaults: &service-defaults
+  env_file:
+    - .env
+    - .env.local
+  restart: unless-stopped
+
+services:
+  # Infrastructure
+  postgres:
+    image: postgres:15-alpine
+    container_name: delos-postgres
+    environment:
+      POSTGRES_USER: delos
+      POSTGRES_PASSWORD: delos
+      POSTGRES_DB: delos
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U delos"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: delos-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: delos-nats
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Delos Services
+  observe:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/observe/Dockerfile
+    container_name: delos-observe
+    ports:
+      - "9000:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  runtime:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/runtime/Dockerfile
+    container_name: delos-runtime
+    ports:
+      - "9001:9001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      observe:
+        condition: service_started
+
+  prompt:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/prompt/Dockerfile
+    container_name: delos-prompt
+    ports:
+      - "9002:9002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      observe:
+        condition: service_started
+
+  datasets:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/datasets/Dockerfile
+    container_name: delos-datasets
+    ports:
+      - "9003:9003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      observe:
+        condition: service_started
+      prompt:
+        condition: service_started
+
+  eval:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/eval/Dockerfile
+    container_name: delos-eval
+    ports:
+      - "9004:9004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      observe:
+        condition: service_started
+      runtime:
+        condition: service_started
+      prompt:
+        condition: service_started
+      datasets:
+        condition: service_started
+
+  deploy:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: services/deploy/Dockerfile
+    container_name: delos-deploy
+    ports:
+      - "9005:9005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      observe:
+        condition: service_started
+      eval:
+        condition: service_started
+
+  # Optional testing infrastructure
+  localstack:
+    image: localstack/localstack:3.0
+    container_name: delos-localstack
+    environment:
+      SERVICES: s3
+      DEBUG: 0
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "4566:4566"
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    profiles:
+      - test
+
+  # Optional observability
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    container_name: delos-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+    profiles:
+      - observability
+
+volumes:
+  postgres_data:
+  redis_data:
+  localstack_data:
+
+networks:
+  default:
+    name: delos-network

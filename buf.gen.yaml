@@ -1,0 +1,26 @@
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/instantcocoa/delos/gen/go
+plugins:
+  # Go code generation
+  - remote: buf.build/protocolbuffers/go
+    out: gen/go
+    opt:
+      - paths=source_relative
+
+  # Go gRPC code generation
+  - remote: buf.build/grpc/go
+    out: gen/go
+    opt:
+      - paths=source_relative
+
+  # Python code generation (for SDK)
+  - remote: buf.build/protocolbuffers/python
+    out: gen/python
+
+  # Python gRPC code generation
+  - remote: buf.build/grpc/python
+    out: gen/python

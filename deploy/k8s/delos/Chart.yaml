@@ -1,0 +1,23 @@
+apiVersion: v2
+name: delos
+description: Delos - Unified Infrastructure Platform for LLM Applications
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - llm
+  - ai
+  - infrastructure
+  - prompts
+  - evaluation
+maintainers:
+  - name: Delos Team
+dependencies:
+  - name: postgresql
+    version: "15.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: postgresql.enabled
+  - name: redis
+    version: "18.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: redis.enabled

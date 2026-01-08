@@ -1,0 +1,165 @@
+# Default values for Delos
+# This is a YAML-formatted file.
+
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+
+# Common settings for all services
+common:
+  image:
+    repository: delos
+    pullPolicy: IfNotPresent
+    tag: ""  # Defaults to Chart.appVersion
+
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  podAnnotations: {}
+  podSecurityContext: {}
+  securityContext: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Service-specific configurations
+services:
+  observe:
+    enabled: true
+    replicaCount: 2
+    port: 9000
+    resources: {}
+
+  runtime:
+    enabled: true
+    replicaCount: 3
+    port: 9001
+    resources:
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+    env:
+      - name: DELOS_RUNTIME_OPENAI_KEY
+        valueFrom:
+          secretKeyRef:
+            name: delos-secrets
+            key: openai-api-key
+            optional: true
+      - name: DELOS_RUNTIME_ANTHROPIC_KEY
+        valueFrom:
+          secretKeyRef:
+            name: delos-secrets
+            key: anthropic-api-key
+            optional: true
+
+  prompt:
+    enabled: true
+    replicaCount: 2
+    port: 9002
+    resources: {}
+
+  datasets:
+    enabled: true
+    replicaCount: 2
+    port: 9003
+    resources: {}
+
+  eval:
+    enabled: true
+    replicaCount: 2
+    port: 9004
+    resources:
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+  deploy:
+    enabled: true
+    replicaCount: 2
+    port: 9005
+    resources: {}
+
+# Database configuration
+database:
+  host: "delos-postgresql"
+  port: 5432
+  name: delos
+  user: delos
+  existingSecret: delos-db-credentials
+  existingSecretPasswordKey: password
+
+# Redis configuration
+redis:
+  host: "delos-redis-master"
+  port: 6379
+  existingSecret: ""
+  existingSecretPasswordKey: ""
+
+# PostgreSQL subchart
+postgresql:
+  enabled: true
+  auth:
+    username: delos
+    database: delos
+    existingSecret: delos-db-credentials
+    secretKeys:
+      userPasswordKey: password
+  primary:
+    persistence:
+      enabled: true
+      size: 10Gi
+
+# Redis subchart
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    enabled: false
+  master:
+    persistence:
+      enabled: true
+      size: 1Gi
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: delos.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Service account
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# Autoscaling
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Monitoring
+metrics:
+  enabled: true
+  port: 9090
+  serviceMonitor:
+    enabled: false
+    interval: 30s

@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "delos.fullname" . }}-config
+  labels:
+    {{- include "delos.labels" . | nindent 4 }}
+data:
+  DELOS_LOG_LEVEL: "info"
+  DELOS_DB_HOST: {{ .Values.database.host | quote }}
+  DELOS_DB_PORT: {{ .Values.database.port | quote }}
+  DELOS_DB_NAME: {{ .Values.database.name | quote }}
+  DELOS_DB_USER: {{ .Values.database.user | quote }}
+  DELOS_REDIS_URL: {{ include "delos.redisUrl" . | quote }}
+  DELOS_OBSERVE_ADDR: "{{ include "delos.fullname" . }}-observe:9000"
+  DELOS_RUNTIME_ADDR: "{{ include "delos.fullname" . }}-runtime:9001"
+  DELOS_PROMPT_ADDR: "{{ include "delos.fullname" . }}-prompt:9002"
+  DELOS_DATASETS_ADDR: "{{ include "delos.fullname" . }}-datasets:9003"
+  DELOS_EVAL_ADDR: "{{ include "delos.fullname" . }}-eval:9004"
+  DELOS_DEPLOY_ADDR: "{{ include "delos.fullname" . }}-deploy:9005"

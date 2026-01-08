@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS deployment_metrics;
+DROP TABLE IF EXISTS deployment_condition_results;
+DROP TABLE IF EXISTS deployment_gate_results;
+DROP TABLE IF EXISTS quality_gate_conditions;
+DROP TABLE IF EXISTS quality_gates;
+DROP TABLE IF EXISTS deployment_metadata;
+DROP TABLE IF EXISTS deployment_rollouts;
+DROP TABLE IF EXISTS deployment_strategies;
+DROP TABLE IF EXISTS deployments;

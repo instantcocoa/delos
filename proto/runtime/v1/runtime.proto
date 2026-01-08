@@ -1,0 +1,166 @@
+syntax = "proto3";
+
+package delos.runtime.v1;
+
+option go_package = "github.com/instantcocoa/delos/proto/runtime/v1;runtimev1";
+
+import "google/protobuf/struct.proto";
+
+// RuntimeService is the LLM Gateway - handles all LLM provider interactions
+service RuntimeService {
+  // Complete performs a completion request
+  rpc Complete(CompleteRequest) returns (CompleteResponse);
+
+  // CompleteStream performs a streaming completion request
+  rpc CompleteStream(CompleteStreamRequest) returns (stream CompleteStreamResponse);
+
+  // Embed generates embeddings for text
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+
+  // ListProviders returns available LLM providers
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// Message represents a chat message
+message Message {
+  string role = 1;  // system, user, assistant
+  string content = 2;
+  string name = 3;  // optional name for multi-party conversations
+}
+
+// RoutingStrategy determines how to select providers
+enum RoutingStrategy {
+  ROUTING_STRATEGY_UNSPECIFIED = 0;
+  ROUTING_STRATEGY_COST_OPTIMIZED = 1;
+  ROUTING_STRATEGY_LATENCY_OPTIMIZED = 2;
+  ROUTING_STRATEGY_QUALITY_OPTIMIZED = 3;
+  ROUTING_STRATEGY_SPECIFIC_PROVIDER = 4;
+}
+
+// CompletionParams contains shared parameters for completion requests
+message CompletionParams {
+  // Either use a prompt reference or provide messages directly
+  string prompt_ref = 1;  // e.g., "summarizer:v2.1"
+  repeated Message messages = 2;
+
+  // Template variables (used when prompt_ref is set)
+  map<string, string> variables = 3;
+
+  // Routing configuration
+  RoutingStrategy routing = 4;
+  string provider = 5;  // required if SPECIFIC_PROVIDER
+  string model = 6;     // optional override
+
+  // Generation parameters
+  double temperature = 7;
+  int32 max_tokens = 8;
+  double top_p = 9;
+  repeated string stop = 10;
+
+  // Response format
+  string output_schema = 11;  // JSON schema for structured output
+
+  // Caching
+  bool use_cache = 12;
+  int32 cache_ttl_seconds = 13;
+
+  // Metadata for tracking
+  map<string, string> metadata = 14;
+}
+
+// CompleteRequest for non-streaming completion
+message CompleteRequest {
+  CompletionParams params = 1;
+}
+
+// CompleteStreamRequest for streaming completion
+message CompleteStreamRequest {
+  CompletionParams params = 1;
+}
+
+message CompleteResponse {
+  string id = 1;
+  string content = 2;
+  Message message = 3;  // full message with role
+
+  // Structured output (if output_schema was provided)
+  google.protobuf.Struct structured_output = 4;
+
+  // Provider info
+  string provider = 5;
+  string model = 6;
+
+  // Usage
+  Usage usage = 7;
+
+  // Caching
+  bool cached = 8;
+
+  // Tracing
+  string trace_id = 9;
+}
+
+message CompleteStreamResponse {
+  string id = 1;
+  string delta = 2;  // incremental content
+  bool done = 3;
+
+  // Only populated on final message
+  Message message = 4;
+  Usage usage = 5;
+  string provider = 6;
+  string model = 7;
+  string trace_id = 8;
+}
+
+message Usage {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  int32 total_tokens = 3;
+  double cost_usd = 4;
+}
+
+// EmbedRequest
+message EmbedRequest {
+  repeated string texts = 1;
+  string model = 2;  // optional, defaults to best available
+  string provider = 3;  // optional
+}
+
+message EmbedResponse {
+  repeated Embedding embeddings = 1;
+  string model = 2;
+  string provider = 3;
+  Usage usage = 4;
+}
+
+message Embedding {
+  repeated float values = 1;
+  int32 dimensions = 2;
+}
+
+// ListProviders
+message ListProvidersRequest {}
+
+message Provider {
+  string name = 1;
+  repeated string models = 2;
+  bool available = 3;
+  map<string, double> cost_per_1k_tokens = 4;  // model -> cost
+}
+
+message ListProvidersResponse {
+  repeated Provider providers = 1;
+}
+
+// Health
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string version = 2;
+  map<string, bool> provider_status = 3;
+}

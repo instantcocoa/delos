@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package delos.observe.v1;
+
+option go_package = "github.com/instantcocoa/delos/proto/observe/v1;observev1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// ObserveService provides tracing and metrics functionality
+service ObserveService {
+  // Ingest traces from services
+  rpc IngestTraces(IngestTracesRequest) returns (IngestTracesResponse);
+
+  // Query traces by various filters
+  rpc QueryTraces(QueryTracesRequest) returns (QueryTracesResponse);
+
+  // Get a specific trace by ID
+  rpc GetTrace(GetTraceRequest) returns (GetTraceResponse);
+
+  // Query metrics
+  rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
+
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// Span represents a single operation in a trace
+message Span {
+  string trace_id = 1;
+  string span_id = 2;
+  string parent_span_id = 3;
+  string name = 4;
+  string service_name = 5;
+  google.protobuf.Timestamp start_time = 6;
+  google.protobuf.Duration duration = 7;
+  SpanStatus status = 8;
+  map<string, string> attributes = 9;
+  repeated SpanEvent events = 10;
+}
+
+message SpanEvent {
+  string name = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  map<string, string> attributes = 3;
+}
+
+enum SpanStatus {
+  SPAN_STATUS_UNSPECIFIED = 0;
+  SPAN_STATUS_OK = 1;
+  SPAN_STATUS_ERROR = 2;
+}
+
+message Trace {
+  string trace_id = 1;
+  repeated Span spans = 2;
+  google.protobuf.Timestamp start_time = 3;
+  google.protobuf.Duration duration = 4;
+  string root_service = 5;
+  string root_operation = 6;
+}
+
+// IngestTraces
+message IngestTracesRequest {
+  repeated Span spans = 1;
+}
+
+message IngestTracesResponse {
+  int32 accepted_count = 1;
+}
+
+// QueryTraces
+message QueryTracesRequest {
+  string service_name = 1;
+  string operation_name = 2;
+  google.protobuf.Timestamp start_time = 3;
+  google.protobuf.Timestamp end_time = 4;
+  google.protobuf.Duration min_duration = 5;
+  google.protobuf.Duration max_duration = 6;
+  map<string, string> tags = 7;
+  int32 limit = 8;
+  int32 offset = 9;
+}
+
+message QueryTracesResponse {
+  repeated Trace traces = 1;
+  int32 total_count = 2;
+}
+
+// GetTrace
+message GetTraceRequest {
+  string trace_id = 1;
+}
+
+message GetTraceResponse {
+  Trace trace = 1;
+}
+
+// QueryMetrics
+message QueryMetricsRequest {
+  string metric_name = 1;
+  string service_name = 2;
+  google.protobuf.Timestamp start_time = 3;
+  google.protobuf.Timestamp end_time = 4;
+  string aggregation = 5; // sum, avg, min, max, count
+  google.protobuf.Duration step = 6;
+}
+
+message MetricDataPoint {
+  google.protobuf.Timestamp timestamp = 1;
+  double value = 2;
+}
+
+message QueryMetricsResponse {
+  repeated MetricDataPoint data_points = 1;
+}
+
+// Health
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string version = 2;
+}

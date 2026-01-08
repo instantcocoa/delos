@@ -1,0 +1,366 @@
+syntax = "proto3";
+
+package delos.datasets.v1;
+
+option go_package = "github.com/instantcocoa/delos/proto/datasets/v1;datasetsv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// DatasetsService manages test datasets for evaluation
+service DatasetsService {
+  // CreateDataset creates a new dataset
+  rpc CreateDataset(CreateDatasetRequest) returns (CreateDatasetResponse);
+
+  // GetDataset retrieves a dataset by ID
+  rpc GetDataset(GetDatasetRequest) returns (GetDatasetResponse);
+
+  // UpdateDataset updates dataset metadata
+  rpc UpdateDataset(UpdateDatasetRequest) returns (UpdateDatasetResponse);
+
+  // ListDatasets returns all datasets
+  rpc ListDatasets(ListDatasetsRequest) returns (ListDatasetsResponse);
+
+  // DeleteDataset deletes a dataset
+  rpc DeleteDataset(DeleteDatasetRequest) returns (DeleteDatasetResponse);
+
+  // AddExamples adds examples to a dataset
+  rpc AddExamples(AddExamplesRequest) returns (AddExamplesResponse);
+
+  // GetExamples retrieves examples from a dataset
+  rpc GetExamples(GetExamplesRequest) returns (GetExamplesResponse);
+
+  // RemoveExamples removes examples from a dataset
+  rpc RemoveExamples(RemoveExamplesRequest) returns (RemoveExamplesResponse);
+
+  // GenerateExamples auto-generates examples using LLM
+  rpc GenerateExamples(GenerateExamplesRequest) returns (GenerateExamplesResponse);
+
+  // ImportExamples imports examples from external sources (CSV, S3, etc.)
+  rpc ImportExamples(ImportExamplesRequest) returns (ImportExamplesResponse);
+
+  // ExportExamples exports examples to various formats
+  rpc ExportExamples(ExportExamplesRequest) returns (ExportExamplesResponse);
+
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// Dataset represents a collection of test examples
+message Dataset {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+
+  // Link to prompt this dataset tests
+  string prompt_id = 4;
+
+  // Schema for examples
+  DatasetSchema schema = 5;
+
+  // Statistics
+  int32 example_count = 6;
+  google.protobuf.Timestamp last_updated = 7;
+
+  // Metadata
+  repeated string tags = 8;
+  map<string, string> metadata = 9;
+
+  // Versioning
+  int32 version = 10;
+
+  // Audit
+  string created_by = 11;
+  google.protobuf.Timestamp created_at = 12;
+}
+
+// DatasetSchema defines the structure of examples
+message DatasetSchema {
+  repeated SchemaField input_fields = 1;
+  repeated SchemaField expected_output_fields = 2;
+}
+
+message SchemaField {
+  string name = 1;
+  string type = 2;  // string, number, boolean, json, array
+  string description = 3;
+  bool required = 4;
+}
+
+// Example represents a single test case
+message Example {
+  string id = 1;
+  string dataset_id = 2;
+
+  // Input variables for the prompt
+  google.protobuf.Struct input = 3;
+
+  // Expected output for evaluation
+  google.protobuf.Struct expected_output = 4;
+
+  // Optional metadata
+  map<string, string> metadata = 5;
+
+  // Source of the example
+  ExampleSource source = 6;
+
+  // Audit
+  google.protobuf.Timestamp created_at = 7;
+}
+
+enum ExampleSource {
+  EXAMPLE_SOURCE_UNSPECIFIED = 0;
+  EXAMPLE_SOURCE_MANUAL = 1;
+  EXAMPLE_SOURCE_GENERATED = 2;
+  EXAMPLE_SOURCE_PRODUCTION = 3;  // captured from production
+  EXAMPLE_SOURCE_IMPORTED = 4;
+}
+
+// CreateDataset
+message CreateDatasetRequest {
+  string name = 1;
+  string description = 2;
+  string prompt_id = 3;
+  DatasetSchema schema = 4;
+  repeated string tags = 5;
+  map<string, string> metadata = 6;
+}
+
+message CreateDatasetResponse {
+  Dataset dataset = 1;
+}
+
+// GetDataset
+message GetDatasetRequest {
+  string id = 1;
+}
+
+message GetDatasetResponse {
+  Dataset dataset = 1;
+}
+
+// UpdateDataset
+message UpdateDatasetRequest {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  repeated string tags = 4;
+  map<string, string> metadata = 5;
+}
+
+message UpdateDatasetResponse {
+  Dataset dataset = 1;
+}
+
+// ListDatasets
+message ListDatasetsRequest {
+  string prompt_id = 1;  // filter by prompt
+  repeated string tags = 2;
+  string search = 3;
+  int32 limit = 4;
+  int32 offset = 5;
+}
+
+message ListDatasetsResponse {
+  repeated Dataset datasets = 1;
+  int32 total_count = 2;
+}
+
+// DeleteDataset
+message DeleteDatasetRequest {
+  string id = 1;
+}
+
+message DeleteDatasetResponse {
+  bool success = 1;
+}
+
+// AddExamples
+message AddExamplesRequest {
+  string dataset_id = 1;
+  repeated ExampleInput examples = 2;
+}
+
+message ExampleInput {
+  google.protobuf.Struct input = 1;
+  google.protobuf.Struct expected_output = 2;
+  map<string, string> metadata = 3;
+  ExampleSource source = 4;
+}
+
+message AddExamplesResponse {
+  int32 added_count = 1;
+  repeated Example examples = 2;
+}
+
+// GetExamples
+message GetExamplesRequest {
+  string dataset_id = 1;
+  int32 limit = 2;
+  int32 offset = 3;
+  bool shuffle = 4;  // return in random order
+}
+
+message GetExamplesResponse {
+  repeated Example examples = 1;
+  int32 total_count = 2;
+}
+
+// RemoveExamples
+message RemoveExamplesRequest {
+  string dataset_id = 1;
+  repeated string example_ids = 2;
+}
+
+message RemoveExamplesResponse {
+  int32 removed_count = 1;
+}
+
+// GenerateExamples
+message GenerateExamplesRequest {
+  string dataset_id = 1;
+  int32 count = 2;  // number of examples to generate
+  string generation_prompt = 3;  // instructions for generation
+  repeated Example seed_examples = 4;  // examples to use as seeds
+}
+
+message GenerateExamplesResponse {
+  repeated Example examples = 1;
+  int32 generated_count = 2;
+}
+
+// Health
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string version = 2;
+}
+
+// =============================================================================
+// Data Sources and Formats
+// =============================================================================
+
+// DataFormat specifies the format of external data
+enum DataFormat {
+  DATA_FORMAT_UNSPECIFIED = 0;
+  DATA_FORMAT_CSV = 1;         // Comma-separated values
+  DATA_FORMAT_JSONL = 2;       // JSON Lines (one JSON object per line)
+  DATA_FORMAT_PARQUET = 3;     // Apache Parquet columnar format
+  DATA_FORMAT_JSON = 4;        // Single JSON array
+}
+
+// DataSource specifies where external data is located
+message DataSource {
+  oneof source {
+    LocalFileSource local_file = 1;
+    S3Source s3 = 2;
+    GCSSource gcs = 3;
+    URLSource url = 4;
+    InlineSource inline = 5;
+  }
+}
+
+// LocalFileSource reads from local filesystem
+message LocalFileSource {
+  string path = 1;  // Path to file or directory
+}
+
+// S3Source reads from Amazon S3
+message S3Source {
+  string bucket = 1;
+  string key = 2;           // Object key or prefix
+  string region = 3;        // AWS region (optional, uses default if not set)
+  string endpoint = 4;      // Custom endpoint (for S3-compatible stores like MinIO)
+  string access_key_id = 5;     // Optional, uses default credentials if not set
+  string secret_access_key = 6; // Optional, uses default credentials if not set
+}
+
+// GCSSource reads from Google Cloud Storage
+message GCSSource {
+  string bucket = 1;
+  string object = 2;        // Object path or prefix
+  string project_id = 3;    // GCP project (optional)
+}
+
+// URLSource reads from an HTTP(S) URL
+message URLSource {
+  string url = 1;
+  map<string, string> headers = 2;  // Optional headers (e.g., Authorization)
+}
+
+// InlineSource provides data directly in the request
+message InlineSource {
+  bytes data = 1;           // Raw data bytes
+  DataFormat format = 2;    // Format of the data
+}
+
+// ColumnMapping maps source columns to dataset schema fields
+message ColumnMapping {
+  string source_column = 1;       // Column name in source data
+  string target_field = 2;        // Field name in dataset schema
+  bool is_input = 3;              // true = input field, false = expected_output field
+}
+
+// ImportExamples
+message ImportExamplesRequest {
+  string dataset_id = 1;
+  DataSource source = 2;
+  DataFormat format = 3;          // Format of the source data
+  repeated ColumnMapping column_mappings = 4;  // How to map columns to schema
+
+  // CSV-specific options
+  CSVOptions csv_options = 5;
+
+  // Processing options
+  bool skip_invalid = 6;          // Skip rows that fail validation
+  int32 max_rows = 7;             // Limit number of rows to import (0 = unlimited)
+}
+
+// CSVOptions contains CSV-specific parsing options
+message CSVOptions {
+  string delimiter = 1;           // Field delimiter (default: ",")
+  bool has_header = 2;            // First row is header (default: true)
+  string quote_char = 3;          // Quote character (default: "\"")
+  string escape_char = 4;         // Escape character (default: "\\")
+  string encoding = 5;            // Character encoding (default: "utf-8")
+}
+
+message ImportExamplesResponse {
+  int32 imported_count = 1;
+  int32 skipped_count = 2;
+  int32 error_count = 3;
+  repeated ImportError errors = 4;  // Details of first N errors
+}
+
+message ImportError {
+  int32 row_number = 1;
+  string error_message = 2;
+  string raw_data = 3;            // The problematic row data
+}
+
+// ExportExamples
+message ExportExamplesRequest {
+  string dataset_id = 1;
+  DataFormat format = 2;          // Desired output format
+
+  // Optional: export to external destination instead of returning inline
+  DataSource destination = 3;
+
+  // CSV-specific options
+  CSVOptions csv_options = 4;
+
+  // Filtering options
+  int32 limit = 5;
+  int32 offset = 6;
+}
+
+message ExportExamplesResponse {
+  // If destination was not provided, data is returned inline
+  bytes data = 1;
+  DataFormat format = 2;
+  int32 exported_count = 3;
+
+  // If destination was provided, location info is returned
+  string destination_uri = 4;     // e.g., "s3://bucket/key" or file path
+}

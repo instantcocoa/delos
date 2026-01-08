@@ -1,0 +1,7 @@
+DROP FUNCTION IF EXISTS cleanup_old_traces(INTEGER);
+DROP TABLE IF EXISTS metrics;
+DROP TABLE IF EXISTS span_event_attributes;
+DROP TABLE IF EXISTS span_events;
+DROP TABLE IF EXISTS span_attributes;
+DROP TABLE IF EXISTS spans;
+DROP TABLE IF EXISTS traces;

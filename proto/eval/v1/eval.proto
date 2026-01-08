@@ -1,0 +1,266 @@
+syntax = "proto3";
+
+package delos.eval.v1;
+
+option go_package = "github.com/instantcocoa/delos/proto/eval/v1;evalv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// EvalService runs evaluations and quality assessments
+service EvalService {
+  // CreateEvalRun creates and starts an evaluation run
+  rpc CreateEvalRun(CreateEvalRunRequest) returns (CreateEvalRunResponse);
+
+  // GetEvalRun retrieves an evaluation run by ID
+  rpc GetEvalRun(GetEvalRunRequest) returns (GetEvalRunResponse);
+
+  // ListEvalRuns returns evaluation runs
+  rpc ListEvalRuns(ListEvalRunsRequest) returns (ListEvalRunsResponse);
+
+  // CancelEvalRun cancels a running evaluation
+  rpc CancelEvalRun(CancelEvalRunRequest) returns (CancelEvalRunResponse);
+
+  // GetEvalResults retrieves detailed results for an eval run
+  rpc GetEvalResults(GetEvalResultsRequest) returns (GetEvalResultsResponse);
+
+  // CompareRuns compares two evaluation runs
+  rpc CompareRuns(CompareRunsRequest) returns (CompareRunsResponse);
+
+  // ListEvaluators returns available evaluator types
+  rpc ListEvaluators(ListEvaluatorsRequest) returns (ListEvaluatorsResponse);
+
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// EvalRun represents an evaluation execution
+message EvalRun {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+
+  // What to evaluate
+  string prompt_id = 4;
+  int32 prompt_version = 5;
+  string dataset_id = 6;
+
+  // Configuration
+  EvalConfig config = 7;
+
+  // Status
+  EvalRunStatus status = 8;
+  string error_message = 9;
+
+  // Progress
+  int32 total_examples = 10;
+  int32 completed_examples = 11;
+
+  // Results summary (populated when complete)
+  EvalSummary summary = 12;
+
+  // Timing
+  google.protobuf.Timestamp created_at = 13;
+  google.protobuf.Timestamp started_at = 14;
+  google.protobuf.Timestamp completed_at = 15;
+
+  // Metadata
+  string created_by = 16;
+  map<string, string> metadata = 17;
+}
+
+enum EvalRunStatus {
+  EVAL_RUN_STATUS_UNSPECIFIED = 0;
+  EVAL_RUN_STATUS_PENDING = 1;
+  EVAL_RUN_STATUS_RUNNING = 2;
+  EVAL_RUN_STATUS_COMPLETED = 3;
+  EVAL_RUN_STATUS_FAILED = 4;
+  EVAL_RUN_STATUS_CANCELLED = 5;
+}
+
+message EvalConfig {
+  // Evaluators to run
+  repeated EvaluatorConfig evaluators = 1;
+
+  // Runtime configuration
+  string provider = 2;  // which provider to use
+  string model = 3;     // which model to use
+  int32 concurrency = 4;  // parallel executions
+
+  // Sampling
+  int32 sample_size = 5;  // 0 = all examples
+  bool shuffle = 6;
+}
+
+message EvaluatorConfig {
+  string type = 1;  // exact_match, semantic_similarity, llm_judge, custom
+  string name = 2;  // display name
+  map<string, string> params = 3;  // evaluator-specific params
+  double weight = 4;  // weight in final score (default 1.0)
+}
+
+message EvalSummary {
+  double overall_score = 1;  // 0-1 weighted score
+  map<string, double> scores_by_evaluator = 2;
+  int32 passed_count = 3;
+  int32 failed_count = 4;
+  double pass_rate = 5;
+
+  // Cost/performance
+  double total_cost_usd = 6;
+  int32 total_tokens = 7;
+  double avg_latency_ms = 8;
+}
+
+// EvalResult represents a single example's evaluation
+message EvalResult {
+  string id = 1;
+  string eval_run_id = 2;
+  string example_id = 3;
+
+  // Input/Output
+  google.protobuf.Struct input = 4;
+  google.protobuf.Struct expected_output = 5;
+  google.protobuf.Struct actual_output = 6;
+
+  // Scores
+  map<string, EvaluatorResult> evaluator_results = 7;
+  double overall_score = 8;
+  bool passed = 9;
+
+  // Metadata
+  double latency_ms = 10;
+  int32 tokens_used = 11;
+  double cost_usd = 12;
+  string error = 13;
+}
+
+message EvaluatorResult {
+  string evaluator_type = 1;
+  double score = 2;  // 0-1
+  bool passed = 3;
+  string explanation = 4;
+  map<string, string> details = 5;
+}
+
+// CreateEvalRun
+message CreateEvalRunRequest {
+  string name = 1;
+  string description = 2;
+  string prompt_id = 3;
+  int32 prompt_version = 4;  // 0 = latest
+  string dataset_id = 5;
+  EvalConfig config = 6;
+  map<string, string> metadata = 7;
+}
+
+message CreateEvalRunResponse {
+  EvalRun eval_run = 1;
+}
+
+// GetEvalRun
+message GetEvalRunRequest {
+  string id = 1;
+}
+
+message GetEvalRunResponse {
+  EvalRun eval_run = 1;
+}
+
+// ListEvalRuns
+message ListEvalRunsRequest {
+  string prompt_id = 1;
+  string dataset_id = 2;
+  EvalRunStatus status = 3;
+  int32 limit = 4;
+  int32 offset = 5;
+}
+
+message ListEvalRunsResponse {
+  repeated EvalRun eval_runs = 1;
+  int32 total_count = 2;
+}
+
+// CancelEvalRun
+message CancelEvalRunRequest {
+  string id = 1;
+}
+
+message CancelEvalRunResponse {
+  EvalRun eval_run = 1;
+}
+
+// GetEvalResults
+message GetEvalResultsRequest {
+  string eval_run_id = 1;
+  bool failed_only = 2;
+  int32 limit = 3;
+  int32 offset = 4;
+}
+
+message GetEvalResultsResponse {
+  repeated EvalResult results = 1;
+  int32 total_count = 2;
+}
+
+// CompareRuns
+message CompareRunsRequest {
+  string run_id_a = 1;
+  string run_id_b = 2;
+}
+
+message RunComparison {
+  string run_id = 1;
+  string prompt_version = 2;
+  double overall_score = 3;
+  double pass_rate = 4;
+  double avg_latency_ms = 5;
+  double total_cost_usd = 6;
+}
+
+message ExampleComparison {
+  string example_id = 1;
+  double score_a = 2;
+  double score_b = 3;
+  double score_diff = 4;
+  bool regression = 5;  // true if B is worse than A
+}
+
+message CompareRunsResponse {
+  RunComparison run_a = 1;
+  RunComparison run_b = 2;
+  double score_diff = 3;
+  int32 regressions = 4;
+  int32 improvements = 5;
+  repeated ExampleComparison examples = 6;
+}
+
+// ListEvaluators
+message ListEvaluatorsRequest {}
+
+message Evaluator {
+  string type = 1;
+  string name = 2;
+  string description = 3;
+  repeated EvaluatorParam params = 4;
+}
+
+message EvaluatorParam {
+  string name = 1;
+  string type = 2;
+  string description = 3;
+  bool required = 4;
+  string default_value = 5;
+}
+
+message ListEvaluatorsResponse {
+  repeated Evaluator evaluators = 1;
+}
+
+// Health
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string version = 2;
+}
