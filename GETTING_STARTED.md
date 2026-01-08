@@ -15,6 +15,45 @@ docker --version
 docker-compose --version
 ```
 
+## Service Architecture
+
+### Service Ports
+
+| Service | Port | Description |
+|---------|------|-------------|
+| observe | 9000 | Tracing and metrics (foundation) |
+| runtime | 9001 | LLM provider gateway |
+| prompt | 9002 | Prompt versioning |
+| datasets | 9003 | Test data management |
+| eval | 9004 | Quality evaluation |
+| deploy | 9005 | Deployment orchestration |
+
+### Service Dependencies & Startup Order
+
+Services have the following dependency graph:
+
+```
+observe (no dependencies - start first)
+    ↑
+runtime ←→ prompt ←→ datasets
+    ↓         ↓         ↓
+         eval (depends on runtime, prompt, datasets)
+           ↓
+        deploy (depends on eval)
+```
+
+**Recommended startup order:**
+1. `observe` - Foundation service, no dependencies
+2. `runtime`, `prompt`, `datasets` - Core services (can start in parallel)
+3. `eval` - Depends on runtime for completions
+4. `deploy` - Depends on eval for quality gates
+
+**What happens if services start out of order?**
+- Services use gRPC with automatic reconnection
+- If a dependency isn't available, the service logs a warning but continues starting
+- Operations requiring missing dependencies will fail with `UNAVAILABLE` until the dependency comes up
+- No manual restart needed - connections auto-recover
+
 ## Option 1: Full Docker Setup (Recommended)
 
 This runs everything in containers - no local Go builds needed.
@@ -115,6 +154,47 @@ Open 6 terminal windows and run one service in each:
 ./bin/delos datasets list
 ./bin/delos eval evaluators
 ./bin/delos deploy list
+```
+
+## Database Migrations
+
+When using PostgreSQL storage backend, you need to run database migrations.
+
+### With Docker Compose (Automatic)
+
+If using Docker Compose, migrations run automatically on container startup.
+
+### Manual Migration (Local Development)
+
+```bash
+# Install golang-migrate CLI
+go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+
+# Set database URL
+export DELOS_DB_URL="postgres://delos:delos@localhost:5432/delos?sslmode=disable"
+
+# Run all migrations (all services share one database)
+migrate -path services/observe/migrations -database "$DELOS_DB_URL" up
+migrate -path services/prompt/migrations -database "$DELOS_DB_URL" up
+migrate -path services/datasets/migrations -database "$DELOS_DB_URL" up
+migrate -path services/eval/migrations -database "$DELOS_DB_URL" up
+migrate -path services/deploy/migrations -database "$DELOS_DB_URL" up
+```
+
+### Check Migration Status
+
+```bash
+migrate -path services/prompt/migrations -database "$DELOS_DB_URL" version
+```
+
+### Rollback Migrations
+
+```bash
+# Rollback last migration for a service
+migrate -path services/prompt/migrations -database "$DELOS_DB_URL" down 1
+
+# Rollback all migrations (dangerous!)
+migrate -path services/prompt/migrations -database "$DELOS_DB_URL" down
 ```
 
 ## Running Tests
