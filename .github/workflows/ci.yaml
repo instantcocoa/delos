@@ -41,7 +41,9 @@ jobs:
           # SA1019: deprecated API usage
           # S1016: type conversion style
           # SA4006: unused values (in test files)
-          staticcheck -checks="all,-ST1005,-SA1019,-S1016,-SA4006" ./...
+          # ST1000: package comments (generated code)
+          # SA9003: empty branches
+          staticcheck -checks="all,-ST1005,-SA1019,-S1016,-SA4006,-ST1000,-SA9003" ./...
 
   proto-lint:
     name: Proto Lint
