@@ -51,6 +51,13 @@ type Base struct {
 	// Tracing
 	TracingEnabled  bool
 	TracingSampling float64
+
+	// Service addresses (for inter-service communication)
+	RuntimeAddr  string
+	PromptAddr   string
+	DatasetsAddr string
+	EvalAddr     string
+	DeployAddr   string
 }
 
 // Load loads base configuration from environment variables.
@@ -80,6 +87,12 @@ func Load(serviceName string) (*Base, error) {
 
 		TracingEnabled:  getEnvBool("DELOS_TRACING_ENABLED", true),
 		TracingSampling: getEnvFloat("DELOS_TRACING_SAMPLING", 1.0),
+
+		RuntimeAddr:  getEnv("DELOS_RUNTIME_ENDPOINT", "localhost:9001"),
+		PromptAddr:   getEnv("DELOS_PROMPT_ENDPOINT", "localhost:9002"),
+		DatasetsAddr: getEnv("DELOS_DATASETS_ENDPOINT", "localhost:9003"),
+		EvalAddr:     getEnv("DELOS_EVAL_ENDPOINT", "localhost:9004"),
+		DeployAddr:   getEnv("DELOS_DEPLOY_ENDPOINT", "localhost:9005"),
 	}
 
 	return cfg, nil

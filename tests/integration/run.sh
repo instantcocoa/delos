@@ -57,6 +57,10 @@ while [[ $# -gt 0 ]]; do
             TEST_FILTER="-run TestCLI"
             shift
             ;;
+        ollama)
+            TEST_FILTER="-run TestOllama"
+            shift
+            ;;
         prompt|datasets|eval|deploy|runtime|observe)
             TEST_FILTER="-run Test$(echo $1 | sed 's/.*/\u&/')Service"
             shift
@@ -72,6 +76,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Test filters:"
             echo "  cli                  Run CLI tests only"
+            echo "  ollama               Run Ollama integration tests only"
             echo "  prompt               Run prompt service tests only"
             echo "  datasets             Run datasets service tests only"
             echo "  eval                 Run eval service tests only"
@@ -158,7 +163,17 @@ fi
 if [ -n "$DELOS_OPENAI_API_KEY" ] || [ -n "$DELOS_ANTHROPIC_API_KEY" ]; then
     echo -e "${GREEN}LLM API keys detected - completion tests will run${NC}"
 else
-    echo -e "${YELLOW}No LLM API keys - completion tests will be skipped${NC}"
+    echo -e "${YELLOW}No LLM API keys - cloud completion tests will be skipped${NC}"
+fi
+
+# Check for Ollama availability (port 11434)
+OLLAMA_HOST=${DELOS_RUNTIME_OLLAMA_URL:-"http://localhost:11434"}
+OLLAMA_PORT=${OLLAMA_HOST##*:}
+OLLAMA_PORT=${OLLAMA_PORT%%/*}
+if check_service "ollama" "localhost:$OLLAMA_PORT" 2>/dev/null; then
+    echo -e "${GREEN}Ollama detected - local LLM tests will run${NC}"
+else
+    echo -e "${YELLOW}Ollama not detected - local LLM tests will be skipped${NC}"
 fi
 echo ""
 

@@ -1,6 +1,7 @@
-.PHONY: all build test test-unit test-integration lint proto proto-lint proto-breaking up down clean help
+.PHONY: all build test test-unit test-integration test-ollama lint proto proto-lint proto-breaking up down clean help
 .PHONY: test-deps-up test-deps-wait
 .PHONY: run-runtime run-prompt run-datasets run-eval run-deploy run-observe run-all stop-all
+.PHONY: up-ollama ollama-pull ollama-ready
 
 # Variables
 SERVICES := runtime prompt datasets eval deploy observe
@@ -72,6 +73,32 @@ test-integration:
 test-integration-full:
 	@./tests/integration/run.sh --start-services
 
+# Run Ollama integration tests only
+test-ollama:
+	@./tests/integration/run.sh ollama
+
+# Start Ollama and wait for model to be ready
+up-ollama:
+	@echo "Starting Ollama..."
+	@docker-compose -f deploy/local/docker-compose.yaml up -d ollama
+	@echo "Waiting for Ollama to be healthy..."
+	@for i in $$(seq 1 30); do \
+		curl -sf http://localhost:11434/api/tags > /dev/null 2>&1 && break; \
+		sleep 2; \
+	done || (echo "Ollama not ready after 60s"; exit 1)
+	@echo "Ollama is ready. Pulling gemma3:4b model..."
+	@docker-compose -f deploy/local/docker-compose.yaml up ollama-init
+	@echo "Ollama setup complete!"
+
+# Pull gemma3 model (assumes Ollama is running)
+ollama-pull:
+	@echo "Pulling gemma3:4b model..."
+	@docker exec delos-ollama ollama pull gemma3:4b
+
+# Check if Ollama and model are ready
+ollama-ready:
+	@curl -sf http://localhost:11434/api/tags | grep -q "gemma3" && echo "Ollama ready with gemma3" || echo "Ollama or gemma3 not available"
+
 # Lint Go code
 lint: proto-lint
 	@golangci-lint run ./...
@@ -96,9 +123,9 @@ proto-breaking:
 proto-format:
 	@buf format -w
 
-# Start local infrastructure (PostgreSQL, Redis, NATS)
+# Start local infrastructure (PostgreSQL, Redis, NATS, Ollama)
 up:
-	@docker-compose -f deploy/local/docker-compose.yaml up -d postgres redis nats
+	@docker-compose -f deploy/local/docker-compose.yaml up -d postgres redis nats ollama ollama-init
 
 # Start all services via Docker Compose
 up-all:
@@ -206,7 +233,7 @@ help:
 	@echo "  make build-cli          Build CLI to bin/delos"
 	@echo ""
 	@echo "Running Services:"
-	@echo "  make up                 Start infrastructure (postgres, redis, nats)"
+	@echo "  make up                 Start infrastructure (postgres, redis, nats, ollama)"
 	@echo "  make up-all             Start all services via Docker Compose"
 	@echo "  make run-all            Run all services locally (background)"
 	@echo "  make stop-all           Stop services started by run-all"
@@ -218,12 +245,18 @@ help:
 	@echo "  make test               Run tests (starts postgres/redis/localstack)"
 	@echo "  make test-unit          Run tests without starting deps"
 	@echo "  make test-integration   Run integration tests (requires services)"
+	@echo "  make test-ollama        Run Ollama integration tests only"
 	@echo "  make test-coverage      Generate HTML coverage report"
 	@echo ""
 	@echo "Proto/Lint:"
 	@echo "  make proto              Generate code from proto files"
 	@echo "  make proto-lint         Lint proto files"
 	@echo "  make lint               Run Go and proto linters"
+	@echo ""
+	@echo "Ollama (Local LLM):"
+	@echo "  make up-ollama          Start Ollama and pull gemma3:4b model"
+	@echo "  make ollama-ready       Check if Ollama and model are ready"
+	@echo "  make ollama-pull        Pull gemma3:4b model (if Ollama running)"
 	@echo ""
 	@echo "Other:"
 	@echo "  make tools              Install dev tools (buf, golangci-lint)"

@@ -81,6 +81,8 @@ services:
         condition: service_healthy
       observe:
         condition: service_started
+      ollama:
+        condition: service_healthy
 
   prompt:
     <<: *service-defaults
@@ -156,6 +158,43 @@ services:
       eval:
         condition: service_started
 
+  # Local LLM (Ollama)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: delos-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Init container to pull gemma3 model
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: delos-ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama_data:/root/.ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Checking for gemma3:4b model..."
+        if ! OLLAMA_HOST=http://ollama:11434 ollama list | grep -q "gemma3:4b"; then
+          echo "Pulling gemma3:4b model (this may take a few minutes)..."
+          OLLAMA_HOST=http://ollama:11434 ollama pull gemma3:4b
+        else
+          echo "Model gemma3:4b already available"
+        fi
+        echo "Model ready!"
+    restart: "no"
+
   # Optional testing infrastructure
   localstack:
     image: localstack/localstack:3.0
@@ -194,6 +233,7 @@ volumes:
   postgres_data:
   redis_data:
   localstack_data:
+  ollama_data:
 
 networks:
   default:
