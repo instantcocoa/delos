@@ -13,8 +13,8 @@ import (
 )
 
 // schemaJSON is the published JSON Schema for the prompt file format. It is a
-// verbatim copy of docs/schemas/prompt.schema.json (enforced by a test) so that
-// go:embed can reach it and validation works offline.
+// verbatim copy of docs/schemas/prompt.schema.json (enforced by a test),
+// embedded so validation works offline.
 //
 //go:embed prompt.schema.json
 var schemaJSON []byte
