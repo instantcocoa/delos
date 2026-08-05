@@ -15,25 +15,22 @@ import (
 type mockProvider struct {
 	name           string
 	models         []string
-	available      bool
-	costPer1K      map[string]float64
 	completeResult *CompletionResult
 	completeErr    error
 	streamChunks   []StreamChunk
 	streamErr      error
 	embedResult    *EmbedResult
 	embedErr       error
+
+	lastParams *CompletionParams // captured on Complete/CompleteStream
 }
 
 func (m *mockProvider) Name() string { return m.name }
 
-func (m *mockProvider) Models() []string { return m.models }
-
-func (m *mockProvider) Available(ctx context.Context) bool { return m.available }
-
-func (m *mockProvider) CostPer1KTokens() map[string]float64 { return m.costPer1K }
+func (m *mockProvider) Models(ctx context.Context) []string { return m.models }
 
 func (m *mockProvider) Complete(ctx context.Context, params CompletionParams) (*CompletionResult, error) {
+	m.lastParams = &params
 	if m.completeErr != nil {
 		return nil, m.completeErr
 	}
@@ -41,6 +38,7 @@ func (m *mockProvider) Complete(ctx context.Context, params CompletionParams) (*
 }
 
 func (m *mockProvider) CompleteStream(ctx context.Context, params CompletionParams) (<-chan StreamChunk, error) {
+	m.lastParams = &params
 	if m.streamErr != nil {
 		return nil, m.streamErr
 	}
@@ -76,628 +74,193 @@ func newTestService(providers ...Provider) *RuntimeService {
 }
 
 // =============================================================================
-// RuntimeService Creation Tests
+// ResolveProvider
 // =============================================================================
 
-func TestNewRuntimeService(t *testing.T) {
-	registry := NewRegistry()
-	logger := newTestLogger()
+func TestResolveProvider(t *testing.T) {
+	openai := &mockProvider{name: "openai", models: []string{"gpt-4o"}}
+	anthropic := &mockProvider{name: "anthropic", models: []string{"claude-sonnet-4-5"}}
+	custom := &mockProvider{name: "local", models: []string{"my-model"}}
+	svc := newTestService(openai, anthropic, custom)
+	ctx := context.Background()
 
-	svc := NewRuntimeService(registry, logger)
-
-	if svc == nil {
-		t.Fatal("expected non-nil service")
+	cases := []struct {
+		model        string
+		wantProvider string
+		wantModel    string
+	}{
+		{"gpt-4o", "openai", "gpt-4o"},                        // exact listing
+		{"my-model", "local", "my-model"},                     // exact listing, custom provider
+		{"openai/whatever", "openai", "whatever"},             // provider prefix wins
+		{"anthropic/claude-x", "anthropic", "claude-x"},       // prefix strips
+		{"claude-brand-new", "anthropic", "claude-brand-new"}, // well-known prefix fallback
+		{"gpt-brand-new", "openai", "gpt-brand-new"},          // well-known prefix fallback
+		{"text-embedding-3-small", "openai", "text-embedding-3-small"},
 	}
-	if svc.registry != registry {
-		t.Error("registry not set correctly")
-	}
-}
-
-// =============================================================================
-// Complete Tests
-// =============================================================================
-
-func TestComplete_Success(t *testing.T) {
-	mockP := &mockProvider{
-		name:      "test-provider",
-		models:    []string{"test-model"},
-		available: true,
-		costPer1K: map[string]float64{"test-model": 0.001},
-		completeResult: &CompletionResult{
-			ID:       "test-id",
-			Content:  "Hello, world!",
-			Provider: "test-provider",
-			Model:    "test-model",
-			Usage:    Usage{TotalTokens: 10, CostUSD: 0.00001},
-		},
-	}
-
-	svc := newTestService(mockP)
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Provider: "test-provider",
-	}
-
-	result, err := svc.Complete(context.Background(), params)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if result.Content != "Hello, world!" {
-		t.Errorf("expected content 'Hello, world!', got '%s'", result.Content)
-	}
-	if result.Provider != "test-provider" {
-		t.Errorf("expected provider 'test-provider', got '%s'", result.Provider)
-	}
-}
-
-func TestComplete_ProviderError(t *testing.T) {
-	mockP := &mockProvider{
-		name:        "test-provider",
-		available:   true,
-		costPer1K:   map[string]float64{},
-		completeErr: errors.New("API rate limit exceeded"),
-	}
-
-	svc := newTestService(mockP)
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Provider: "test-provider",
-	}
-
-	_, err := svc.Complete(context.Background(), params)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !errors.Is(err, mockP.completeErr) && err.Error() != "completion failed: API rate limit exceeded" {
-		t.Errorf("unexpected error message: %v", err)
-	}
-}
-
-func TestComplete_ProviderNotFound(t *testing.T) {
-	svc := newTestService() // no providers
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Provider: "nonexistent",
-	}
-
-	_, err := svc.Complete(context.Background(), params)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if err.Error() != "provider not found: nonexistent" {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestComplete_NoProvidersAvailable(t *testing.T) {
-	mockP := &mockProvider{
-		name:      "test-provider",
-		available: false, // not available
-		costPer1K: map[string]float64{},
-	}
-
-	svc := newTestService(mockP)
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		// No provider specified, will try to auto-select
-	}
-
-	_, err := svc.Complete(context.Background(), params)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if err.Error() != "no providers available" {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestComplete_SpecificProviderNotAvailable(t *testing.T) {
-	mockP := &mockProvider{
-		name:      "test-provider",
-		available: false,
-		costPer1K: map[string]float64{},
-	}
-
-	svc := newTestService(mockP)
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Provider: "test-provider",
-		Routing:  RoutingSpecificProvider,
-	}
-
-	_, err := svc.Complete(context.Background(), params)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if err.Error() != "provider not available: test-provider" {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestComplete_SpecificProviderNoName(t *testing.T) {
-	svc := newTestService()
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Routing:  RoutingSpecificProvider,
-		// Provider name not set
-	}
-
-	_, err := svc.Complete(context.Background(), params)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if err.Error() != "provider name required for specific provider routing" {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-// =============================================================================
-// CompleteStream Tests
-// =============================================================================
-
-func TestCompleteStream_Success(t *testing.T) {
-	chunks := []StreamChunk{
-		{Delta: "Hello", Done: false},
-		{Delta: ", world!", Done: false},
-		{Delta: "", Done: true, Message: &Message{Role: "assistant", Content: "Hello, world!"}},
-	}
-
-	mockP := &mockProvider{
-		name:         "test-provider",
-		available:    true,
-		costPer1K:    map[string]float64{},
-		streamChunks: chunks,
-	}
-
-	svc := newTestService(mockP)
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Provider: "test-provider",
-	}
-
-	ch, err := svc.CompleteStream(context.Background(), params)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	var received []StreamChunk
-	for chunk := range ch {
-		received = append(received, chunk)
-	}
-
-	if len(received) != 3 {
-		t.Errorf("expected 3 chunks, got %d", len(received))
-	}
-	if received[0].Delta != "Hello" {
-		t.Errorf("expected first chunk 'Hello', got '%s'", received[0].Delta)
-	}
-}
-
-func TestCompleteStream_ProviderError(t *testing.T) {
-	mockP := &mockProvider{
-		name:      "test-provider",
-		available: true,
-		costPer1K: map[string]float64{},
-		streamErr: errors.New("stream initialization failed"),
-	}
-
-	svc := newTestService(mockP)
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Provider: "test-provider",
-	}
-
-	_, err := svc.CompleteStream(context.Background(), params)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-}
-
-// =============================================================================
-// Embed Tests
-// =============================================================================
-
-func TestEmbed_Success(t *testing.T) {
-	mockP := &mockProvider{
-		name:      "openai",
-		available: true,
-		costPer1K: map[string]float64{},
-		embedResult: &EmbedResult{
-			Embeddings: []Embedding{
-				{Values: []float32{0.1, 0.2, 0.3}, Dimensions: 3},
-			},
-			Model:    "text-embedding-3-small",
-			Provider: "openai",
-		},
-	}
-
-	svc := newTestService(mockP)
-
-	params := EmbedParams{
-		Texts: []string{"Hello, world!"},
-	}
-
-	result, err := svc.Embed(context.Background(), params)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(result.Embeddings) != 1 {
-		t.Errorf("expected 1 embedding, got %d", len(result.Embeddings))
-	}
-	if result.Embeddings[0].Dimensions != 3 {
-		t.Errorf("expected 3 dimensions, got %d", result.Embeddings[0].Dimensions)
-	}
-}
-
-func TestEmbed_SpecificProvider(t *testing.T) {
-	mockP := &mockProvider{
-		name:      "gemini",
-		available: true,
-		costPer1K: map[string]float64{},
-		embedResult: &EmbedResult{
-			Provider: "gemini",
-		},
-	}
-
-	svc := newTestService(mockP)
-
-	params := EmbedParams{
-		Texts:    []string{"Test"},
-		Provider: "gemini",
-	}
-
-	result, err := svc.Embed(context.Background(), params)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Provider != "gemini" {
-		t.Errorf("expected provider 'gemini', got '%s'", result.Provider)
-	}
-}
-
-func TestEmbed_ProviderNotFound(t *testing.T) {
-	svc := newTestService() // no providers
-
-	params := EmbedParams{
-		Texts:    []string{"Test"},
-		Provider: "nonexistent",
-	}
-
-	_, err := svc.Embed(context.Background(), params)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if err.Error() != "provider not found: nonexistent" {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestEmbed_NoEmbeddingProvider(t *testing.T) {
-	// No openai provider registered (default for embeddings)
-	mockP := &mockProvider{
-		name:      "anthropic", // doesn't support embeddings
-		available: true,
-		costPer1K: map[string]float64{},
-	}
-
-	svc := newTestService(mockP)
-
-	params := EmbedParams{
-		Texts: []string{"Test"},
-		// No provider specified, will try to default to openai
-	}
-
-	_, err := svc.Embed(context.Background(), params)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if err.Error() != "no embedding provider available" {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestEmbed_ProviderError(t *testing.T) {
-	mockP := &mockProvider{
-		name:      "openai",
-		available: true,
-		costPer1K: map[string]float64{},
-		embedErr:  errors.New("embedding failed"),
-	}
-
-	svc := newTestService(mockP)
-
-	params := EmbedParams{
-		Texts: []string{"Test"},
-	}
-
-	_, err := svc.Embed(context.Background(), params)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-}
-
-// =============================================================================
-// ListProviders Tests
-// =============================================================================
-
-func TestListProviders_Empty(t *testing.T) {
-	svc := newTestService()
-
-	providers := svc.ListProviders(context.Background())
-
-	if len(providers) != 0 {
-		t.Errorf("expected 0 providers, got %d", len(providers))
-	}
-}
-
-func TestListProviders_Multiple(t *testing.T) {
-	mock1 := &mockProvider{
-		name:      "provider1",
-		models:    []string{"model1", "model2"},
-		available: true,
-		costPer1K: map[string]float64{"model1": 0.001},
-	}
-	mock2 := &mockProvider{
-		name:      "provider2",
-		models:    []string{"model3"},
-		available: false,
-		costPer1K: map[string]float64{"model3": 0.002},
-	}
-
-	svc := newTestService(mock1, mock2)
-
-	providers := svc.ListProviders(context.Background())
-
-	if len(providers) != 2 {
-		t.Errorf("expected 2 providers, got %d", len(providers))
-	}
-
-	// Check first provider
-	found := false
-	for _, p := range providers {
-		if p.Name == "provider1" {
-			found = true
-			if !p.Available {
-				t.Error("provider1 should be available")
-			}
-			if len(p.Models) != 2 {
-				t.Errorf("provider1 should have 2 models, got %d", len(p.Models))
-			}
+	for _, tc := range cases {
+		p, model, err := svc.ResolveProvider(ctx, tc.model)
+		if err != nil {
+			t.Errorf("ResolveProvider(%q) error: %v", tc.model, err)
+			continue
+		}
+		if p.Name() != tc.wantProvider || model != tc.wantModel {
+			t.Errorf("ResolveProvider(%q) = (%s, %s), want (%s, %s)",
+				tc.model, p.Name(), model, tc.wantProvider, tc.wantModel)
 		}
 	}
-	if !found {
-		t.Error("provider1 not found in list")
+}
+
+func TestResolveProviderNotFound(t *testing.T) {
+	svc := newTestService(&mockProvider{name: "openai", models: []string{"gpt-4o"}})
+	if _, _, err := svc.ResolveProvider(context.Background(), "unknown-model"); err == nil {
+		t.Fatal("expected error for unknown model")
+	}
+	// well-known prefix but provider not registered
+	if _, _, err := svc.ResolveProvider(context.Background(), "gemini-2.5-flash"); err == nil {
+		t.Fatal("expected error for unregistered provider")
 	}
 }
 
 // =============================================================================
-// Provider Selection Tests
+// Complete / CompleteStream / Embed pass-through
 // =============================================================================
 
-func TestSelectProvider_CostOptimized(t *testing.T) {
-	expensive := &mockProvider{
-		name:      "expensive",
-		available: true,
-		costPer1K: map[string]float64{"model": 0.01},
+func TestServiceComplete(t *testing.T) {
+	p := &mockProvider{
+		name:   "openai",
+		models: []string{"gpt-4o"},
+		completeResult: &CompletionResult{
+			Message:      TextMessage("assistant", "hello"),
+			FinishReason: FinishStop,
+			Provider:     "openai",
+			Model:        "gpt-4o",
+			Usage:        Usage{TotalTokens: 10},
+		},
 	}
-	cheap := &mockProvider{
-		name:      "cheap",
-		available: true,
-		costPer1K: map[string]float64{"model": 0.001},
-	}
+	svc := newTestService(p)
 
-	svc := newTestService(expensive, cheap)
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Routing:  RoutingCostOptimized,
-	}
-
-	// Use Complete to trigger provider selection
-	cheap.completeResult = &CompletionResult{Provider: "cheap"}
-
-	result, err := svc.Complete(context.Background(), params)
+	result, err := svc.Complete(context.Background(), p, CompletionParams{
+		Messages: []Message{TextMessage("user", "hi")},
+		Model:    "gpt-4o",
+	})
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("Complete failed: %v", err)
 	}
-	if result.Provider != "cheap" {
-		t.Errorf("expected cheap provider, got '%s'", result.Provider)
+	if result.Text() != "hello" {
+		t.Errorf("Text() = %q", result.Text())
+	}
+	if p.lastParams == nil || p.lastParams.Model != "gpt-4o" {
+		t.Errorf("params not passed through: %+v", p.lastParams)
 	}
 }
 
-func TestSelectProvider_QualityOptimized_PrefersAnthropic(t *testing.T) {
-	openai := &mockProvider{
-		name:           "openai",
-		available:      true,
-		costPer1K:      map[string]float64{},
-		completeResult: &CompletionResult{Provider: "openai"},
-	}
-	anthropic := &mockProvider{
-		name:           "anthropic",
-		available:      true,
-		costPer1K:      map[string]float64{},
-		completeResult: &CompletionResult{Provider: "anthropic"},
-	}
+func TestServiceCompleteError(t *testing.T) {
+	wantErr := &ProviderError{Provider: "openai", StatusCode: 429, Message: "rate limited"}
+	p := &mockProvider{name: "openai", completeErr: wantErr}
+	svc := newTestService(p)
 
-	svc := newTestService(openai, anthropic)
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Routing:  RoutingQualityOptimized,
-	}
-
-	result, err := svc.Complete(context.Background(), params)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Provider != "anthropic" {
-		t.Errorf("expected anthropic for quality routing, got '%s'", result.Provider)
-	}
-}
-
-func TestSelectProvider_QualityOptimized_FallbackToOpenAI(t *testing.T) {
-	openai := &mockProvider{
-		name:           "openai",
-		available:      true,
-		costPer1K:      map[string]float64{},
-		completeResult: &CompletionResult{Provider: "openai"},
-	}
-
-	svc := newTestService(openai)
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Routing:  RoutingQualityOptimized,
-	}
-
-	result, err := svc.Complete(context.Background(), params)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Provider != "openai" {
-		t.Errorf("expected openai fallback, got '%s'", result.Provider)
-	}
-}
-
-func TestSelectProvider_LatencyOptimized(t *testing.T) {
-	mockP := &mockProvider{
-		name:           "fast-provider",
-		available:      true,
-		costPer1K:      map[string]float64{},
-		completeResult: &CompletionResult{Provider: "fast-provider"},
-	}
-
-	svc := newTestService(mockP)
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Routing:  RoutingLatencyOptimized,
-	}
-
-	result, err := svc.Complete(context.Background(), params)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Provider != "fast-provider" {
-		t.Errorf("expected fast-provider, got '%s'", result.Provider)
-	}
-}
-
-func TestSelectCheapest_WithSpecificModel(t *testing.T) {
-	p1 := &mockProvider{
-		name:      "p1",
-		available: true,
-		costPer1K: map[string]float64{"gpt-4": 0.03, "gpt-3.5": 0.001},
-	}
-	p2 := &mockProvider{
-		name:      "p2",
-		available: true,
-		costPer1K: map[string]float64{"gpt-4": 0.02}, // cheaper for gpt-4
-	}
-
-	svc := newTestService(p1, p2)
-	p2.completeResult = &CompletionResult{Provider: "p2"}
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Model:    "gpt-4",
-		Routing:  RoutingCostOptimized,
-	}
-
-	result, err := svc.Complete(context.Background(), params)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Provider != "p2" {
-		t.Errorf("expected p2 (cheaper for gpt-4), got '%s'", result.Provider)
-	}
-}
-
-// =============================================================================
-// Context Cancellation Tests
-// =============================================================================
-
-func TestComplete_ContextCancelled(t *testing.T) {
-	mockP := &mockProvider{
-		name:        "test-provider",
-		available:   true,
-		costPer1K:   map[string]float64{},
-		completeErr: context.Canceled,
-	}
-
-	svc := newTestService(mockP)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Provider: "test-provider",
-	}
-
-	_, err := svc.Complete(ctx, params)
+	_, err := svc.Complete(context.Background(), p, CompletionParams{Model: "gpt-4o"})
 	if err == nil {
-		t.Fatal("expected error, got nil")
+		t.Fatal("expected error")
+	}
+	var pe *ProviderError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected ProviderError passthrough, got %T: %v", err, err)
+	}
+	if !pe.Retryable() {
+		t.Error("429 should be retryable")
+	}
+}
+
+func TestServiceCompleteStream(t *testing.T) {
+	p := &mockProvider{
+		name: "openai",
+		streamChunks: []StreamChunk{
+			{Delta: "he"},
+			{Delta: "llo"},
+			{Done: true, FinishReason: FinishStop},
+		},
+	}
+	svc := newTestService(p)
+
+	chunks, err := svc.CompleteStream(context.Background(), p, CompletionParams{Model: "gpt-4o"})
+	if err != nil {
+		t.Fatalf("CompleteStream failed: %v", err)
+	}
+	text := ""
+	var done bool
+	for c := range chunks {
+		text += c.Delta
+		if c.Done {
+			done = true
+		}
+	}
+	if text != "hello" || !done {
+		t.Errorf("stream text=%q done=%v", text, done)
+	}
+}
+
+func TestServiceEmbed(t *testing.T) {
+	p := &mockProvider{
+		name: "openai",
+		embedResult: &EmbedResult{
+			Embeddings: []Embedding{{Values: []float32{1, 2}, Dimensions: 2}},
+		},
+	}
+	svc := newTestService(p)
+
+	result, err := svc.Embed(context.Background(), p, EmbedParams{Texts: []string{"x"}, Model: "text-embedding-3-small"})
+	if err != nil {
+		t.Fatalf("Embed failed: %v", err)
+	}
+	if len(result.Embeddings) != 1 {
+		t.Errorf("embeddings = %v", result.Embeddings)
 	}
 }
 
 // =============================================================================
-// Edge Cases
+// ListProviders / Registry
 // =============================================================================
 
-func TestComplete_EmptyMessages(t *testing.T) {
-	mockP := &mockProvider{
-		name:           "test-provider",
-		available:      true,
-		costPer1K:      map[string]float64{},
-		completeResult: &CompletionResult{Content: "response"},
+func TestListProviders(t *testing.T) {
+	svc := newTestService(
+		&mockProvider{name: "openai", models: []string{"gpt-4o"}},
+		&mockProvider{name: "anthropic", models: []string{"claude-sonnet-4-5"}},
+	)
+	infos := svc.ListProviders(context.Background())
+	if len(infos) != 2 {
+		t.Fatalf("got %d providers", len(infos))
 	}
-
-	svc := newTestService(mockP)
-
-	params := CompletionParams{
-		Messages: []Message{}, // empty
-		Provider: "test-provider",
-	}
-
-	// Should still work - provider handles validation
-	_, err := svc.Complete(context.Background(), params)
-	if err != nil {
-		t.Errorf("unexpected error with empty messages: %v", err)
+	// registration order is preserved
+	if infos[0].Name != "openai" || infos[1].Name != "anthropic" {
+		t.Errorf("order = %s, %s", infos[0].Name, infos[1].Name)
 	}
 }
 
-func TestSelectCheapest_NoCostsConfigured(t *testing.T) {
-	mockP := &mockProvider{
-		name:           "test-provider",
-		available:      true,
-		costPer1K:      map[string]float64{}, // empty costs
-		completeResult: &CompletionResult{Provider: "test-provider"},
+func TestRegistryReplace(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&mockProvider{name: "openai", models: []string{"a"}})
+	r.Register(&mockProvider{name: "openai", models: []string{"b"}})
+	if len(r.List()) != 1 {
+		t.Fatalf("re-registration must replace, got %d providers", len(r.List()))
 	}
-
-	svc := newTestService(mockP)
-
-	params := CompletionParams{
-		Messages: []Message{{Role: "user", Content: "Hi"}},
-		Routing:  RoutingCostOptimized,
+	p, _ := r.Get("openai")
+	if p.Models(context.Background())[0] != "b" {
+		t.Error("latest registration should win")
 	}
+}
 
-	// Should fall back to first provider
-	result, err := svc.Complete(context.Background(), params)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Provider != "test-provider" {
-		t.Errorf("expected test-provider fallback, got '%s'", result.Provider)
+// =============================================================================
+// Message helpers
+// =============================================================================
+
+func TestMessageText(t *testing.T) {
+	m := Message{Role: "user", Content: []ContentPart{
+		TextPart("a"),
+		{Type: "image", ImageURL: "http://x/y.png"},
+		TextPart("b"),
+	}}
+	if m.Text() != "ab" {
+		t.Errorf("Text() = %q", m.Text())
 	}
 }

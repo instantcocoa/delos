@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -20,6 +21,10 @@ const (
 
 // Base contains common configuration shared by all services.
 type Base struct {
+	// ConfigPath is the delos.yaml that contributed to this configuration,
+	// or "" when none was found.
+	ConfigPath string
+
 	// Service identification
 	ServiceName string
 	Environment string // development, staging, production
@@ -58,44 +63,143 @@ type Base struct {
 	DatasetsAddr string
 	EvalAddr     string
 	DeployAddr   string
+
+	// Control plane
+	Port int // `delos serve` listen port (DELOS_PORT)
+
+	// Gateway (data plane)
+	GatewayPort    int           // DELOS_GATEWAY_PORT
+	GatewayURL     string        // DELOS_GATEWAY_URL - how clients reach the gateway
+	RequestTimeout time.Duration // DELOS_REQUEST_TIMEOUT, end-to-end budget
+	CacheEnabled   bool          // DELOS_CACHE=off disables
+	CacheTTL       time.Duration // DELOS_CACHE_TTL
+	CacheRedisURL  string        // DELOS_REDIS_URL; empty means in-process LRU
+	// Routes maps a model alias to an ordered fallback chain of
+	// provider/model targets. Set from the config file; DELOS_ROUTES (JSON)
+	// overrides it and is exposed as RoutesJSON.
+	Routes     map[string][]string
+	RoutesJSON string
+
+	// Telemetry
+	OTLPEndpoint string // DELOS_OTLP_ENDPOINT
+	OTLPProtocol string // DELOS_OTLP_PROTOCOL: http | grpc
+	TraceStdout  bool   // DELOS_TRACE_STDOUT
+	TraceContent bool   // DELOS_TRACE_CONTENT - prompt/completion capture
+	TraceRedact  string // DELOS_TRACE_REDACT - comma-separated regexes
 }
 
-// Load loads base configuration from environment variables.
+// Load loads configuration with precedence: environment variable > delos.yaml
+// > built-in default. The file is optional; it is located via DELOS_CONFIG or
+// ./delos.yaml. A malformed file is an error - it is never silently ignored.
 func Load(serviceName string) (*Base, error) {
+	path := DiscoverFilePath()
+	var f *File
+	if path != "" {
+		loaded, err := LoadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if problems := loaded.Validate(); len(problems) > 0 {
+			msgs := make([]string, 0, len(problems))
+			for _, p := range problems {
+				msgs = append(msgs, p.String())
+			}
+			return nil, fmt.Errorf("%s is invalid: %s (run `delos config validate` for details)",
+				path, strings.Join(msgs, "; "))
+		}
+		f = loaded
+	}
+	return loadWith(serviceName, path, f)
+}
+
+// loadWith applies the precedence rules against an already-parsed file (which
+// may be nil).
+func loadWith(serviceName, path string, f *File) (*Base, error) {
+	if f == nil {
+		f = &File{}
+	}
+	db := f.Database
+	if db == nil {
+		db = &DatabaseFile{}
+	}
+	gw := f.Gateway
+	if gw == nil {
+		gw = &GatewayFile{}
+	}
+	cache := gw.Cache
+	if cache == nil {
+		cache = &CacheFile{}
+	}
+	tel := f.Telemetry
+	if tel == nil {
+		tel = &TelemetryFile{}
+	}
+
 	cfg := &Base{
+		ConfigPath:  path,
 		ServiceName: serviceName,
-		Environment: getEnv("DELOS_ENV", "development"),
-		Version:     getEnv("DELOS_VERSION", "dev"),
+		Environment: fileStr("DELOS_ENV", f.Env, "development"),
+		Version:     fileStr("DELOS_VERSION", f.Version, "dev"),
 
 		GRPCPort: getEnvInt("DELOS_GRPC_PORT", 9000),
 		HTTPPort: getEnvInt("DELOS_HTTP_PORT", 8080),
 
-		StorageBackend: parseStorageBackend(getEnv("DELOS_STORAGE_BACKEND", "memory")),
+		StorageBackend: parseStorageBackend(fileStr("DELOS_STORAGE_BACKEND", f.Storage, "memory")),
 
-		DBHost:     getEnv("DELOS_DB_HOST", "localhost"),
-		DBPort:     getEnvInt("DELOS_DB_PORT", 5432),
-		DBUser:     getEnv("DELOS_DB_USER", "delos"),
+		DBHost: fileStr("DELOS_DB_HOST", db.Host, "localhost"),
+		DBPort: fileInt("DELOS_DB_PORT", db.Port, 5432),
+		DBUser: fileStr("DELOS_DB_USER", db.User, "delos"),
+		// Passwords are env-only on purpose; they do not belong in delos.yaml.
 		DBPassword: getEnv("DELOS_DB_PASSWORD", ""),
-		DBName:     getEnv("DELOS_DB_NAME", "delos"),
-		DBSSLMode:  getEnv("DELOS_DB_SSLMODE", "disable"),
+		DBName:     fileStr("DELOS_DB_NAME", db.Name, "delos"),
+		DBSSLMode:  fileStr("DELOS_DB_SSLMODE", db.SSLMode, "disable"),
 
 		RedisURL: getEnv("DELOS_REDIS_URL", "redis://localhost:6379"),
 
 		ObserveEndpoint: getEnv("DELOS_OBSERVE_ENDPOINT", "localhost:9000"),
-		LogLevel:        getEnv("DELOS_LOG_LEVEL", "info"),
-		LogFormat:       getEnv("DELOS_LOG_FORMAT", "json"),
+		LogLevel:        fileStr("DELOS_LOG_LEVEL", f.LogLevel, "info"),
+		LogFormat:       fileStr("DELOS_LOG_FORMAT", f.LogFormat, "json"),
 
 		TracingEnabled:  getEnvBool("DELOS_TRACING_ENABLED", true),
-		TracingSampling: getEnvFloat("DELOS_TRACING_SAMPLING", 1.0),
+		TracingSampling: fileFloat("DELOS_TRACING_SAMPLING", tel.Sampling, 1.0),
 
 		RuntimeAddr:  getEnv("DELOS_RUNTIME_ENDPOINT", "localhost:9001"),
 		PromptAddr:   getEnv("DELOS_PROMPT_ENDPOINT", "localhost:9002"),
 		DatasetsAddr: getEnv("DELOS_DATASETS_ENDPOINT", "localhost:9003"),
 		EvalAddr:     getEnv("DELOS_EVAL_ENDPOINT", "localhost:9004"),
 		DeployAddr:   getEnv("DELOS_DEPLOY_ENDPOINT", "localhost:9005"),
+
+		Port: fileInt("DELOS_PORT", f.Port, 8081),
+
+		GatewayPort:    fileInt("DELOS_GATEWAY_PORT", gw.Port, 8080),
+		GatewayURL:     fileStr("DELOS_GATEWAY_URL", gw.URL, "http://localhost:8080"),
+		RequestTimeout: fileDuration("DELOS_REQUEST_TIMEOUT", gw.RequestTimeout, 5*time.Minute),
+		CacheEnabled:   cacheEnabled(cache.Enabled),
+		CacheTTL:       fileDuration("DELOS_CACHE_TTL", cache.TTL, 5*time.Minute),
+		CacheRedisURL:  fileStr("DELOS_REDIS_URL", cache.RedisURL, ""),
+		Routes:         gw.Routes,
+		RoutesJSON:     os.Getenv("DELOS_ROUTES"),
+
+		OTLPEndpoint: fileStr("DELOS_OTLP_ENDPOINT", tel.OTLPEndpoint, ""),
+		OTLPProtocol: fileStr("DELOS_OTLP_PROTOCOL", tel.OTLPProtocol, "http"),
+		TraceStdout:  fileBool("DELOS_TRACE_STDOUT", tel.Stdout, false),
+		TraceContent: fileBool("DELOS_TRACE_CONTENT", tel.TraceContent, false),
+		TraceRedact:  fileStr("DELOS_TRACE_REDACT", tel.TraceRedact, ""),
 	}
 
 	return cfg, nil
+}
+
+// cacheEnabled honours the historical DELOS_CACHE=off switch on top of the
+// file's gateway.cache.enabled.
+func cacheEnabled(fileVal *bool) bool {
+	if v := os.Getenv("DELOS_CACHE"); v != "" {
+		return !strings.EqualFold(v, "off") && !strings.EqualFold(v, "false")
+	}
+	if fileVal != nil {
+		return *fileVal
+	}
+	return true
 }
 
 // DatabaseDSN returns the PostgreSQL connection string.

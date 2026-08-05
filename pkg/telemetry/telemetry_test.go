@@ -9,12 +9,12 @@ import (
 
 func TestSetup_TracingDisabled(t *testing.T) {
 	cfg := Config{
-		ServiceName:     "test-service",
-		ServiceVersion:  "1.0.0",
-		Environment:     "test",
-		TracingEnabled:  false,
-		LogLevel:        "info",
-		LogFormat:       "json",
+		ServiceName:    "test-service",
+		ServiceVersion: "1.0.0",
+		Environment:    "test",
+		TracingEnabled: false,
+		LogLevel:       "info",
+		LogFormat:      "json",
 	}
 
 	provider, err := Setup(context.Background(), cfg)

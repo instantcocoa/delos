@@ -1,456 +1,597 @@
 package runtime
 
 import (
-	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"sort"
 	"strings"
-	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	brdoc "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
+	brtypes "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
-// BedrockProvider implements the Provider interface for AWS Bedrock.
+const (
+	bedrockDefaultRegion = "us-east-1"
+	bedrockDefaultModel  = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+	bedrockEmbedModel    = "amazon.titan-embed-text-v2:0"
+)
+
+// bedrockModels is the curated model list this provider serves, in listing order.
+var bedrockModels = []string{
+	"anthropic.claude-sonnet-4-5-20250929-v1:0",
+	"anthropic.claude-haiku-4-5-20251001-v1:0",
+	"amazon.nova-pro-v1:0",
+	"amazon.nova-lite-v1:0",
+	"meta.llama3-3-70b-instruct-v1:0",
+	"amazon.titan-embed-text-v2:0",
+}
+
+// bedrockPricing is USD per 1K total tokens, blended.
+var bedrockPricing = map[string]float64{
+	"anthropic.claude-sonnet-4-5-20250929-v1:0": 0.003,
+	"anthropic.claude-haiku-4-5-20251001-v1:0":  0.001,
+	"amazon.nova-pro-v1:0":                      0.0008,
+	"amazon.nova-lite-v1:0":                     0.00006,
+	"meta.llama3-3-70b-instruct-v1:0":           0.00072,
+	"amazon.titan-embed-text-v2:0":              0.00002,
+}
+
+// bedrockAPI is the subset of the Bedrock Runtime client this provider uses.
+// Declaring it as an interface keeps the provider testable without AWS.
+type bedrockAPI interface {
+	Converse(ctx context.Context, in *bedrockruntime.ConverseInput, optFns ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error)
+	ConverseStream(ctx context.Context, in *bedrockruntime.ConverseStreamInput, optFns ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseStreamOutput, error)
+	InvokeModel(ctx context.Context, in *bedrockruntime.InvokeModelInput, optFns ...func(*bedrockruntime.Options)) (*bedrockruntime.InvokeModelOutput, error)
+}
+
+// BedrockProvider speaks the AWS Bedrock Runtime Converse API through the
+// official AWS SDK, which handles SigV4 signing and event-stream decoding.
 type BedrockProvider struct {
-	accessKeyID     string
-	secretAccessKey string
-	sessionToken    string // Optional, for temporary credentials
-	region          string
-	httpClient      *http.Client
-	models          []string
+	client  bedrockAPI
+	region  string
+	models  []string
+	pricing map[string]float64
 }
 
-// NewBedrockProvider creates a new AWS Bedrock provider.
-func NewBedrockProvider(accessKeyID, secretAccessKey, region string, opts ...BedrockOption) *BedrockProvider {
+// NewBedrockProvider builds a Bedrock provider from the default AWS credential
+// chain (environment, shared config, IMDS, ...). AWS_ACCESS_KEY_ID,
+// AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN are all picked up by that chain.
+func NewBedrockProvider(ctx context.Context, region string) (*BedrockProvider, error) {
 	if region == "" {
-		region = "us-east-1"
+		region = bedrockDefaultRegion
 	}
-	p := &BedrockProvider{
-		accessKeyID:     accessKeyID,
-		secretAccessKey: secretAccessKey,
-		region:          region,
-		httpClient:      &http.Client{Timeout: 120 * time.Second},
-		models: []string{
-			// Anthropic Claude models
-			"anthropic.claude-3-5-sonnet-20241022-v2:0",
-			"anthropic.claude-3-5-haiku-20241022-v1:0",
-			"anthropic.claude-3-sonnet-20240229-v1:0",
-			"anthropic.claude-3-haiku-20240307-v1:0",
-			"anthropic.claude-3-opus-20240229-v1:0",
-			// Meta Llama models
-			"meta.llama3-1-405b-instruct-v1:0",
-			"meta.llama3-1-70b-instruct-v1:0",
-			"meta.llama3-1-8b-instruct-v1:0",
-			// Amazon Titan
-			"amazon.titan-text-premier-v1:0",
-			"amazon.titan-text-express-v1",
-			// Mistral
-			"mistral.mistral-large-2407-v1:0",
-			"mistral.mixtral-8x7b-instruct-v0:1",
-			// Cohere
-			"cohere.command-r-plus-v1:0",
-			"cohere.command-r-v1:0",
-		},
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("bedrock: loading AWS config: %w", err)
 	}
-	for _, opt := range opts {
-		opt(p)
-	}
-	return p
+	return &BedrockProvider{
+		client:  bedrockruntime.NewFromConfig(cfg),
+		region:  region,
+		models:  bedrockModels,
+		pricing: bedrockPricing,
+	}, nil
 }
 
-// BedrockOption configures the Bedrock provider.
-type BedrockOption func(*BedrockProvider)
+func (p *BedrockProvider) Name() string                        { return "bedrock" }
+func (p *BedrockProvider) Models(ctx context.Context) []string { return p.models }
 
-// WithSessionToken sets the session token for temporary credentials.
-func WithSessionToken(token string) BedrockOption {
-	return func(p *BedrockProvider) {
-		p.sessionToken = token
+// ---- request translation (pure functions, unit-tested without AWS) ----
+
+// bedrockImageFormat maps an IANA media type onto Bedrock's image format enum.
+func bedrockImageFormat(mediaType string) (brtypes.ImageFormat, error) {
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "image/png", "png":
+		return brtypes.ImageFormatPng, nil
+	case "image/jpeg", "image/jpg", "jpeg", "jpg":
+		return brtypes.ImageFormatJpeg, nil
+	case "image/gif", "gif":
+		return brtypes.ImageFormatGif, nil
+	case "image/webp", "webp":
+		return brtypes.ImageFormatWebp, nil
+	default:
+		return "", fmt.Errorf("bedrock: unsupported image media type %q", mediaType)
 	}
 }
 
-func (p *BedrockProvider) Name() string {
-	return "bedrock"
-}
-
-func (p *BedrockProvider) Models() []string {
-	return p.models
-}
-
-func (p *BedrockProvider) Available(ctx context.Context) bool {
-	return p.accessKeyID != "" && p.secretAccessKey != ""
-}
-
-func (p *BedrockProvider) CostPer1KTokens() map[string]float64 {
-	// Bedrock pricing (approximate, varies by region)
-	return map[string]float64{
-		"anthropic.claude-3-5-sonnet-20241022-v2:0": 0.003,
-		"anthropic.claude-3-5-haiku-20241022-v1:0":  0.0008,
-		"anthropic.claude-3-sonnet-20240229-v1:0":   0.003,
-		"anthropic.claude-3-haiku-20240307-v1:0":    0.00025,
-		"anthropic.claude-3-opus-20240229-v1:0":     0.015,
-		"meta.llama3-1-405b-instruct-v1:0":          0.00265,
-		"meta.llama3-1-70b-instruct-v1:0":           0.00099,
-		"meta.llama3-1-8b-instruct-v1:0":            0.00022,
-		"amazon.titan-text-premier-v1:0":            0.0005,
-		"amazon.titan-text-express-v1":              0.0002,
-		"mistral.mistral-large-2407-v1:0":           0.002,
-		"mistral.mixtral-8x7b-instruct-v0:1":        0.00045,
-		"cohere.command-r-plus-v1:0":                0.003,
-		"cohere.command-r-v1:0":                     0.0005,
+// bedrockContentBlock converts one internal content part to a Converse block.
+func bedrockContentBlock(part ContentPart) (brtypes.ContentBlock, error) {
+	switch part.Type {
+	case "text":
+		return &brtypes.ContentBlockMemberText{Value: part.Text}, nil
+	case "image":
+		if part.ImageData == "" {
+			if part.ImageURL != "" {
+				return nil, fmt.Errorf("bedrock: remote image URLs are not supported; supply base64 image data instead")
+			}
+			return nil, fmt.Errorf("bedrock: image content part has no data")
+		}
+		format, err := bedrockImageFormat(part.MediaType)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := base64.StdEncoding.DecodeString(part.ImageData)
+		if err != nil {
+			return nil, fmt.Errorf("bedrock: invalid base64 image data: %w", err)
+		}
+		return &brtypes.ContentBlockMemberImage{Value: brtypes.ImageBlock{
+			Format: format,
+			Source: &brtypes.ImageSourceMemberBytes{Value: raw},
+		}}, nil
+	default:
+		return nil, fmt.Errorf("bedrock: unsupported content part type %q", part.Type)
 	}
 }
 
-// Bedrock Converse API types
-type bedrockMessage struct {
-	Role    string                `json:"role"`
-	Content []bedrockContentBlock `json:"content"`
+// bedrockToolInput parses raw JSON arguments into a Bedrock document. Empty
+// input becomes an empty object, which is what Bedrock expects for no-arg tools.
+func bedrockToolInput(raw string) (brdoc.Interface, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return brdoc.NewLazyDocument(map[string]any{}), nil
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+		return nil, fmt.Errorf("bedrock: tool arguments are not valid JSON: %w", err)
+	}
+	return brdoc.NewLazyDocument(parsed), nil
 }
 
-type bedrockContentBlock struct {
-	Text string `json:"text,omitempty"`
+// bedrockFromMessages splits internal messages into Converse system blocks and
+// conversation messages. Tool results become tool_result blocks on a user
+// message, and consecutive same-role messages are merged because Converse
+// requires strictly alternating roles.
+func bedrockFromMessages(messages []Message) ([]brtypes.SystemContentBlock, []brtypes.Message, error) {
+	var system []brtypes.SystemContentBlock
+	var out []brtypes.Message
+
+	appendBlocks := func(role brtypes.ConversationRole, blocks []brtypes.ContentBlock) {
+		if len(out) > 0 && out[len(out)-1].Role == role {
+			out[len(out)-1].Content = append(out[len(out)-1].Content, blocks...)
+			return
+		}
+		out = append(out, brtypes.Message{Role: role, Content: blocks})
+	}
+
+	for _, m := range messages {
+		switch m.Role {
+		case "system":
+			if text := m.Text(); text != "" {
+				system = append(system, &brtypes.SystemContentBlockMemberText{Value: text})
+			}
+
+		case "tool":
+			result := brtypes.ToolResultBlock{ToolUseId: aws.String(m.ToolCallID)}
+			result.Content = []brtypes.ToolResultContentBlock{
+				&brtypes.ToolResultContentBlockMemberText{Value: m.Text()},
+			}
+			appendBlocks(brtypes.ConversationRoleUser, []brtypes.ContentBlock{
+				&brtypes.ContentBlockMemberToolResult{Value: result},
+			})
+
+		case "assistant":
+			var blocks []brtypes.ContentBlock
+			for _, part := range m.Content {
+				b, err := bedrockContentBlock(part)
+				if err != nil {
+					return nil, nil, err
+				}
+				blocks = append(blocks, b)
+			}
+			for _, tc := range m.ToolCalls {
+				input, err := bedrockToolInput(tc.Arguments)
+				if err != nil {
+					return nil, nil, err
+				}
+				blocks = append(blocks, &brtypes.ContentBlockMemberToolUse{Value: brtypes.ToolUseBlock{
+					ToolUseId: aws.String(tc.ID),
+					Name:      aws.String(tc.Name),
+					Input:     input,
+				}})
+			}
+			if len(blocks) == 0 {
+				blocks = []brtypes.ContentBlock{&brtypes.ContentBlockMemberText{Value: ""}}
+			}
+			appendBlocks(brtypes.ConversationRoleAssistant, blocks)
+
+		default: // user
+			var blocks []brtypes.ContentBlock
+			for _, part := range m.Content {
+				b, err := bedrockContentBlock(part)
+				if err != nil {
+					return nil, nil, err
+				}
+				blocks = append(blocks, b)
+			}
+			if len(blocks) == 0 {
+				blocks = []brtypes.ContentBlock{&brtypes.ContentBlockMemberText{Value: ""}}
+			}
+			appendBlocks(brtypes.ConversationRoleUser, blocks)
+		}
+	}
+	return system, out, nil
 }
 
-type bedrockInferenceConfig struct {
-	MaxTokens   int      `json:"maxTokens,omitempty"`
-	Temperature float64  `json:"temperature,omitempty"`
-	TopP        float64  `json:"topP,omitempty"`
-	StopSeqs    []string `json:"stopSequences,omitempty"`
+// bedrockToolConfig converts tool declarations and the tool choice. It returns
+// nil when no tools were declared.
+func bedrockToolConfig(tools []Tool, choice *ToolChoice) (*brtypes.ToolConfiguration, error) {
+	if choice != nil && choice.Mode == "none" {
+		return nil, fmt.Errorf("bedrock: tool_choice %q is not supported by the Converse API", choice.Mode)
+	}
+	if len(tools) == 0 {
+		return nil, nil
+	}
+
+	cfg := &brtypes.ToolConfiguration{}
+	for _, t := range tools {
+		schema := strings.TrimSpace(string(t.Parameters))
+		if schema == "" {
+			schema = `{"type":"object"}`
+		}
+		var parsed any
+		if err := json.Unmarshal([]byte(schema), &parsed); err != nil {
+			return nil, fmt.Errorf("bedrock: tool %q has an invalid JSON Schema: %w", t.Name, err)
+		}
+		spec := brtypes.ToolSpecification{
+			Name:        aws.String(t.Name),
+			InputSchema: &brtypes.ToolInputSchemaMemberJson{Value: brdoc.NewLazyDocument(parsed)},
+		}
+		if t.Description != "" {
+			spec.Description = aws.String(t.Description)
+		}
+		cfg.Tools = append(cfg.Tools, &brtypes.ToolMemberToolSpec{Value: spec})
+	}
+
+	if choice != nil {
+		switch choice.Mode {
+		case "", "auto":
+			cfg.ToolChoice = &brtypes.ToolChoiceMemberAuto{}
+		case "required":
+			cfg.ToolChoice = &brtypes.ToolChoiceMemberAny{}
+		case "tool":
+			if choice.Name == "" {
+				return nil, fmt.Errorf("bedrock: tool_choice mode %q requires a tool name", choice.Mode)
+			}
+			cfg.ToolChoice = &brtypes.ToolChoiceMemberTool{
+				Value: brtypes.SpecificToolChoice{Name: aws.String(choice.Name)},
+			}
+		default:
+			return nil, fmt.Errorf("bedrock: unsupported tool_choice mode %q", choice.Mode)
+		}
+	}
+	return cfg, nil
 }
 
-type bedrockConverseRequest struct {
-	Messages        []bedrockMessage        `json:"messages"`
-	System          []bedrockContentBlock   `json:"system,omitempty"`
-	InferenceConfig *bedrockInferenceConfig `json:"inferenceConfig,omitempty"`
+// bedrockInferenceConfig converts sampling parameters; nil when none are set.
+func bedrockInferenceConfig(params CompletionParams) *brtypes.InferenceConfiguration {
+	cfg := &brtypes.InferenceConfiguration{}
+	set := false
+	if params.Temperature != nil {
+		cfg.Temperature = aws.Float32(float32(*params.Temperature))
+		set = true
+	}
+	if params.TopP != nil {
+		cfg.TopP = aws.Float32(float32(*params.TopP))
+		set = true
+	}
+	if params.MaxTokens > 0 {
+		cfg.MaxTokens = aws.Int32(int32(params.MaxTokens))
+		set = true
+	}
+	if len(params.Stop) > 0 {
+		cfg.StopSequences = params.Stop
+		set = true
+	}
+	if !set {
+		return nil
+	}
+	return cfg
 }
 
-type bedrockConverseResponse struct {
-	Output struct {
-		Message bedrockMessage `json:"message"`
-	} `json:"output"`
-	StopReason string `json:"stopReason"`
-	Usage      struct {
-		InputTokens  int `json:"inputTokens"`
-		OutputTokens int `json:"outputTokens"`
-		TotalTokens  int `json:"totalTokens"`
-	} `json:"usage"`
-}
-
-func (p *BedrockProvider) Complete(ctx context.Context, params CompletionParams) (*CompletionResult, error) {
+// bedrockConverseInput builds the full Converse request from internal params.
+func bedrockConverseInput(params CompletionParams) (*bedrockruntime.ConverseInput, error) {
+	if params.ResponseFormat != nil {
+		return nil, fmt.Errorf("bedrock: response_format is not supported for this backend")
+	}
+	system, messages, err := bedrockFromMessages(params.Messages)
+	if err != nil {
+		return nil, err
+	}
+	toolConfig, err := bedrockToolConfig(params.Tools, params.ToolChoice)
+	if err != nil {
+		return nil, err
+	}
 	model := params.Model
 	if model == "" {
-		model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+		model = bedrockDefaultModel
 	}
+	return &bedrockruntime.ConverseInput{
+		ModelId:         aws.String(model),
+		Messages:        messages,
+		System:          system,
+		InferenceConfig: bedrockInferenceConfig(params),
+		ToolConfig:      toolConfig,
+	}, nil
+}
 
-	// Build messages, extracting system message
-	var systemBlocks []bedrockContentBlock
-	var messages []bedrockMessage
+// ---- response translation ----
 
-	for _, m := range params.Messages {
-		if m.Role == "system" {
-			systemBlocks = append(systemBlocks, bedrockContentBlock{Text: m.Content})
-			continue
+func bedrockFinishReason(reason brtypes.StopReason) string {
+	switch reason {
+	case brtypes.StopReasonMaxTokens:
+		return FinishLength
+	case brtypes.StopReasonToolUse:
+		return FinishToolCalls
+	case brtypes.StopReasonContentFiltered, brtypes.StopReasonGuardrailIntervened:
+		return FinishContentFilter
+	default: // end_turn, stop_sequence, and anything newer
+		return FinishStop
+	}
+}
+
+// bedrockMessageFromBlocks converts a Converse output message into the internal
+// assistant message shape.
+func bedrockMessageFromBlocks(blocks []brtypes.ContentBlock) (Message, error) {
+	msg := Message{Role: "assistant"}
+	for _, block := range blocks {
+		switch b := block.(type) {
+		case *brtypes.ContentBlockMemberText:
+			msg.Content = append(msg.Content, TextPart(b.Value))
+		case *brtypes.ContentBlockMemberToolUse:
+			args := "{}"
+			if b.Value.Input != nil {
+				raw, err := b.Value.Input.MarshalSmithyDocument()
+				if err != nil {
+					return Message{}, fmt.Errorf("bedrock: encoding tool input: %w", err)
+				}
+				if len(raw) > 0 {
+					args = string(raw)
+				}
+			}
+			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
+				ID:        aws.ToString(b.Value.ToolUseId),
+				Name:      aws.ToString(b.Value.Name),
+				Arguments: args,
+			})
 		}
-		messages = append(messages, bedrockMessage{
-			Role:    m.Role,
-			Content: []bedrockContentBlock{{Text: m.Content}},
-		})
+		// Reasoning, citations, and other block kinds are intentionally dropped.
 	}
+	return msg, nil
+}
 
-	reqBody := bedrockConverseRequest{
-		Messages: messages,
-		System:   systemBlocks,
-	}
-
-	// Add inference config if any params set
-	if params.MaxTokens > 0 || params.Temperature > 0 || params.TopP > 0 || len(params.Stop) > 0 {
-		reqBody.InferenceConfig = &bedrockInferenceConfig{
-			MaxTokens:   params.MaxTokens,
-			Temperature: params.Temperature,
-			TopP:        params.TopP,
-			StopSeqs:    params.Stop,
-		}
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	// Build endpoint URL
-	endpoint := fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/converse", p.region, model)
-
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	// Sign request with AWS Signature V4
-	if err := p.signRequest(req, body); err != nil {
-		return nil, fmt.Errorf("failed to sign request: %w", err)
-	}
-
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Bedrock API error: status %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var bedrockResp bedrockConverseResponse
-	if err := json.Unmarshal(respBody, &bedrockResp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	// Extract text content
-	var content string
-	for _, block := range bedrockResp.Output.Message.Content {
-		if block.Text != "" {
-			content += block.Text
+func (p *BedrockProvider) cost(model string, totalTokens int) float64 {
+	rate, ok := p.pricing[model]
+	if !ok {
+		for m, r := range p.pricing {
+			if strings.HasPrefix(model, m) {
+				rate = r
+				break
+			}
 		}
 	}
+	return rate * float64(totalTokens) / 1000
+}
 
-	cost := p.calculateCost(model, bedrockResp.Usage.TotalTokens)
+func (p *BedrockProvider) usage(model string, tu *brtypes.TokenUsage) Usage {
+	if tu == nil {
+		return Usage{}
+	}
+	in := int(aws.ToInt32(tu.InputTokens))
+	out := int(aws.ToInt32(tu.OutputTokens))
+	total := int(aws.ToInt32(tu.TotalTokens))
+	if total == 0 {
+		total = in + out
+	}
+	return Usage{
+		PromptTokens:     in,
+		CompletionTokens: out,
+		TotalTokens:      total,
+		CostUSD:          p.cost(model, total),
+	}
+}
 
+// bedrockError normalizes an SDK error into a ProviderError carrying the
+// upstream HTTP status when the SDK exposes one.
+func bedrockError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var already *ProviderError
+	if errors.As(err, &already) {
+		return already
+	}
+	status := 502
+	var respErr *smithyhttp.ResponseError
+	if errors.As(err, &respErr) && respErr.Response != nil {
+		status = respErr.HTTPStatusCode()
+	}
+	message := err.Error()
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorMessage() != "" {
+		message = fmt.Sprintf("%s: %s", apiErr.ErrorCode(), apiErr.ErrorMessage())
+	}
+	return &ProviderError{Provider: "bedrock", StatusCode: status, Message: message}
+}
+
+// ---- Provider implementation ----
+
+func (p *BedrockProvider) Complete(ctx context.Context, params CompletionParams) (*CompletionResult, error) {
+	in, err := bedrockConverseInput(params)
+	if err != nil {
+		return nil, err
+	}
+	out, err := p.client.Converse(ctx, in)
+	if err != nil {
+		return nil, bedrockError(err)
+	}
+
+	model := aws.ToString(in.ModelId)
+	msg := Message{Role: "assistant"}
+	if outputMsg, ok := out.Output.(*brtypes.ConverseOutputMemberMessage); ok {
+		msg, err = bedrockMessageFromBlocks(outputMsg.Value.Content)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	requestID, _ := awsmiddleware.GetRequestIDMetadata(out.ResultMetadata)
 	return &CompletionResult{
-		ID:      "", // Bedrock doesn't return an ID
-		Content: content,
-		Message: Message{
-			Role:    bedrockResp.Output.Message.Role,
-			Content: content,
-		},
-		Provider: p.Name(),
-		Model:    model,
-		Usage: Usage{
-			PromptTokens:     bedrockResp.Usage.InputTokens,
-			CompletionTokens: bedrockResp.Usage.OutputTokens,
-			TotalTokens:      bedrockResp.Usage.TotalTokens,
-			CostUSD:          cost,
-		},
+		ID:           requestID,
+		Message:      msg,
+		FinishReason: bedrockFinishReason(out.StopReason),
+		Provider:     p.Name(),
+		Model:        model,
+		Usage:        p.usage(model, out.Usage),
 	}, nil
 }
 
 func (p *BedrockProvider) CompleteStream(ctx context.Context, params CompletionParams) (<-chan StreamChunk, error) {
-	model := params.Model
-	if model == "" {
-		model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
-	}
-
-	// Build messages
-	var systemBlocks []bedrockContentBlock
-	var messages []bedrockMessage
-
-	for _, m := range params.Messages {
-		if m.Role == "system" {
-			systemBlocks = append(systemBlocks, bedrockContentBlock{Text: m.Content})
-			continue
-		}
-		messages = append(messages, bedrockMessage{
-			Role:    m.Role,
-			Content: []bedrockContentBlock{{Text: m.Content}},
-		})
-	}
-
-	reqBody := bedrockConverseRequest{
-		Messages: messages,
-		System:   systemBlocks,
-	}
-
-	if params.MaxTokens > 0 || params.Temperature > 0 || params.TopP > 0 || len(params.Stop) > 0 {
-		reqBody.InferenceConfig = &bedrockInferenceConfig{
-			MaxTokens:   params.MaxTokens,
-			Temperature: params.Temperature,
-			TopP:        params.TopP,
-			StopSeqs:    params.Stop,
-		}
-	}
-
-	body, err := json.Marshal(reqBody)
+	converseIn, err := bedrockConverseInput(params)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, err
 	}
-
-	// Use converse-stream endpoint
-	endpoint := fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/converse-stream", p.region, model)
-
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
+	in := &bedrockruntime.ConverseStreamInput{
+		ModelId:         converseIn.ModelId,
+		Messages:        converseIn.Messages,
+		System:          converseIn.System,
+		InferenceConfig: converseIn.InferenceConfig,
+		ToolConfig:      converseIn.ToolConfig,
+	}
+	out, err := p.client.ConverseStream(ctx, in)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, bedrockError(err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
+	model := aws.ToString(in.ModelId)
+	id, _ := awsmiddleware.GetRequestIDMetadata(out.ResultMetadata)
+	stream := out.GetStream()
 
-	if err := p.signRequest(req, body); err != nil {
-		return nil, fmt.Errorf("failed to sign request: %w", err)
-	}
+	chunks := make(chan StreamChunk)
+	go func() {
+		defer close(chunks)
+		defer stream.Close()
 
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
+		finish := FinishStop
+		var usage *Usage
+		// Bedrock indexes content blocks; only tool_use blocks consume a
+		// sequential tool-call index, mirroring provider_anthropic.go.
+		toolIndexByBlock := map[int32]int{}
+		nextToolIndex := 0
 
-	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Bedrock API error: status %d: %s", resp.StatusCode, string(respBody))
-	}
+		for event := range stream.Events() {
+			switch ev := event.(type) {
+			case *brtypes.ConverseStreamOutputMemberContentBlockStart:
+				start, ok := ev.Value.Start.(*brtypes.ContentBlockStartMemberToolUse)
+				if !ok {
+					continue
+				}
+				blockIdx := aws.ToInt32(ev.Value.ContentBlockIndex)
+				toolIndexByBlock[blockIdx] = nextToolIndex
+				chunks <- StreamChunk{
+					ID: id,
+					ToolCall: &ToolCallDelta{
+						Index: nextToolIndex,
+						ID:    aws.ToString(start.Value.ToolUseId),
+						Name:  aws.ToString(start.Value.Name),
+					},
+					Provider: p.Name(),
+					Model:    model,
+				}
+				nextToolIndex++
 
-	ch := make(chan StreamChunk, 100)
-	go p.streamResponse(ctx, resp, model, ch)
-	return ch, nil
-}
-
-func (p *BedrockProvider) streamResponse(ctx context.Context, resp *http.Response, model string, ch chan<- StreamChunk) {
-	defer close(ch)
-	defer resp.Body.Close()
-
-	var fullContent strings.Builder
-	var inputTokens, outputTokens int
-
-	// Bedrock uses AWS event stream format
-	// Parse event stream - simplified parser for the text events
-	decoder := json.NewDecoder(resp.Body)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		var event map[string]interface{}
-		if err := decoder.Decode(&event); err != nil {
-			if err == io.EOF {
-				break
-			}
-			// Report decode errors but try to continue
-			ch <- StreamChunk{
-				Err:      fmt.Errorf("failed to decode stream event: %w", err),
-				Provider: p.Name(),
-				Model:    model,
-			}
-			continue
-		}
-
-		// Handle content block delta
-		if delta, ok := event["contentBlockDelta"].(map[string]interface{}); ok {
-			if deltaContent, ok := delta["delta"].(map[string]interface{}); ok {
-				if text, ok := deltaContent["text"].(string); ok && text != "" {
-					fullContent.WriteString(text)
-					ch <- StreamChunk{
-						Delta:    text,
-						Done:     false,
+			case *brtypes.ConverseStreamOutputMemberContentBlockDelta:
+				blockIdx := aws.ToInt32(ev.Value.ContentBlockIndex)
+				switch delta := ev.Value.Delta.(type) {
+				case *brtypes.ContentBlockDeltaMemberText:
+					if delta.Value != "" {
+						chunks <- StreamChunk{ID: id, Delta: delta.Value, Provider: p.Name(), Model: model}
+					}
+				case *brtypes.ContentBlockDeltaMemberToolUse:
+					fragment := aws.ToString(delta.Value.Input)
+					idx, ok := toolIndexByBlock[blockIdx]
+					if !ok || fragment == "" {
+						continue
+					}
+					chunks <- StreamChunk{
+						ID:       id,
+						ToolCall: &ToolCallDelta{Index: idx, ArgumentsDelta: fragment},
 						Provider: p.Name(),
 						Model:    model,
 					}
 				}
+
+			case *brtypes.ConverseStreamOutputMemberMessageStop:
+				finish = bedrockFinishReason(ev.Value.StopReason)
+
+			case *brtypes.ConverseStreamOutputMemberMetadata:
+				u := p.usage(model, ev.Value.Usage)
+				usage = &u
 			}
 		}
 
-		// Handle metadata (usage)
-		if metadata, ok := event["metadata"].(map[string]interface{}); ok {
-			if usage, ok := metadata["usage"].(map[string]interface{}); ok {
-				if v, ok := usage["inputTokens"].(float64); ok {
-					inputTokens = int(v)
-				}
-				if v, ok := usage["outputTokens"].(float64); ok {
-					outputTokens = int(v)
-				}
-			}
+		if err := stream.Err(); err != nil {
+			chunks <- StreamChunk{ID: id, Err: bedrockError(err), Provider: p.Name(), Model: model}
+			return
 		}
-	}
 
-	totalTokens := inputTokens + outputTokens
-	cost := p.calculateCost(model, totalTokens)
-
-	ch <- StreamChunk{
-		Done:     true,
-		Provider: p.Name(),
-		Model:    model,
-		Message: &Message{
-			Role:    "assistant",
-			Content: fullContent.String(),
-		},
-		Usage: &Usage{
-			PromptTokens:     inputTokens,
-			CompletionTokens: outputTokens,
-			TotalTokens:      totalTokens,
-			CostUSD:          cost,
-		},
-	}
+		chunks <- StreamChunk{
+			ID:           id,
+			Done:         true,
+			FinishReason: finish,
+			Usage:        usage,
+			Provider:     p.Name(),
+			Model:        model,
+		}
+	}()
+	return chunks, nil
 }
 
 func (p *BedrockProvider) Embed(ctx context.Context, params EmbedParams) (*EmbedResult, error) {
 	model := params.Model
 	if model == "" {
-		model = "amazon.titan-embed-text-v2:0"
+		model = bedrockEmbedModel
+	}
+	if model != bedrockEmbedModel {
+		return nil, fmt.Errorf("bedrock: embeddings are only supported for %s, got %q", bedrockEmbedModel, model)
 	}
 
 	embeddings := make([]Embedding, 0, len(params.Texts))
+	promptTokens := 0
 
+	// Titan embeddings are not exposed through Converse; invoke the model
+	// directly, one text per call (Titan accepts a single inputText).
 	for _, text := range params.Texts {
-		reqBody := map[string]interface{}{
-			"inputText": text,
-		}
-
-		body, err := json.Marshal(reqBody)
+		body, err := json.Marshal(map[string]any{"inputText": text})
 		if err != nil {
-			return nil, fmt.Errorf("failed to marshal request: %w", err)
+			return nil, fmt.Errorf("bedrock: encoding embedding request: %w", err)
 		}
-
-		endpoint := fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/invoke", p.region, model)
-
-		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
+		out, err := p.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{
+			ModelId:     aws.String(model),
+			Body:        body,
+			ContentType: aws.String("application/json"),
+			Accept:      aws.String("application/json"),
+		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
+			return nil, bedrockError(err)
 		}
-
-		req.Header.Set("Content-Type", "application/json")
-
-		if err := p.signRequest(req, body); err != nil {
-			return nil, fmt.Errorf("failed to sign request: %w", err)
+		var decoded struct {
+			Embedding           []float32 `json:"embedding"`
+			InputTextTokenCount int       `json:"inputTextTokenCount"`
 		}
-
-		resp, err := p.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("request failed: %w", err)
+		if err := json.Unmarshal(out.Body, &decoded); err != nil {
+			return nil, fmt.Errorf("bedrock: invalid embedding response: %w", err)
 		}
-		defer resp.Body.Close()
-
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read response: %w", err)
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("Bedrock API error: status %d: %s", resp.StatusCode, string(respBody))
-		}
-
-		var embedResp struct {
-			Embedding []float32 `json:"embedding"`
-		}
-
-		if err := json.Unmarshal(respBody, &embedResp); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-		}
-
+		promptTokens += decoded.InputTextTokenCount
 		embeddings = append(embeddings, Embedding{
-			Values:     embedResp.Embedding,
-			Dimensions: len(embedResp.Embedding),
+			Values:     decoded.Embedding,
+			Dimensions: len(decoded.Embedding),
 		})
 	}
 
@@ -458,114 +599,10 @@ func (p *BedrockProvider) Embed(ctx context.Context, params EmbedParams) (*Embed
 		Embeddings: embeddings,
 		Model:      model,
 		Provider:   p.Name(),
+		Usage: Usage{
+			PromptTokens: promptTokens,
+			TotalTokens:  promptTokens,
+			CostUSD:      p.cost(model, promptTokens),
+		},
 	}, nil
-}
-
-func (p *BedrockProvider) calculateCost(model string, totalTokens int) float64 {
-	costs := p.CostPer1KTokens()
-	costPer1K, ok := costs[model]
-	if !ok {
-		costPer1K = 0.001
-	}
-	return float64(totalTokens) / 1000 * costPer1K
-}
-
-// signRequest signs an HTTP request using AWS Signature V4
-func (p *BedrockProvider) signRequest(req *http.Request, payload []byte) error {
-	now := time.Now().UTC()
-	datestamp := now.Format("20060102")
-	amzdate := now.Format("20060102T150405Z")
-
-	service := "bedrock"
-	host := req.URL.Host
-
-	// Create canonical request
-	method := req.Method
-	canonicalURI := req.URL.Path
-	canonicalQuerystring := req.URL.RawQuery
-
-	// Create payload hash
-	payloadHash := sha256Hash(payload)
-
-	// Set required headers
-	req.Header.Set("Host", host)
-	req.Header.Set("X-Amz-Date", amzdate)
-	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
-	if p.sessionToken != "" {
-		req.Header.Set("X-Amz-Security-Token", p.sessionToken)
-	}
-
-	// Create signed headers list
-	signedHeaders := []string{"content-type", "host", "x-amz-content-sha256", "x-amz-date"}
-	if p.sessionToken != "" {
-		signedHeaders = append(signedHeaders, "x-amz-security-token")
-	}
-	sort.Strings(signedHeaders)
-	signedHeadersStr := strings.Join(signedHeaders, ";")
-
-	// Create canonical headers
-	var canonicalHeaders strings.Builder
-	for _, h := range signedHeaders {
-		var val string
-		switch h {
-		case "host":
-			val = host
-		case "content-type":
-			val = req.Header.Get("Content-Type")
-		case "x-amz-date":
-			val = amzdate
-		case "x-amz-content-sha256":
-			val = payloadHash
-		case "x-amz-security-token":
-			val = p.sessionToken
-		}
-		canonicalHeaders.WriteString(h)
-		canonicalHeaders.WriteString(":")
-		canonicalHeaders.WriteString(val)
-		canonicalHeaders.WriteString("\n")
-	}
-
-	canonicalRequest := strings.Join([]string{
-		method,
-		canonicalURI,
-		canonicalQuerystring,
-		canonicalHeaders.String(),
-		signedHeadersStr,
-		payloadHash,
-	}, "\n")
-
-	// Create string to sign
-	algorithm := "AWS4-HMAC-SHA256"
-	credentialScope := fmt.Sprintf("%s/%s/%s/aws4_request", datestamp, p.region, service)
-	stringToSign := strings.Join([]string{
-		algorithm,
-		amzdate,
-		credentialScope,
-		sha256Hash([]byte(canonicalRequest)),
-	}, "\n")
-
-	// Calculate signature
-	kDate := hmacSHA256([]byte("AWS4"+p.secretAccessKey), []byte(datestamp))
-	kRegion := hmacSHA256(kDate, []byte(p.region))
-	kService := hmacSHA256(kRegion, []byte(service))
-	kSigning := hmacSHA256(kService, []byte("aws4_request"))
-	signature := hex.EncodeToString(hmacSHA256(kSigning, []byte(stringToSign)))
-
-	// Create authorization header
-	authHeader := fmt.Sprintf("%s Credential=%s/%s, SignedHeaders=%s, Signature=%s",
-		algorithm, p.accessKeyID, credentialScope, signedHeadersStr, signature)
-	req.Header.Set("Authorization", authHeader)
-
-	return nil
-}
-
-func sha256Hash(data []byte) string {
-	h := sha256.Sum256(data)
-	return hex.EncodeToString(h[:])
-}
-
-func hmacSHA256(key, data []byte) []byte {
-	h := hmac.New(sha256.New, key)
-	h.Write(data)
-	return h.Sum(nil)
 }

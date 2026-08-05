@@ -516,7 +516,7 @@ func TestMigrator_Down_FailedRollback_Integration(t *testing.T) {
 		{
 			Version: 1,
 			Name:    "create_something",
-			Up:      "SELECT 1", // Simple up
+			Up:      "SELECT 1",                         // Simple up
 			Down:    "DROP TABLE nonexistent_table_xyz", // Will fail
 		},
 	}

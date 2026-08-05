@@ -3,12 +3,15 @@ package telemetry
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -26,6 +29,14 @@ type Config struct {
 	TracingSampling float64
 	LogLevel        string
 	LogFormat       string
+
+	// OTLPProtocol selects the OTLP transport when OTLPEndpoint is set:
+	// "grpc" (default) or "http" (OTLP/HTTP protobuf).
+	OTLPProtocol string
+
+	// StdoutTraces additionally writes spans to stdout. This is the
+	// zero-config dev mode: traces are visible without any collector.
+	StdoutTraces bool
 }
 
 // Provider manages telemetry resources.
@@ -113,11 +124,48 @@ func setupLogger(cfg Config) *slog.Logger {
 	return logger
 }
 
+// newExporters builds the span exporters implied by cfg. It returns an empty
+// slice when no exporter is configured, in which case the TracerProvider is
+// still installed so spans can be collected in-process (tests, and any
+// SpanProcessor added later).
+func newExporters(ctx context.Context, cfg Config) ([]sdktrace.SpanExporter, error) {
+	var exporters []sdktrace.SpanExporter
+	if cfg.OTLPEndpoint != "" {
+		switch cfg.OTLPProtocol {
+		case "http":
+			exp, err := otlptracehttp.New(ctx,
+				otlptracehttp.WithEndpoint(cfg.OTLPEndpoint),
+				otlptracehttp.WithInsecure(), // TODO: configure TLS for production
+			)
+			if err != nil {
+				return nil, err
+			}
+			exporters = append(exporters, exp)
+		case "", "grpc":
+			exp, err := otlptracegrpc.New(ctx,
+				otlptracegrpc.WithEndpoint(cfg.OTLPEndpoint),
+				otlptracegrpc.WithInsecure(), // TODO: configure TLS for production
+			)
+			if err != nil {
+				return nil, err
+			}
+			exporters = append(exporters, exp)
+		default:
+			return nil, fmt.Errorf("unsupported OTLP protocol %q (want \"grpc\" or \"http\")", cfg.OTLPProtocol)
+		}
+	}
+	if cfg.StdoutTraces {
+		exp, err := stdouttrace.New(stdouttrace.WithPrettyPrint())
+		if err != nil {
+			return nil, err
+		}
+		exporters = append(exporters, exp)
+	}
+	return exporters, nil
+}
+
 func setupTracing(ctx context.Context, cfg Config) (*sdktrace.TracerProvider, error) {
-	exporter, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint(cfg.OTLPEndpoint),
-		otlptracegrpc.WithInsecure(), // TODO: configure TLS for production
-	)
+	exporters, err := newExporters(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -137,15 +185,17 @@ func setupTracing(ctx context.Context, cfg Config) (*sdktrace.TracerProvider, er
 		sdktrace.TraceIDRatioBased(cfg.TracingSampling),
 	)
 
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter,
-			sdktrace.WithBatchTimeout(5*time.Second),
-		),
+	opts := []sdktrace.TracerProviderOption{
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sampler),
-	)
+	}
+	for _, exp := range exporters {
+		opts = append(opts, sdktrace.WithBatcher(exp,
+			sdktrace.WithBatchTimeout(5*time.Second),
+		))
+	}
 
-	return tp, nil
+	return sdktrace.NewTracerProvider(opts...), nil
 }
 
 // SpanFromContext returns the span from the context.
