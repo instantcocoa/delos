@@ -2,8 +2,29 @@
 
 The Prompt Service manages versioned prompts with full history tracking and semantic diffing.
 
-**Port**: 9002
+It is a module of the `delos` control plane, not a standalone process: `delos serve` hosts it alongside observe, datasets, eval and deploy in a single binary.
+
+**Port**: 8081 (the control plane port; override with `DELOS_PORT`)
+**Transport**: gRPC over h2c (plaintext HTTP/2) on that same port
 **Package**: `delos.prompt.v1`
+
+## Connecting
+
+```bash
+# CLI (default: localhost:8081)
+delos prompt list
+
+# Point at another control plane
+DELOS_CONTROL_PLANE_ADDR=delos.internal:8081 delos prompt list
+```
+
+```bash
+# Raw gRPC — the control plane enables server reflection
+grpcurl -plaintext localhost:8081 list delos.prompt.v1.PromptService
+grpcurl -plaintext -d '{"id": "pmt_123"}' localhost:8081 delos.prompt.v1.PromptService/GetPrompt
+```
+
+Storage is in-memory by default. Set `DELOS_STORAGE_BACKEND=postgres` (plus `DELOS_DB_*`) to persist prompts; the control plane applies its own migrations at startup.
 
 ## Endpoints
 
@@ -11,10 +32,10 @@ The Prompt Service manages versioned prompts with full history tracking and sema
 |-----|-------------|
 | [Health](#health) | Service health check |
 | [CreatePrompt](#createprompt) | Create a new prompt |
-| [GetPrompt](#getprompt) | Get a prompt by ID or slug |
+| [GetPrompt](#getprompt) | Get a prompt by ID or reference |
 | [UpdatePrompt](#updateprompt) | Update a prompt (creates new version) |
 | [ListPrompts](#listprompts) | List prompts with filtering |
-| [DeletePrompt](#deleteprompt) | Archive a prompt |
+| [DeletePrompt](#deleteprompt) | Delete a prompt |
 | [GetPromptHistory](#getprompthistory) | Get version history |
 | [CompareVersions](#compareversions) | Compare two versions |
 
@@ -24,12 +45,17 @@ The Prompt Service manages versioned prompts with full history tracking and sema
 
 Check service health status.
 
+**Request**: `HealthRequest` (empty)
+
 **Response**:
 ```protobuf
 message HealthResponse {
-  string status = 1;  // "healthy"
+  string status = 1;
+  string version = 2;
 }
 ```
+
+The control plane process as a whole also answers `GET http://localhost:8081/healthz` and the standard gRPC health service (`grpc.health.v1.Health`, with sub-services `observe`, `prompt`, `datasets`, `eval`, `deploy`).
 
 ---
 
@@ -40,17 +66,35 @@ Create a new versioned prompt.
 **Request**:
 ```protobuf
 message CreatePromptRequest {
-  string name = 1;                    // Display name
-  string slug = 2;                    // URL-safe identifier (unique)
-  string description = 3;             // Optional description
-  repeated PromptMessage messages = 4; // Prompt template
-  map<string, string> metadata = 5;   // Custom metadata
-  repeated string tags = 6;           // Tags for filtering
+  string name = 1;                      // Display name
+  string slug = 2;                      // URL-friendly identifier (unique)
+  string description = 3;               // Optional description
+  repeated PromptMessage messages = 4;  // Prompt template
+  repeated PromptVariable variables = 5;
+  GenerationConfig default_config = 6;
+  repeated string tags = 7;             // Tags for filtering
+  map<string, string> metadata = 8;     // Custom metadata
 }
 
 message PromptMessage {
   string role = 1;     // system, user, assistant
   string content = 2;  // Message content (supports {{variables}})
+}
+
+message PromptVariable {
+  string name = 1;
+  string description = 2;
+  string type = 3;           // string, number, boolean, json
+  bool required = 4;
+  string default_value = 5;
+}
+
+message GenerationConfig {
+  double temperature = 1;
+  int32 max_tokens = 2;
+  double top_p = 3;
+  repeated string stop = 4;
+  string output_schema = 5;  // JSON schema for structured output
 }
 ```
 
@@ -64,82 +108,65 @@ message Prompt {
   string id = 1;
   string name = 2;
   string slug = 3;
-  int32 version = 4;                   // Always 1 for new prompts
+  int32 version = 4;                    // Always 1 for new prompts
   string description = 5;
   repeated PromptMessage messages = 6;
-  map<string, string> metadata = 7;
-  repeated string tags = 8;
-  PromptStatus status = 9;
-  google.protobuf.Timestamp created_at = 10;
-  google.protobuf.Timestamp updated_at = 11;
+  repeated PromptVariable variables = 7;
+  GenerationConfig default_config = 8;
+  repeated string tags = 9;
+  map<string, string> metadata = 10;
+  string created_by = 11;
+  google.protobuf.Timestamp created_at = 12;
+  string updated_by = 13;
+  google.protobuf.Timestamp updated_at = 14;
+  PromptStatus status = 15;
 }
 
 enum PromptStatus {
   PROMPT_STATUS_UNSPECIFIED = 0;
-  PROMPT_STATUS_ACTIVE = 1;
-  PROMPT_STATUS_ARCHIVED = 2;
+  PROMPT_STATUS_DRAFT = 1;
+  PROMPT_STATUS_ACTIVE = 2;
+  PROMPT_STATUS_DEPRECATED = 3;
+  PROMPT_STATUS_ARCHIVED = 4;
 }
 ```
 
 **CLI**:
 ```bash
-delos prompt create \
-  --name "Summarizer" \
-  --slug "summarizer" \
-  --message "system:Summarize the following text." \
-  --tag "production"
-```
-
-**Python SDK**:
-```python
-prompt = await client.prompts.create(
-    name="Summarizer",
-    slug="summarizer",
-    messages=[
-        {"role": "system", "content": "Summarize the following text: {{text}}"}
-    ],
-    tags=["production"]
-)
-print(f"Created: {prompt.id} v{prompt.version}")
+delos prompt create "Summarizer" \
+  --slug summarizer \
+  --system "Summarize the following text: {{text}}" \
+  --tags production
 ```
 
 ---
 
 ## GetPrompt
 
-Get a prompt by ID, slug, or slug with version.
+Get a prompt by ID, or by a `slug:version` reference.
 
 **Request**:
 ```protobuf
 message GetPromptRequest {
-  string id = 1;       // Prompt ID (pmt_...)
-  string slug = 2;     // Prompt slug
-  int32 version = 3;   // Optional version (default: latest)
+  // Either id or reference can be used
+  string id = 1;
+  string reference = 2;  // e.g., "summarizer:v2" or "summarizer:latest"
+}
+
+message GetPromptResponse {
+  Prompt prompt = 1;
 }
 ```
+
+`id` takes precedence: the handler only resolves `reference` when `id` is empty.
 
 **CLI**:
 ```bash
 # By ID
-delos prompt get --id pmt_123
+delos prompt get pmt_123
 
-# By slug (latest version)
-delos prompt get --slug summarizer
-
-# By slug with version
-delos prompt get --slug summarizer --version 2
-```
-
-**Python SDK**:
-```python
-# By ID
-prompt = await client.prompts.get(id="pmt_123")
-
-# By slug
-prompt = await client.prompts.get(slug="summarizer")
-
-# Specific version
-prompt = await client.prompts.get(slug="summarizer", version=2)
+# By reference — the positional argument is sent as `id`, so pass it empty
+delos prompt get "" --reference summarizer:v2
 ```
 
 ---
@@ -152,35 +179,29 @@ Update a prompt, creating a new version.
 ```protobuf
 message UpdatePromptRequest {
   string id = 1;
-  string name = 2;                     // Optional
-  string description = 3;              // Optional
-  repeated PromptMessage messages = 4;  // New messages
-  map<string, string> metadata = 5;
+  string description = 2;
+  repeated PromptMessage messages = 3;
+  repeated PromptVariable variables = 4;
+  GenerationConfig default_config = 5;
   repeated string tags = 6;
-  string change_description = 7;       // Describe the change
+  map<string, string> metadata = 7;
+  string change_description = 8;  // Describe the change
 }
 ```
 
-**Response**: Returns the updated `Prompt` with incremented version.
+**Response**:
+```protobuf
+message UpdatePromptResponse {
+  Prompt prompt = 1;          // Updated prompt with incremented version
+  int32 previous_version = 2;
+}
+```
 
 **CLI**:
 ```bash
-delos prompt update \
-  --id pmt_123 \
-  --message "system:Summarize in 3 bullet points." \
-  --change "Made output more structured"
-```
-
-**Python SDK**:
-```python
-updated = await client.prompts.update(
-    id="pmt_123",
-    messages=[
-        {"role": "system", "content": "Summarize in 3 bullet points: {{text}}"}
-    ],
-    change_description="Made output more structured"
-)
-print(f"Now at v{updated.version}")
+delos prompt update pmt_123 \
+  --system "Summarize in 3 bullet points: {{text}}" \
+  --change-description "Made output more structured"
 ```
 
 ---
@@ -192,11 +213,13 @@ List prompts with filtering and pagination.
 **Request**:
 ```protobuf
 message ListPromptsRequest {
-  repeated string tags = 1;       // Filter by tags
-  PromptStatus status = 2;        // Filter by status
-  string search = 3;              // Search name/description
-  int32 limit = 4;                // Page size (default 20)
-  string cursor = 5;              // Pagination cursor
+  string search = 1;          // Search in name/description
+  repeated string tags = 2;   // Filter by tags
+  PromptStatus status = 3;    // Filter by status
+  int32 limit = 4;
+  int32 offset = 5;
+  string order_by = 6;        // created_at, updated_at, name
+  bool descending = 7;
 }
 ```
 
@@ -204,27 +227,21 @@ message ListPromptsRequest {
 ```protobuf
 message ListPromptsResponse {
   repeated Prompt prompts = 1;
-  string next_cursor = 2;
+  int32 total_count = 2;
 }
 ```
 
 **CLI**:
 ```bash
-delos prompt list --tag production --limit 10
-```
-
-**Python SDK**:
-```python
-prompts = await client.prompts.list(tags=["production"], limit=10)
-for p in prompts:
-    print(f"{p.slug} v{p.version}: {p.name}")
+delos prompt list --tags production --limit 10
+delos prompt list --search summar
 ```
 
 ---
 
 ## DeletePrompt
 
-Archive a prompt (soft delete).
+Delete a prompt.
 
 **Request**:
 ```protobuf
@@ -233,11 +250,16 @@ message DeletePromptRequest {
 }
 ```
 
-**Response**: Returns the archived `Prompt` with `status = ARCHIVED`.
+**Response**:
+```protobuf
+message DeletePromptResponse {
+  bool success = 1;
+}
+```
 
 **CLI**:
 ```bash
-delos prompt delete --id pmt_123
+delos prompt delete pmt_123
 ```
 
 ---
@@ -257,7 +279,8 @@ message GetPromptHistoryRequest {
 **Response**:
 ```protobuf
 message GetPromptHistoryResponse {
-  repeated PromptVersion versions = 1;
+  string prompt_id = 1;
+  repeated PromptVersion versions = 2;
 }
 
 message PromptVersion {
@@ -270,14 +293,7 @@ message PromptVersion {
 
 **CLI**:
 ```bash
-delos prompt history --id pmt_123
-```
-
-**Python SDK**:
-```python
-history = await client.prompts.get_history(id="pmt_123")
-for v in history.versions:
-    print(f"v{v.version}: {v.change_description}")
+delos prompt history pmt_123 --limit 10
 ```
 
 ---
@@ -298,60 +314,43 @@ message CompareVersionsRequest {
 **Response**:
 ```protobuf
 message CompareVersionsResponse {
-  repeated MessageDiff diffs = 1;
-  double semantic_similarity = 2;  // 0.0 to 1.0
+  repeated VersionDiff diffs = 1;
+  double semantic_similarity = 2;  // 0-1 score of semantic similarity
 }
 
-message MessageDiff {
-  string role = 1;
-  string content_a = 2;
-  string content_b = 3;
-  DiffType diff_type = 4;
-}
-
-enum DiffType {
-  DIFF_TYPE_UNSPECIFIED = 0;
-  DIFF_TYPE_ADDED = 1;
-  DIFF_TYPE_REMOVED = 2;
-  DIFF_TYPE_MODIFIED = 3;
-  DIFF_TYPE_UNCHANGED = 4;
+message VersionDiff {
+  string field = 1;      // e.g. "description", "messages[0].content"
+  string old_value = 2;
+  string new_value = 3;
+  string diff_type = 4;  // added, removed, modified
 }
 ```
 
 **CLI**:
 ```bash
-delos prompt compare --id pmt_123 --version-a 1 --version-b 3
-```
-
-**Python SDK**:
-```python
-diff = await client.prompts.compare_versions(
-    prompt_id="pmt_123",
-    version_a=1,
-    version_b=3
-)
-print(f"Similarity: {diff.semantic_similarity:.2%}")
-for d in diff.diffs:
-    print(f"{d.role}: {d.diff_type}")
+delos prompt compare pmt_123 1 3
 ```
 
 ---
 
 ## Prompt References
 
-Prompts can be referenced in the Runtime service using the format:
+Prompts can be referenced by slug and version using the format:
 
 ```
 {slug}:v{version}
+{slug}:latest
 ```
 
 Examples:
 - `summarizer:v1` - Version 1 of summarizer
 - `summarizer:v2` - Version 2 of summarizer
+- `summarizer:latest` - Newest version of summarizer
 
-```python
-response = await client.runtime.complete(
-    prompt_ref="summarizer:v2",
-    variables={"text": "Long article..."}
-)
+Pass a reference to `GetPrompt` to resolve it to a concrete `Prompt`:
+
+```bash
+delos prompt get "" --reference summarizer:v2 --output json
 ```
+
+The gateway (`delos-gateway`) has no knowledge of prompts — it only speaks the OpenAI/Anthropic HTTP surfaces. To run a stored prompt, resolve it here and send the resulting messages to the gateway, or let an eval run do it for you (the control plane's eval runner fetches prompts in-process and calls the gateway over `DELOS_GATEWAY_URL`).
