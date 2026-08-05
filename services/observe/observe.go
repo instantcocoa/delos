@@ -7,7 +7,6 @@
 package observe
 
 import (
-	"sort"
 	"strconv"
 	"time"
 )
@@ -248,42 +247,6 @@ type Stats struct {
 
 // DefaultStatsBucket is the cost-over-time bucket width when unspecified.
 const DefaultStatsBucket = time.Hour
-
-// defaultStatsWindow is how far back a stats query reaches when no start time
-// is given.
-const defaultStatsWindow = 24 * time.Hour
-
-// normalize fills in defaults so the memory and Postgres stores agree on the
-// effective window.
-func (q StatsQuery) normalize(now time.Time) StatsQuery {
-	if q.EndTime.IsZero() {
-		q.EndTime = now
-	}
-	if q.StartTime.IsZero() {
-		q.StartTime = q.EndTime.Add(-defaultStatsWindow)
-	}
-	if q.Bucket <= 0 {
-		q.Bucket = DefaultStatsBucket
-	}
-	return q
-}
-
-// percentile returns the p-th percentile (0..1) of the supplied millisecond
-// samples using nearest-rank. It sorts the slice in place.
-func percentile(ms []float64, p float64) float64 {
-	if len(ms) == 0 {
-		return 0
-	}
-	sort.Float64s(ms)
-	idx := int(float64(len(ms)-1)*p + 0.5)
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(ms) {
-		idx = len(ms) - 1
-	}
-	return ms[idx]
-}
 
 // MetricDataPoint represents a single metric measurement.
 type MetricDataPoint struct {

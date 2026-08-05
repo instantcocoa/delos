@@ -2,15 +2,9 @@ package deploy
 
 import (
 	"context"
-	"log/slog"
-	"os"
 	"testing"
 	"time"
 )
-
-func testLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-}
 
 func testGate(name, prompt string, conditions ...GateCondition) *QualityGate {
 	return &QualityGate{
