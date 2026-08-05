@@ -64,3 +64,11 @@ ENV/
 # Generated protobuf files (buf generate output)
 # Uncomment to commit generated code (ensures consistency across environments)
 gen/
+bin/
+server
+*.test
+coverage.out
+coverage.html
+
+# Local config file (delos.yaml.example is the committed template)
+/delos.yaml

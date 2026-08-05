@@ -1,0 +1,120 @@
+# delos.yaml - the one Delos config file.
+#
+# Copy to delos.yaml and edit. Everything here is optional: Delos boots with
+# working defaults and no config file at all. Use this file for production;
+# for hello-world, environment variables are enough.
+#
+#   Precedence:  environment variable  >  delos.yaml  >  built-in default
+#
+# Discovery: Delos reads $DELOS_CONFIG if set, otherwise ./delos.yaml if it
+# exists. Validate a file with:
+#
+#   delos config validate delos.yaml
+#   delos config doctor            # also probes the things it points at
+#
+# SECRETS DO NOT GO IN THIS FILE. Provider API keys and the database password
+# are read from the environment only, so this file is safe to commit:
+#
+#   OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY (or GOOGLE_API_KEY),
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, DELOS_COMPAT_API_KEY,
+#   DELOS_DB_PASSWORD
+
+
+# ---------------------------------------------------------------------------
+# Process basics (both binaries)
+# ---------------------------------------------------------------------------
+
+# development | staging | production            env: DELOS_ENV
+env: development
+
+# debug | info | warn | error                   env: DELOS_LOG_LEVEL
+log_level: info
+
+# json | text                                   env: DELOS_LOG_FORMAT
+log_format: json
+
+
+# ---------------------------------------------------------------------------
+# Control plane (`delos serve`)
+# ---------------------------------------------------------------------------
+
+# gRPC-over-h2c + /healthz listen port.          env: DELOS_PORT
+port: 8081
+
+# memory | postgres                              env: DELOS_STORAGE_BACKEND
+# "memory" is ephemeral and meant for development; everything is lost on
+# restart. Production wants postgres.
+storage: postgres
+
+database:
+  host: localhost                                # env: DELOS_DB_HOST
+  port: 5432                                     # env: DELOS_DB_PORT
+  user: delos                                    # env: DELOS_DB_USER
+  name: delos                                    # env: DELOS_DB_NAME
+  # disable | allow | prefer | require | verify-ca | verify-full
+  sslmode: disable                               # env: DELOS_DB_SSLMODE
+  # password: intentionally not configurable here - set DELOS_DB_PASSWORD.
+
+
+# ---------------------------------------------------------------------------
+# Gateway (`delos-gateway`)
+# ---------------------------------------------------------------------------
+
+gateway:
+  # HTTP listen port for the OpenAI/Anthropic surfaces.
+  port: 8080                                     # env: DELOS_GATEWAY_PORT
+
+  # How the CLI and control plane reach the gateway. In Docker Compose this
+  # is http://gateway:8080.
+  url: http://localhost:8080                     # env: DELOS_GATEWAY_URL
+
+  # End-to-end budget for one request, covering every retry and fallback.
+  request_timeout: 5m                            # env: DELOS_REQUEST_TIMEOUT
+
+  # Exact-match response cache, keyed on (model, normalized messages, params).
+  cache:
+    enabled: true                                # env: DELOS_CACHE=off disables
+    ttl: 5m                                      # env: DELOS_CACHE_TTL
+    # Leave empty for an in-process LRU (fine for a single gateway). Point
+    # several gateways at one Redis to share a cache.
+    redis_url: ""                                # env: DELOS_REDIS_URL
+
+  # Model aliases with ordered fallback chains. The client asks for the alias
+  # on the left; Delos tries each provider/model on the right in order, moving
+  # on when one returns 429/5xx or trips its circuit breaker.
+  # Equivalent env var (JSON): DELOS_ROUTES='{"gpt-4":["openai/gpt-4o"]}'
+  routes:
+    gpt-4:
+      - openai/gpt-4o
+      - anthropic/claude-sonnet-4-5
+    cheap:
+      - openai/gpt-4o-mini
+      - ollama/gemma3:4b
+
+
+# ---------------------------------------------------------------------------
+# Telemetry - OpenTelemetry gen_ai.* spans
+# ---------------------------------------------------------------------------
+# See docs/otel.md for pointing this at Jaeger, Grafana Tempo, or Datadog.
+
+telemetry:
+  # Where spans go. Empty means no OTLP export. The gateway never requires
+  # the control plane: any OTLP collector works.
+  otlp_endpoint: ""                              # env: DELOS_OTLP_ENDPOINT
+  # http (OTLP/HTTP, endpoint is a URL) | grpc (endpoint is host:port)
+  otlp_protocol: http                            # env: DELOS_OTLP_PROTOCOL
+
+  # Print spans to stdout. Useful in development, noisy in production.
+  stdout: false                                  # env: DELOS_TRACE_STDOUT
+
+  # Head sampling fraction, 0.0-1.0.              env: DELOS_TRACING_SAMPLING
+  sampling: 1.0
+
+  # Capture prompts and completions as span attributes. OFF BY DEFAULT: this
+  # puts user content in your traces. Turn it on deliberately.
+  trace_content: false                           # env: DELOS_TRACE_CONTENT
+
+  # Comma-separated regexes applied to captured content before export. Only
+  # meaningful when trace_content is true.
+  trace_redact: ""                               # env: DELOS_TRACE_REDACT
+  # e.g. trace_redact: "sk-[A-Za-z0-9]{20,},[0-9]{3}-[0-9]{2}-[0-9]{4}"

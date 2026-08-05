@@ -1,37 +1,37 @@
-.PHONY: all build test test-unit test-integration test-ollama lint proto proto-lint proto-breaking up down clean help
+.PHONY: all build build-delos build-gateway
+.PHONY: test test-unit test-integration test-integration-full test-ollama test-coverage
 .PHONY: test-deps-up test-deps-wait
-.PHONY: run-runtime run-prompt run-datasets run-eval run-deploy run-observe run-all stop-all
+.PHONY: conformance conformance-record bench soak compat vulncheck
+.PHONY: lint proto proto-lint proto-breaking proto-format docs-test
+.PHONY: up up-all down logs clean tools help
+.PHONY: run-gateway run-control-plane run-all stop-all
 .PHONY: up-ollama ollama-pull ollama-ready
 
 # Variables
-SERVICES := runtime prompt datasets eval deploy observe
 GO_MODULE := github.com/instantcocoa/delos
+COMPOSE := docker compose -f deploy/local/docker-compose.yaml
 
 # Default target
 all: build
 
-# Build all services
-build:
-	@for svc in $(SERVICES); do \
-		echo "Building $$svc..."; \
-		go build -o bin/$$svc ./services/$$svc/cmd/server; \
-	done
+# Build both binaries
+build: build-delos build-gateway
 
-# Build a specific service
-build-%:
-	@echo "Building $*..."
-	@go build -o bin/$* ./services/$*/cmd/server
+# Control plane + CLI (one binary; `delos serve` runs the control plane)
+build-delos:
+	@echo "Building delos..."
+	@go build -o bin/delos ./cmd/delos
 
-# Build CLI
-build-cli:
-	@echo "Building CLI..."
-	@go build -o bin/delos ./cli
+# Data plane (stateless LLM gateway)
+build-gateway:
+	@echo "Building delos-gateway..."
+	@go build -o bin/delos-gateway ./cmd/delos-gateway
 
 # Run all tests (starts test dependencies first)
 test: test-deps-up test-deps-wait
 	@echo "Running all tests..."
 	@go test -race -cover ./... ; status=$$?; \
-		docker-compose -f deploy/local/docker-compose.yaml --profile test stop postgres localstack redis > /dev/null 2>&1 || true; \
+		$(COMPOSE) --profile test stop postgres localstack > /dev/null 2>&1 || true; \
 		exit $$status
 
 # Run unit tests only (no external dependencies)
@@ -42,22 +42,18 @@ test-unit:
 test-coverage: test-deps-up test-deps-wait
 	@go test -race -coverprofile=coverage.out ./...
 	@go tool cover -html=coverage.out -o coverage.html
-	@docker-compose -f deploy/local/docker-compose.yaml --profile test stop localstack redis > /dev/null 2>&1 || true
+	@$(COMPOSE) --profile test stop postgres localstack > /dev/null 2>&1 || true
 	@echo "Coverage report: coverage.html"
 
-# Start test dependencies (PostgreSQL, Redis, LocalStack)
+# Start test dependencies (PostgreSQL, LocalStack)
 test-deps-up:
-	@docker-compose -f deploy/local/docker-compose.yaml --profile test up -d postgres redis localstack > /dev/null 2>&1
+	@$(COMPOSE) --profile test up -d postgres localstack > /dev/null 2>&1
 
 # Wait for test dependencies to be healthy (uses Docker health checks)
 test-deps-wait:
 	@echo "Waiting for test dependencies..."
 	@for i in $$(seq 1 30); do \
-		docker-compose -f deploy/local/docker-compose.yaml ps postgres 2>/dev/null | grep -q "(healthy)" && break; \
-		sleep 1; \
-	done
-	@for i in $$(seq 1 30); do \
-		docker-compose -f deploy/local/docker-compose.yaml ps redis 2>/dev/null | grep -q "(healthy)" && break; \
+		$(COMPOSE) ps postgres 2>/dev/null | grep -q "(healthy)" && break; \
 		sleep 1; \
 	done
 	@for i in $$(seq 1 60); do \
@@ -77,27 +73,40 @@ test-integration-full:
 test-ollama:
 	@./tests/integration/run.sh ollama
 
-# Start Ollama and wait for model to be ready
-up-ollama:
-	@echo "Starting Ollama..."
-	@docker-compose -f deploy/local/docker-compose.yaml up -d ollama
-	@echo "Waiting for Ollama to be healthy..."
-	@for i in $$(seq 1 30); do \
-		curl -sf http://localhost:11434/api/tags > /dev/null 2>&1 && break; \
-		sleep 2; \
-	done || (echo "Ollama not ready after 60s"; exit 1)
-	@echo "Ollama is ready. Pulling gemma3:4b model..."
-	@docker-compose -f deploy/local/docker-compose.yaml up ollama-init
-	@echo "Ollama setup complete!"
+# Provider conformance suite: replays recorded provider responses through the
+# real gateway surfaces. Hermetic - no keys, no network beyond loopback.
+conformance:
+	@go test ./tests/conformance/ -count=1
 
-# Pull gemma3 model (assumes Ollama is running)
-ollama-pull:
-	@echo "Pulling gemma3:4b model..."
-	@docker exec delos-ollama ollama pull gemma3:4b
+# Re-record every cassette against the live provider APIs. Needs real keys
+# (providers without one are skipped); `git diff tests/conformance/cassettes`
+# afterwards is the provider-drift report.
+conformance-record:
+	@DELOS_CONFORMANCE_RECORD=1 go test ./tests/conformance/ -count=1 -v
 
-# Check if Ollama and model are ready
-ollama-ready:
-	@curl -sf http://localhost:11434/api/tags | grep -q "gemma3" && echo "Ollama ready with gemma3" || echo "Ollama or gemma3 not available"
+# Gateway overhead benchmark: 2000 sequential requests against an instant
+# upstream, gated on p99 < 5ms with no goroutine leaks.
+bench:
+	@go test ./tests/conformance/ -run 'TestGatewayOverheadP99' -count=1 -v
+
+# 10s soak: constant traffic, then assert goroutine and FD counts are flat.
+soak:
+	@DELOS_SOAK=1 go test ./tests/conformance/ -run 'TestGatewaySoak' -count=1 -v -timeout 5m
+
+# Client compatibility: the unmodified official openai (Python + Node) and
+# anthropic (Python) clients against a real gateway over a mock upstream.
+compat:
+	@./tests/compat/run.sh
+
+# Supply-chain hygiene: report known vulnerabilities in our dependency graph.
+vulncheck:
+	@go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+# Execute the documentation. Every fenced bash block whose first line is
+# "# docs-test" is extracted and run in a scratch directory with bin/ on PATH,
+# so stale docs fail like any other test.
+docs-test: build
+	@go run ./tools/docstest
 
 # Lint Go code
 lint: proto-lint
@@ -114,7 +123,8 @@ proto-lint:
 	@echo "Linting proto files..."
 	@buf lint
 
-# Check for breaking changes
+# Check for breaking changes (currently expected to fail during the
+# two-binary refactor; re-enable in CI once the topology change lands)
 proto-breaking:
 	@echo "Checking for breaking changes..."
 	@buf breaking --against '.git#branch=main'
@@ -123,70 +133,69 @@ proto-breaking:
 proto-format:
 	@buf format -w
 
-# Start local infrastructure (PostgreSQL, Redis, NATS, Ollama)
+# Start local infrastructure (PostgreSQL only - that's all Delos needs)
 up:
-	@docker-compose -f deploy/local/docker-compose.yaml up -d postgres redis nats ollama ollama-init
+	@$(COMPOSE) up -d postgres
 
-# Start all services via Docker Compose
+# Start the whole stack via Docker Compose (postgres + gateway + delos)
 up-all:
-	@docker-compose -f deploy/local/docker-compose.yaml up -d
+	@$(COMPOSE) up -d
 
 # Stop all containers
 down:
-	@docker-compose -f deploy/local/docker-compose.yaml --profile test down
+	@$(COMPOSE) --profile test --profile ollama --profile observability down
 
 # View logs from containers
 logs:
-	@docker-compose -f deploy/local/docker-compose.yaml logs -f
+	@$(COMPOSE) logs -f
 
-# Run individual services (foreground)
-run-runtime:
-	@go run ./services/runtime/cmd/server
+# Run the gateway (data plane, :8080) in the foreground
+run-gateway:
+	@go run ./cmd/delos-gateway
 
-run-prompt:
-	@go run ./services/prompt/cmd/server
+# Run the control plane (:8081) in the foreground
+run-control-plane:
+	@go run ./cmd/delos serve
 
-run-datasets:
-	@go run ./services/datasets/cmd/server
-
-run-eval:
-	@go run ./services/eval/cmd/server
-
-run-deploy:
-	@go run ./services/deploy/cmd/server
-
-run-observe:
-	@go run ./services/observe/cmd/server
-
-# Run all services in background using built binaries
+# Run both binaries in the background using the built binaries
 # Use 'make stop-all' to stop them
 run-all: build
-	@echo "Starting all services in background..."
+	@echo "Starting delos-gateway (:8080) and delos serve (:8081) in background..."
 	@echo "Use 'make stop-all' to stop them"
-	@./bin/observe &
+	@./bin/delos-gateway &
 	@sleep 1
-	@./bin/runtime &
-	@sleep 1
-	@./bin/prompt &
-	@sleep 1
-	@./bin/datasets &
-	@sleep 1
-	@./bin/eval &
-	@sleep 1
-	@./bin/deploy &
-	@echo "All services started. PIDs:"
-	@pgrep -f 'bin/(observe|runtime|prompt|datasets|eval|deploy)' || true
+	@./bin/delos serve &
+	@echo "Started. PIDs:"
+	@pgrep -f 'bin/delos' || true
 
-# Stop all background services started by run-all
+# Stop background processes started by run-all
 stop-all:
-	@echo "Stopping all services..."
-	@pkill -f 'bin/observe' 2>/dev/null || true
-	@pkill -f 'bin/runtime' 2>/dev/null || true
-	@pkill -f 'bin/prompt' 2>/dev/null || true
-	@pkill -f 'bin/datasets' 2>/dev/null || true
-	@pkill -f 'bin/eval' 2>/dev/null || true
-	@pkill -f 'bin/deploy' 2>/dev/null || true
-	@echo "All services stopped"
+	@echo "Stopping delos processes..."
+	@pkill -f 'bin/delos-gateway' 2>/dev/null || true
+	@pkill -f 'bin/delos serve' 2>/dev/null || true
+	@echo "Stopped"
+
+# Start Ollama (optional profile) and pull the default model
+up-ollama:
+	@echo "Starting Ollama..."
+	@$(COMPOSE) --profile ollama up -d ollama
+	@echo "Waiting for Ollama to be healthy..."
+	@for i in $$(seq 1 30); do \
+		curl -sf http://localhost:11434/api/tags > /dev/null 2>&1 && break; \
+		sleep 2; \
+	done || (echo "Ollama not ready after 60s"; exit 1)
+	@echo "Ollama is ready. Pulling gemma3:4b model..."
+	@$(COMPOSE) --profile ollama up ollama-init
+	@echo "Ollama setup complete!"
+
+# Pull gemma3 model (assumes Ollama is running)
+ollama-pull:
+	@echo "Pulling gemma3:4b model..."
+	@docker exec delos-ollama ollama pull gemma3:4b
+
+# Check if Ollama and model are ready
+ollama-ready:
+	@curl -sf http://localhost:11434/api/tags | grep -q "gemma3" && echo "Ollama ready with gemma3" || echo "Ollama or gemma3 not available"
 
 # Clean build artifacts
 clean:
@@ -202,61 +211,58 @@ tools:
 	@go install github.com/golangci-lint/golangci-lint/cmd/golangci-lint@latest
 	@echo "Development tools installed"
 
-# Database migrations (requires golang-migrate)
-migrate-up:
-	@for svc in $(SERVICES); do \
-		if [ -d "services/$$svc/migrations" ]; then \
-			echo "Running migrations for $$svc..."; \
-			migrate -path services/$$svc/migrations -database "$$DELOS_DB_URL" up; \
-		fi \
-	done
-
-migrate-down:
-	@for svc in $(SERVICES); do \
-		if [ -d "services/$$svc/migrations" ]; then \
-			echo "Rolling back migrations for $$svc..."; \
-			migrate -path services/$$svc/migrations -database "$$DELOS_DB_URL" down 1; \
-		fi \
-	done
-
 # Help
 help:
 	@echo "Delos Makefile"
 	@echo ""
+	@echo "Delos is two binaries + Postgres:"
+	@echo "  delos-gateway   data plane, HTTP :8080, stateless, no database"
+	@echo "  delos           control plane + CLI; 'delos serve' listens on :8081"
+	@echo ""
 	@echo "Quick Start:"
-	@echo "  make up && make build && make run-all    Start everything locally"
-	@echo "  make up-all                              Start everything via Docker"
+	@echo "  make up && make run-all                  Postgres in Docker, binaries locally"
+	@echo "  make up-all                              Everything via Docker (3 containers)"
 	@echo ""
 	@echo "Building:"
-	@echo "  make build              Build all service binaries to bin/"
-	@echo "  make build-<svc>        Build specific service (runtime, prompt, etc.)"
-	@echo "  make build-cli          Build CLI to bin/delos"
+	@echo "  make build              Build bin/delos and bin/delos-gateway"
+	@echo "  make build-delos        Build the control plane + CLI binary"
+	@echo "  make build-gateway      Build the gateway binary"
 	@echo ""
-	@echo "Running Services:"
-	@echo "  make up                 Start infrastructure (postgres, redis, nats, ollama)"
-	@echo "  make up-all             Start all services via Docker Compose"
-	@echo "  make run-all            Run all services locally (background)"
-	@echo "  make stop-all           Stop services started by run-all"
-	@echo "  make run-<svc>          Run specific service (foreground)"
+	@echo "Running:"
+	@echo "  make up                 Start Postgres only"
+	@echo "  make up-all             Start postgres + gateway + control plane"
+	@echo "  make run-gateway        Run the gateway (:8080) in the foreground"
+	@echo "  make run-control-plane  Run the control plane (:8081) in the foreground"
+	@echo "  make run-all            Run both binaries in the background"
+	@echo "  make stop-all           Stop binaries started by run-all"
 	@echo "  make down               Stop all containers"
 	@echo "  make logs               View container logs"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test               Run tests (starts postgres/redis/localstack)"
+	@echo "  make test               Run tests (starts postgres/localstack)"
 	@echo "  make test-unit          Run tests without starting deps"
-	@echo "  make test-integration   Run integration tests (requires services)"
+	@echo "  make test-integration   Run integration tests (requires the stack)"
 	@echo "  make test-ollama        Run Ollama integration tests only"
 	@echo "  make test-coverage      Generate HTML coverage report"
+	@echo "  make docs-test          Run the marked code blocks in the docs"
+	@echo ""
+	@echo "Gateway conformance and compatibility:"
+	@echo "  make conformance        Replay the provider cassettes (hermetic)"
+	@echo "  make conformance-record Re-record cassettes against live APIs (needs keys)"
+	@echo "  make bench              Gateway overhead benchmark (p99 < 5ms gate)"
+	@echo "  make soak               10s soak: goroutine and FD leak check"
+	@echo "  make compat             Official openai/anthropic clients vs the gateway"
+	@echo "  make vulncheck          govulncheck over the module"
 	@echo ""
 	@echo "Proto/Lint:"
 	@echo "  make proto              Generate code from proto files"
 	@echo "  make proto-lint         Lint proto files"
 	@echo "  make lint               Run Go and proto linters"
 	@echo ""
-	@echo "Ollama (Local LLM):"
-	@echo "  make up-ollama          Start Ollama and pull gemma3:4b model"
+	@echo "Ollama (optional 'ollama' compose profile):"
+	@echo "  make up-ollama          Start Ollama and pull gemma3:4b"
 	@echo "  make ollama-ready       Check if Ollama and model are ready"
-	@echo "  make ollama-pull        Pull gemma3:4b model (if Ollama running)"
+	@echo "  make ollama-pull        Pull gemma3:4b (if Ollama running)"
 	@echo ""
 	@echo "Other:"
 	@echo "  make tools              Install dev tools (buf, golangci-lint)"

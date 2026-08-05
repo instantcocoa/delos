@@ -1,0 +1,73 @@
+name: Nightly
+
+# Provider drift is the failure mode a hermetic conformance suite cannot see:
+# the cassettes keep passing while the real API changes underneath them. So
+# every night the cassettes are re-recorded against the live provider APIs and
+# the result is diffed. A diff means a provider changed its wire format, and it
+# fails here rather than in a user's production traffic.
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # 04:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.25'
+  CGO_ENABLED: '0'
+
+# Every `uses:` is pinned to a full commit SHA; the trailing comment records
+# the human-readable version it resolved from.
+
+jobs:
+  record:
+    name: Re-record cassettes against live providers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Providers without a configured key are skipped, not failed: a nightly
+      # that cannot reach Gemini should still report on OpenAI and Anthropic.
+      - name: Record and replay
+        env:
+          DELOS_CONFORMANCE_RECORD: '1'
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: go test ./tests/conformance/ -count=1 -v -timeout 20m
+
+      - name: Fail on provider drift
+        run: |
+          if ! git diff --exit-code tests/conformance/cassettes; then
+            echo "::error::Provider responses drifted from the recorded cassettes." \
+                 "Review the diff above, update the gateway's translation layer if" \
+                 "needed, and commit the re-recorded cassettes."
+            exit 1
+          fi
+          echo "No provider drift: every re-recorded cassette is byte-identical."
+
+  soak:
+    name: Overhead and leak soak
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Gateway overhead (p99 gate)
+        run: go test ./tests/conformance/ -run 'TestGatewayOverheadP99' -count=1 -v
+
+      - name: Soak (goroutine and FD leak check)
+        env:
+          DELOS_SOAK: '1'
+        run: go test ./tests/conformance/ -run 'TestGatewaySoak' -count=1 -v -timeout 10m

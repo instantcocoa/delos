@@ -7,6 +7,11 @@ on:
 
 env:
   GO_VERSION: '1.25'
+  # Both binaries ship CGO-free.
+  CGO_ENABLED: '0'
+
+# Every `uses:` is pinned to a full commit SHA (supply-chain hygiene); the
+# trailing comment records the human-readable version it resolved from.
 
 jobs:
   release:
@@ -15,24 +20,36 @@ jobs:
     permissions:
       contents: write
       packages: write
+      # Required for cosign keyless signing (Fulcio/Rekor via OIDC).
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      # Generates the SBOMs referenced by .goreleaser.yaml's `sboms:` block.
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+
+      # Signs checksums.txt keylessly; verifying the checksums verifies every
+      # artifact, so one signature covers the release.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v5
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
           distribution: goreleaser
-          version: latest
+          version: '~> v2'
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
 
   docker-release:
     name: Docker Release
@@ -43,21 +60,19 @@ jobs:
       packages: write
     strategy:
       matrix:
-        service:
-          - observe
-          - runtime
-          - prompt
-          - datasets
-          - eval
-          - deploy
+        include:
+          - name: delos
+            dockerfile: Dockerfile.delos
+          - name: delos-gateway
+            dockerfile: Dockerfile.gateway
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Login to Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -68,41 +83,13 @@ jobs:
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          file: services/${{ matrix.service }}/Dockerfile
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}-${{ matrix.service }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}-${{ matrix.service }}:latest
+            ghcr.io/${{ github.repository }}-${{ matrix.name }}:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}-${{ matrix.name }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  helm-release:
-    name: Helm Release
-    runs-on: ubuntu-latest
-    needs: [docker-release]
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Helm
-        uses: azure/setup-helm@v4
-        with:
-          version: v3.13.0
-
-      - name: Get version
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-      - name: Package Helm chart
-        run: |
-          helm package deploy/k8s/delos --version ${{ steps.version.outputs.version }} --app-version ${{ steps.version.outputs.version }}
-
-      - name: Upload Helm chart
-        uses: actions/upload-artifact@v4
-        with:
-          name: helm-chart
-          path: delos-*.tgz
