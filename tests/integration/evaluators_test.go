@@ -3,7 +3,7 @@
 // The eval service supports both CRUD operations for eval runs and actual
 // execution of evaluations. The execution engine:
 // - Polls for pending runs and executes them
-// - Integrates with runtime service for LLM calls
+// - Calls the delos-gateway over HTTP (DELOS_GATEWAY_URL) for LLM completions
 // - Runs evaluators (exact_match, contains, regex, json_schema, llm_judge, semantic_similarity)
 // - Tracks progress and generates results
 //

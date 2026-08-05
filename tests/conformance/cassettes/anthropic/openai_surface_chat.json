@@ -1,0 +1,42 @@
+{
+  "name": "anthropic backend served on the OpenAI surface",
+  "provider": "anthropic",
+  "surface": "openai",
+  "request": {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 64,
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are terse."
+      },
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/messages",
+  "upstream_body_contains": [
+    "\"system\":\"You are terse.\""
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"msg_06Conformance\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5-20250929\",\"content\":[{\"type\":\"text\",\"text\":\"Hello there!\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":14,\"output_tokens\":4}}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "choices.0.finish_reason": "stop",
+      "choices.0.message.content": "Hello there!",
+      "choices.0.message.role": "assistant",
+      "object": "chat.completion",
+      "usage.completion_tokens": 4,
+      "usage.prompt_tokens": 14,
+      "usage.total_tokens": 18
+    }
+  }
+}

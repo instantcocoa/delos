@@ -1,0 +1,39 @@
+{
+  "name": "anthropic: rate limit passthrough (with one retry)",
+  "provider": "anthropic",
+  "surface": "anthropic",
+  "request": {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 64,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/messages",
+  "upstream_responses": [
+    {
+      "status": 429,
+      "content_type": "application/json",
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Number of request tokens has exceeded your per-minute rate limit (input_tokens: 40000). Please reduce the rate of requests and try again.\"}}"
+    },
+    {
+      "status": 429,
+      "content_type": "application/json",
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Number of request tokens has exceeded your per-minute rate limit (input_tokens: 40000). Please reduce the rate of requests and try again.\"}}"
+    }
+  ],
+  "expect": {
+    "status": 429,
+    "json_paths": {
+      "error.type": "rate_limit_error",
+      "type": "error"
+    },
+    "body_contains": [
+      "Number of request tokens has exceeded your per-minute rate limit (input_tokens: 40000). Please reduce the rate of requests and try again.",
+      "provider anthropic:"
+    ]
+  }
+}

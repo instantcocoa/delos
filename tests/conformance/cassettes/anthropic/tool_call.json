@@ -1,0 +1,60 @@
+{
+  "name": "anthropic: tool use",
+  "provider": "anthropic",
+  "surface": "anthropic",
+  "request": {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 256,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather in Paris?"
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather in a city",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "location"
+          ]
+        }
+      }
+    ],
+    "tool_choice": {
+      "type": "auto"
+    }
+  },
+  "upstream_path_contains": "/v1/messages",
+  "upstream_body_contains": [
+    "\"input_schema\"",
+    "get_weather",
+    "\"tool_choice\":{\"type\":\"auto\"}"
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"msg_03Conformance\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5-20250929\",\"content\":[{\"type\":\"text\",\"text\":\"Let me check.\"},{\"type\":\"tool_use\",\"id\":\"toolu_01Conformance\",\"name\":\"get_weather\",\"input\":{\"location\":\"Paris\"}}],\"stop_reason\":\"tool_use\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":402,\"output_tokens\":61}}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "content.0.text": "Let me check.",
+      "content.0.type": "text",
+      "content.1.id": "toolu_01Conformance",
+      "content.1.input.location": "Paris",
+      "content.1.name": "get_weather",
+      "content.1.type": "tool_use",
+      "stop_reason": "tool_use"
+    }
+  }
+}

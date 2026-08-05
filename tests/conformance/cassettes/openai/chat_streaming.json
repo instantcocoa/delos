@@ -1,0 +1,37 @@
+{
+  "name": "openai: streaming chat completion",
+  "provider": "openai",
+  "surface": "openai",
+  "request": {
+    "model": "gpt-4o",
+    "stream": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_body_contains": [
+    "\"stream\":true"
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "text/event-stream",
+      "body": "data: {\"id\":\"chatcmpl-A2\",\"object\":\"chat.completion.chunk\",\"created\":1730000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-A2\",\"object\":\"chat.completion.chunk\",\"created\":1730000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-A2\",\"object\":\"chat.completion.chunk\",\"created\":1730000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-A2\",\"object\":\"chat.completion.chunk\",\"created\":1730000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"chatcmpl-A2\",\"object\":\"chat.completion.chunk\",\"created\":1730000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2,\"total_tokens\":13}}\n\ndata: [DONE]\n\n"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "body_contains": [
+      "chat.completion.chunk",
+      "\"finish_reason\":\"stop\""
+    ],
+    "sse": {
+      "deltas_join": "Hello world",
+      "done": true
+    }
+  }
+}

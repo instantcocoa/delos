@@ -1,0 +1,32 @@
+{
+  "name": "ollama (OpenAI-compatible): invalid request passthrough",
+  "provider": "ollama",
+  "surface": "openai",
+  "request": {
+    "model": "gemma3:4b",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_responses": [
+    {
+      "status": 400,
+      "content_type": "application/json",
+      "body": "{\"error\":{\"message\":\"model not found, try pulling it first\",\"type\":\"invalid_request_error\",\"code\":null}}"
+    }
+  ],
+  "expect": {
+    "status": 400,
+    "json_paths": {
+      "error.code": "provider_error"
+    },
+    "body_contains": [
+      "model not found, try pulling it first",
+      "provider ollama:"
+    ]
+  }
+}

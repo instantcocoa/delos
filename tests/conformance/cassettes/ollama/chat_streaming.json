@@ -1,0 +1,30 @@
+{
+  "name": "ollama (OpenAI-compatible): streaming chat completion",
+  "provider": "ollama",
+  "surface": "openai",
+  "request": {
+    "model": "gemma3:4b",
+    "stream": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "text/event-stream",
+      "body": "data: {\"id\":\"chatcmpl-338\",\"object\":\"chat.completion.chunk\",\"created\":1730000000,\"model\":\"gemma3:4b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-338\",\"object\":\"chat.completion.chunk\",\"created\":1730000000,\"model\":\"gemma3:4b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-338\",\"object\":\"chat.completion.chunk\",\"created\":1730000000,\"model\":\"gemma3:4b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":2,\"total_tokens\":16}}\n\ndata: [DONE]\n\n"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "sse": {
+      "deltas_join": "Hello world",
+      "done": true
+    }
+  }
+}

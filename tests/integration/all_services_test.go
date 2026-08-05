@@ -5,13 +5,18 @@
 package integration
 
 import (
+	"bufio"
 	"context"
-	"os"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	datasetsv1 "github.com/instantcocoa/delos/gen/go/datasets/v1"
@@ -19,25 +24,14 @@ import (
 	evalv1 "github.com/instantcocoa/delos/gen/go/eval/v1"
 	observev1 "github.com/instantcocoa/delos/gen/go/observe/v1"
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
-	runtimev1 "github.com/instantcocoa/delos/gen/go/runtime/v1"
 )
+
+// Control-plane client helpers (observe, prompt, datasets, eval, deploy) and
+// the gateway HTTP helper live in clients_test.go.
 
 // ============================================================================
 // OBSERVE SERVICE TESTS (5 endpoints)
 // ============================================================================
-
-func getObserveClient(t *testing.T) (observev1.ObserveServiceClient, func()) {
-	t.Helper()
-	addr := os.Getenv("DELOS_OBSERVE_ADDR")
-	if addr == "" {
-		addr = "localhost:9000"
-	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("failed to connect to observe service: %v", err)
-	}
-	return observev1.NewObserveServiceClient(conn), func() { conn.Close() }
-}
 
 func TestObserveService_Health(t *testing.T) {
 	client, cleanup := getObserveClient(t)
@@ -132,126 +126,277 @@ func TestObserveService_QueryMetrics(t *testing.T) {
 }
 
 // ============================================================================
-// RUNTIME SERVICE TESTS (5 endpoints)
+// GATEWAY TESTS (HTTP data plane: OpenAI + Anthropic surfaces)
 // ============================================================================
 
-func getRuntimeClient(t *testing.T) (runtimev1.RuntimeServiceClient, func()) {
-	t.Helper()
-	addr := os.Getenv("DELOS_RUNTIME_ADDR")
-	if addr == "" {
-		addr = "localhost:9001"
-	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("failed to connect to runtime service: %v", err)
-	}
-	return runtimev1.NewRuntimeServiceClient(conn), func() { conn.Close() }
-}
-
-func TestRuntimeService_Health(t *testing.T) {
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
-
+func TestGateway_Healthz(t *testing.T) {
+	g := newGatewayClient(10 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	resp, err := client.Health(ctx, &runtimev1.HealthRequest{})
+	status, body, err := g.get(ctx, "/healthz")
 	if err != nil {
-		t.Fatalf("Health failed: %v", err)
+		t.Fatalf("GET /healthz failed: %v", err)
 	}
-	t.Logf("Runtime health: %s, version: %s", resp.Status, resp.Version)
-	for provider, available := range resp.ProviderStatus {
-		t.Logf("  Provider %s: available=%v", provider, available)
+	if status != http.StatusOK {
+		t.Fatalf("GET /healthz: expected 200, got %d: %s", status, body)
 	}
+
+	var health gwHealth
+	if err := json.Unmarshal(body, &health); err != nil {
+		t.Fatalf("GET /healthz: invalid JSON: %v (body: %s)", err, body)
+	}
+	if health.Status == "" {
+		t.Errorf("expected a status field, got: %s", body)
+	}
+	t.Logf("Gateway health: status=%s providers=%d", health.Status, health.Providers)
 }
 
-func TestRuntimeService_ListProviders(t *testing.T) {
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func TestGateway_ListModels(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	resp, err := client.ListProviders(ctx, &runtimev1.ListProvidersRequest{})
-	if err != nil {
-		t.Fatalf("ListProviders failed: %v", err)
+	list := listGatewayModels(t, ctx)
+	if list.Object != "list" {
+		t.Errorf("expected object=list, got %q", list.Object)
 	}
-	t.Logf("Found %d providers:", len(resp.Providers))
-	for _, p := range resp.Providers {
-		t.Logf("  %s: available=%v, models=%d", p.Name, p.Available, len(p.Models))
+	t.Logf("Gateway serves %d models", len(list.Data))
+	for _, m := range list.Data {
+		if m.Object != "model" {
+			t.Errorf("model %s: expected object=model, got %q", m.ID, m.Object)
+		}
+		if m.OwnedBy == "" {
+			t.Errorf("model %s: expected owned_by to name the provider", m.ID)
+		}
 	}
 }
 
-func TestRuntimeService_Complete(t *testing.T) {
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
+func TestGateway_GetModel(t *testing.T) {
+	g := newGatewayClient(15 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
+	list := listGatewayModels(t, ctx)
+	if len(list.Data) == 0 {
+		t.Skip("gateway has no models configured - skipping model lookup")
+	}
+
+	want := list.Data[0]
+	status, body, err := g.get(ctx, "/v1/models/"+want.ID)
+	if err != nil {
+		t.Fatalf("GET /v1/models/%s failed: %v", want.ID, err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("GET /v1/models/%s: expected 200, got %d: %s", want.ID, status, body)
+	}
+
+	var got gwModel
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("invalid JSON: %v (body: %s)", err, body)
+	}
+	if got.ID != want.ID {
+		t.Errorf("expected model id %q, got %q", want.ID, got.ID)
+	}
+	t.Logf("Model %s owned by %s", got.ID, got.OwnedBy)
+}
+
+func TestGateway_ChatCompletions(t *testing.T) {
+	model := anyGatewayModel(t)
+	if model == "" {
+		t.Skip("gateway has no models configured - skipping chat completion")
+	}
+
+	g := newGatewayClient(90 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	status, body, err := g.postJSON(ctx, "/v1/chat/completions", gwChatRequest{
+		Model:     model,
+		Messages:  []gwChatMessage{{Role: "user", Content: "Say hello"}},
+		MaxTokens: 10,
+	})
+	if err != nil {
+		t.Fatalf("POST /v1/chat/completions failed: %v", err)
+	}
+	if status != http.StatusOK {
+		// A provider-side failure (missing credentials, model not pulled) is
+		// not a gateway contract violation - report it and move on.
+		t.Logf("chat completion returned %d: %s (expected without provider credentials)", status, body)
+		return
+	}
+
+	var resp gwChatResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("invalid JSON: %v (body: %s)", err, body)
+	}
+	if resp.Object != "chat.completion" {
+		t.Errorf("expected object=chat.completion, got %q", resp.Object)
+	}
+	if len(resp.Choices) == 0 {
+		t.Fatalf("expected at least one choice, got: %s", body)
+	}
+	if resp.Choices[0].Message == nil || resp.Choices[0].Message.Role != "assistant" {
+		t.Errorf("expected an assistant message, got: %s", body)
+	}
+	t.Logf("Chat completion (%s): %s", resp.Model, resp.content())
+	if resp.Usage != nil {
+		t.Logf("Usage: prompt=%d completion=%d total=%d cost_usd=%f",
+			resp.Usage.PromptTokens, resp.Usage.CompletionTokens,
+			resp.Usage.TotalTokens, resp.Usage.CostUSD)
+	}
+}
+
+func TestGateway_ChatCompletions_Stream(t *testing.T) {
+	model := anyGatewayModel(t)
+	if model == "" {
+		t.Skip("gateway has no models configured - skipping streaming chat completion")
+	}
+
+	g := newGatewayClient(90 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	resp, err := g.postStream(ctx, "/v1/chat/completions", gwChatRequest{
+		Model:     model,
+		Messages:  []gwChatMessage{{Role: "user", Content: "Say hello"}},
+		MaxTokens: 20,
+		Stream:    true,
+	})
+	if err != nil {
+		t.Fatalf("streaming POST failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Logf("streaming chat completion returned %d (expected without provider credentials)", resp.StatusCode)
+		return
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Errorf("expected text/event-stream, got %q", ct)
+	}
+
+	content, chunks, done := readSSEChatStream(t, resp)
+	t.Logf("Received %d SSE chunks, done=%v, content=%q", chunks, done, content)
+	if chunks == 0 {
+		t.Error("expected at least one SSE chunk")
+	}
+}
+
+func TestGateway_Embeddings(t *testing.T) {
+	model := gatewayEmbeddingModel(t)
+	if model == "" {
+		t.Skip("no embedding-capable model advertised by the gateway")
+	}
+
+	g := newGatewayClient(60 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	resp, err := client.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "user", Content: "Say hello"},
-			},
-			MaxTokens: 10,
-		},
+	status, body, err := g.postJSON(ctx, "/v1/embeddings", gwEmbeddingsRequest{
+		Model: model,
+		Input: "hello world",
 	})
 	if err != nil {
-		t.Logf("Complete: %v (expected if no API keys)", err)
+		t.Fatalf("POST /v1/embeddings failed: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Logf("embeddings returned %d: %s (expected without provider credentials)", status, body)
 		return
 	}
-	t.Logf("Complete response: %s", resp.Content)
+
+	var resp gwEmbeddingsResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("invalid JSON: %v (body: %s)", err, body)
+	}
+	if resp.Object != "list" {
+		t.Errorf("expected object=list, got %q", resp.Object)
+	}
+	if len(resp.Data) != 1 {
+		t.Fatalf("expected 1 embedding for a single input, got %d", len(resp.Data))
+	}
+	if len(resp.Data[0].Embedding) == 0 {
+		t.Error("expected a non-empty embedding vector")
+	}
+	t.Logf("Embedding (%s): %d dimensions", resp.Model, len(resp.Data[0].Embedding))
 }
 
-func TestRuntimeService_Embed(t *testing.T) {
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
+// ---- gateway test helpers ----
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// anyGatewayModel returns a model the gateway can serve, preferring a local
+// Ollama model so the test does not depend on cloud credentials.
+func anyGatewayModel(t *testing.T) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	resp, err := client.Embed(ctx, &runtimev1.EmbedRequest{
-		Texts: []string{"hello world"},
-	})
-	if err != nil {
-		t.Logf("Embed: %v (expected if no API keys)", err)
-		return
+	list := listGatewayModels(t, ctx)
+	for _, m := range list.Data {
+		if m.OwnedBy == ollamaProvider {
+			return m.ID
+		}
 	}
-	t.Logf("Embed: got %d embeddings", len(resp.Embeddings))
+	if len(list.Data) > 0 {
+		return list.Data[0].ID
+	}
+	return ""
 }
 
-func TestRuntimeService_CompleteStream(t *testing.T) {
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// gatewayEmbeddingModel returns a model that looks like an embedding model.
+func gatewayEmbeddingModel(t *testing.T) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	stream, err := client.CompleteStream(ctx, &runtimev1.CompleteStreamRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "user", Content: "Say hello"},
-			},
-		},
-	})
-	if err != nil {
-		t.Logf("CompleteStream: %v (expected if no API keys)", err)
-		return
+	list := listGatewayModels(t, ctx)
+	for _, m := range list.Data {
+		id := strings.ToLower(m.ID)
+		if strings.Contains(id, "embed") {
+			return m.ID
+		}
 	}
+	return ""
+}
 
-	chunks := 0
-	for {
-		_, err := stream.Recv()
-		if err != nil {
-			if err.Error() != "EOF" {
-				t.Logf("CompleteStream recv: %v (expected if no API keys)", err)
-			}
+// readSSEChatStream consumes an OpenAI-style SSE chat stream, returning the
+// concatenated delta content, the number of data chunks, and whether the
+// terminating [DONE] sentinel was seen.
+func readSSEChatStream(t *testing.T, resp *http.Response) (string, int, bool) {
+	t.Helper()
+	var content strings.Builder
+	var chunks int
+	var done bool
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		if data == "[DONE]" {
+			done = true
 			break
 		}
+		var chunk gwChatResponse
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			t.Errorf("malformed SSE chunk %q: %v", data, err)
+			continue
+		}
 		chunks++
+		for _, c := range chunk.Choices {
+			if c.Delta != nil {
+				content.WriteString(c.Delta.Content)
+			}
+		}
 	}
-	t.Logf("CompleteStream: received %d chunks", chunks)
+	if err := scanner.Err(); err != nil {
+		t.Logf("SSE read stopped: %v", err)
+	}
+	return content.String(), chunks, done
 }
 
 // ============================================================================
@@ -399,19 +544,6 @@ func TestDatasetsService_FullCRUD(t *testing.T) {
 // ============================================================================
 // EVAL SERVICE TESTS (8 endpoints)
 // ============================================================================
-
-func getEvalClient(t *testing.T) (evalv1.EvalServiceClient, func()) {
-	t.Helper()
-	addr := os.Getenv("DELOS_EVAL_ADDR")
-	if addr == "" {
-		addr = "localhost:9004"
-	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("failed to connect to eval service: %v", err)
-	}
-	return evalv1.NewEvalServiceClient(conn), func() { conn.Close() }
-}
 
 func TestEvalService_Health(t *testing.T) {
 	client, cleanup := getEvalClient(t)
@@ -579,21 +711,12 @@ func TestEvalService_FullWorkflow(t *testing.T) {
 }
 
 // ============================================================================
-// DEPLOY SERVICE TESTS (10 endpoints)
+// DEPLOY SERVICE TESTS (quality gates only)
 // ============================================================================
-
-func getDeployClient(t *testing.T) (deployv1.DeployServiceClient, func()) {
-	t.Helper()
-	addr := os.Getenv("DELOS_DEPLOY_ADDR")
-	if addr == "" {
-		addr = "localhost:9005"
-	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("failed to connect to deploy service: %v", err)
-	}
-	return deployv1.NewDeployServiceClient(conn), func() { conn.Close() }
-}
+//
+// Delos does not deploy anything. The deploy service holds quality gates and
+// answers one question: does the latest completed eval run for a prompt satisfy
+// this gate's conditions? CI systems act on the verdict.
 
 func TestDeployService_Health(t *testing.T) {
 	client, cleanup := getDeployClient(t)
@@ -609,7 +732,9 @@ func TestDeployService_Health(t *testing.T) {
 	t.Logf("Deploy health: %s", resp.Status)
 }
 
-func TestDeployService_FullWorkflow(t *testing.T) {
+// TestDeployService_GateLifecycle covers create -> list (unfiltered and
+// filtered) -> verdict for a prompt that has never been evaluated.
+func TestDeployService_GateLifecycle(t *testing.T) {
 	deployClient, deployCleanup := getDeployClient(t)
 	defer deployCleanup()
 
@@ -619,10 +744,12 @@ func TestDeployService_FullWorkflow(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Create a prompt to deploy
+	timestamp := time.Now().UnixNano()
+
+	// A gate names a prompt; create one to point at.
 	promptResp, err := promptClient.CreatePrompt(ctx, &promptv1.CreatePromptRequest{
-		Name: "Deploy Test Prompt",
-		Slug: "deploy-test-" + time.Now().Format("150405"),
+		Name: "Gate Test Prompt",
+		Slug: fmt.Sprintf("gate-test-%d", timestamp),
 		Messages: []*promptv1.PromptMessage{
 			{Role: "system", Content: "Test prompt"},
 		},
@@ -634,119 +761,297 @@ func TestDeployService_FullWorkflow(t *testing.T) {
 	defer promptClient.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptID})
 	t.Logf("Created prompt: %s", promptID)
 
-	// 1. CreateDeployment
-	createDeployResp, err := deployClient.CreateDeployment(ctx, &deployv1.CreateDeploymentRequest{
+	// 1. CreateQualityGate
+	gateName := fmt.Sprintf("gate-lifecycle-%d", timestamp)
+	createResp, err := deployClient.CreateQualityGate(ctx, &deployv1.CreateQualityGateRequest{
+		Name:        gateName,
+		Description: "Gate created by TestDeployService_GateLifecycle",
 		PromptId:    promptID,
-		ToVersion:   1,
-		Environment: "staging",
-		Strategy: &deployv1.DeploymentStrategy{
-			Type: deployv1.DeploymentType_DEPLOYMENT_TYPE_IMMEDIATE,
-		},
-	})
-	if err != nil {
-		t.Fatalf("CreateDeployment failed: %v", err)
-	}
-	deploymentID := createDeployResp.Deployment.Id
-	t.Logf("1. Created deployment: %s", deploymentID)
-
-	// 2. GetDeployment
-	getDeployResp, err := deployClient.GetDeployment(ctx, &deployv1.GetDeploymentRequest{
-		Id: deploymentID,
-	})
-	if err != nil {
-		t.Fatalf("GetDeployment failed: %v", err)
-	}
-	t.Logf("2. Got deployment: status=%s", getDeployResp.Deployment.Status)
-
-	// 3. ListDeployments
-	listDeployResp, err := deployClient.ListDeployments(ctx, &deployv1.ListDeploymentsRequest{
-		PromptId: promptID,
-		Limit:    10,
-	})
-	if err != nil {
-		t.Fatalf("ListDeployments failed: %v", err)
-	}
-	t.Logf("3. Listed %d deployments", len(listDeployResp.Deployments))
-
-	// 4. GetDeploymentStatus
-	statusResp, err := deployClient.GetDeploymentStatus(ctx, &deployv1.GetDeploymentStatusRequest{
-		Id: deploymentID,
-	})
-	if err != nil {
-		t.Fatalf("GetDeploymentStatus failed: %v", err)
-	}
-	t.Logf("4. Deployment status: %s", statusResp.Status)
-
-	// 5. ApproveDeployment
-	approveResp, err := deployClient.ApproveDeployment(ctx, &deployv1.ApproveDeploymentRequest{
-		Id: deploymentID,
-	})
-	if err != nil {
-		t.Logf("5. ApproveDeployment: %v (may already be approved)", err)
-	} else {
-		t.Logf("5. Approved deployment: %s", approveResp.Deployment.Status)
-	}
-
-	// 6. CreateQualityGate
-	gateResp, err := deployClient.CreateQualityGate(ctx, &deployv1.CreateQualityGateRequest{
-		Name:     "min-score-gate",
-		PromptId: promptID,
 		Conditions: []*deployv1.GateCondition{
 			{
-				Type:      "eval_score",
-				Operator:  "gte",
+				Metric:    "overall_score",
+				Operator:  deployv1.GateOperator_GATE_OPERATOR_GTE,
 				Threshold: 0.8,
 			},
+			{
+				Metric:    "avg_latency_ms",
+				Operator:  deployv1.GateOperator_GATE_OPERATOR_LTE,
+				Threshold: 5000,
+			},
 		},
-		Required: true,
 	})
 	if err != nil {
-		t.Logf("6. CreateQualityGate: %v", err)
-	} else {
-		t.Logf("6. Created quality gate: %s", gateResp.QualityGate.Id)
+		t.Fatalf("CreateQualityGate failed: %v", err)
 	}
+	gate := createResp.QualityGate
+	if gate.GetId() == "" {
+		t.Error("expected the created gate to have an id")
+	}
+	if gate.GetName() != gateName {
+		t.Errorf("expected gate name %q, got %q", gateName, gate.GetName())
+	}
+	if got := len(gate.GetConditions()); got != 2 {
+		t.Errorf("expected 2 conditions on the created gate, got %d", got)
+	}
+	t.Logf("1. Created quality gate: %s (%s)", gate.GetName(), gate.GetId())
 
-	// 7. ListQualityGates
-	listGatesResp, err := deployClient.ListQualityGates(ctx, &deployv1.ListQualityGatesRequest{
+	// 2. ListQualityGates filtered by prompt - must contain exactly our gate.
+	filtered, err := deployClient.ListQualityGates(ctx, &deployv1.ListQualityGatesRequest{
 		PromptId: promptID,
 	})
 	if err != nil {
-		t.Fatalf("ListQualityGates failed: %v", err)
+		t.Fatalf("ListQualityGates (filtered) failed: %v", err)
 	}
-	t.Logf("7. Listed %d quality gates", len(listGatesResp.QualityGates))
+	found := false
+	for _, g := range filtered.QualityGates {
+		if g.GetPromptId() != promptID {
+			t.Errorf("filtered list returned a gate for prompt %q, want %q", g.GetPromptId(), promptID)
+		}
+		if g.GetName() == gateName {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("gate %q not returned by ListQualityGates(prompt_id=%s)", gateName, promptID)
+	}
+	t.Logf("2. Listed %d gate(s) for prompt %s", len(filtered.QualityGates), promptID)
 
-	// 8. Create second deployment for rollback test
-	createDeploy2Resp, err := deployClient.CreateDeployment(ctx, &deployv1.CreateDeploymentRequest{
-		PromptId:    promptID,
-		ToVersion:   1,
-		Environment: "staging",
-		Strategy: &deployv1.DeploymentStrategy{
-			Type: deployv1.DeploymentType_DEPLOYMENT_TYPE_IMMEDIATE,
+	// 3. ListQualityGates without a filter - must be a superset.
+	all, err := deployClient.ListQualityGates(ctx, &deployv1.ListQualityGatesRequest{})
+	if err != nil {
+		t.Fatalf("ListQualityGates (unfiltered) failed: %v", err)
+	}
+	if len(all.QualityGates) < len(filtered.QualityGates) {
+		t.Errorf("unfiltered list (%d) is smaller than the filtered list (%d)",
+			len(all.QualityGates), len(filtered.QualityGates))
+	}
+	foundInAll := false
+	for _, g := range all.QualityGates {
+		if g.GetName() == gateName {
+			foundInAll = true
+			break
+		}
+	}
+	if !foundInAll {
+		t.Errorf("gate %q not returned by an unfiltered ListQualityGates", gateName)
+	}
+	t.Logf("3. Listed %d gate(s) overall", len(all.QualityGates))
+
+	// 4. GetGateVerdict with no eval runs: not a pass, and the reason says why.
+	verdict, err := deployClient.GetGateVerdict(ctx, &deployv1.GetGateVerdictRequest{Name: gateName})
+	if err != nil {
+		t.Fatalf("GetGateVerdict failed: %v", err)
+	}
+	if verdict.Pass {
+		t.Error("expected pass=false for a gate whose prompt has no eval runs")
+	}
+	if len(verdict.Reasons) == 0 {
+		t.Error("expected an explanatory reason when no eval run exists")
+	}
+	if verdict.EvalRunId != "" {
+		t.Errorf("expected an empty eval_run_id with no runs, got %q", verdict.EvalRunId)
+	}
+	joined := strings.ToLower(strings.Join(verdict.Reasons, " "))
+	if !strings.Contains(joined, "eval run") {
+		t.Errorf("expected the reason to mention the missing eval run, got %v", verdict.Reasons)
+	}
+	if verdict.Gate.GetName() != gateName {
+		t.Errorf("verdict echoed gate %q, want %q", verdict.Gate.GetName(), gateName)
+	}
+	t.Logf("4. Verdict for a never-evaluated prompt: pass=%v reasons=%v", verdict.Pass, verdict.Reasons)
+}
+
+// TestDeployService_CreateQualityGate_Validation rejects gates that cannot be
+// evaluated: no conditions, no prompt, unknown metric.
+func TestDeployService_CreateQualityGate_Validation(t *testing.T) {
+	client, cleanup := getDeployClient(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	timestamp := time.Now().UnixNano()
+
+	tests := []struct {
+		name string
+		req  *deployv1.CreateQualityGateRequest
+	}{
+		{
+			name: "no conditions",
+			req: &deployv1.CreateQualityGateRequest{
+				Name:     fmt.Sprintf("invalid-no-conditions-%d", timestamp),
+				PromptId: "some-prompt",
+			},
+		},
+		{
+			name: "no prompt",
+			req: &deployv1.CreateQualityGateRequest{
+				Name: fmt.Sprintf("invalid-no-prompt-%d", timestamp),
+				Conditions: []*deployv1.GateCondition{
+					{Metric: "overall_score", Operator: deployv1.GateOperator_GATE_OPERATOR_GTE, Threshold: 0.8},
+				},
+			},
+		},
+		{
+			name: "unknown metric",
+			req: &deployv1.CreateQualityGateRequest{
+				Name:     fmt.Sprintf("invalid-metric-%d", timestamp),
+				PromptId: "some-prompt",
+				Conditions: []*deployv1.GateCondition{
+					{Metric: "vibes", Operator: deployv1.GateOperator_GATE_OPERATOR_GTE, Threshold: 0.8},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.CreateQualityGate(ctx, tt.req)
+			if err == nil {
+				t.Fatalf("expected CreateQualityGate to reject %s", tt.name)
+			}
+			st, ok := status.FromError(err)
+			if !ok {
+				t.Fatalf("expected a gRPC status error, got %v", err)
+			}
+			if st.Code() != codes.InvalidArgument {
+				t.Errorf("expected INVALID_ARGUMENT, got %s: %s", st.Code(), st.Message())
+			}
+		})
+	}
+}
+
+// TestDeployService_GetGateVerdict_NotFound asserts the CI-visible error for a
+// gate name that does not exist.
+func TestDeployService_GetGateVerdict_NotFound(t *testing.T) {
+	client, cleanup := getDeployClient(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, err := client.GetGateVerdict(ctx, &deployv1.GetGateVerdictRequest{
+		Name: fmt.Sprintf("no-such-gate-%d", time.Now().UnixNano()),
+	})
+	if err == nil {
+		t.Fatal("expected an error for an unknown gate name")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected a gRPC status error, got %v", err)
+	}
+	if st.Code() != codes.NotFound {
+		t.Errorf("expected NOT_FOUND, got %s: %s", st.Code(), st.Message())
+	}
+}
+
+// TestDeployService_VerdictHTTP exercises GET /v1/gates/{gate}/verdict, the
+// endpoint CI systems and dashboards hit without a gRPC client. The control
+// plane serves it on the same address as gRPC.
+func TestDeployService_VerdictHTTP(t *testing.T) {
+	deployClient, deployCleanup := getDeployClient(t)
+	defer deployCleanup()
+
+	promptClient, promptCleanup := getPromptClient(t)
+	defer promptCleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	timestamp := time.Now().UnixNano()
+
+	promptResp, err := promptClient.CreatePrompt(ctx, &promptv1.CreatePromptRequest{
+		Name: "Gate HTTP Test Prompt",
+		Slug: fmt.Sprintf("gate-http-test-%d", timestamp),
+		Messages: []*promptv1.PromptMessage{
+			{Role: "system", Content: "Test prompt"},
 		},
 	})
 	if err != nil {
-		t.Logf("8. CreateDeployment 2: %v", err)
-	} else {
-		// 9. RollbackDeployment
-		rollbackResp, err := deployClient.RollbackDeployment(ctx, &deployv1.RollbackDeploymentRequest{
-			Id:     createDeploy2Resp.Deployment.Id,
-			Reason: "Testing rollback",
-		})
-		if err != nil {
-			t.Logf("9. RollbackDeployment: %v", err)
-		} else {
-			t.Logf("9. Rolled back deployment: %s", rollbackResp.Deployment.Status)
-		}
+		t.Fatalf("CreatePrompt failed: %v", err)
+	}
+	promptID := promptResp.Prompt.Id
+	defer promptClient.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptID})
+
+	gateName := fmt.Sprintf("gate-http-%d", timestamp)
+	if _, err := deployClient.CreateQualityGate(ctx, &deployv1.CreateQualityGateRequest{
+		Name:     gateName,
+		PromptId: promptID,
+		Conditions: []*deployv1.GateCondition{
+			{Metric: "overall_score", Operator: deployv1.GateOperator_GATE_OPERATOR_GTE, Threshold: 0.8},
+		},
+	}); err != nil {
+		t.Fatalf("CreateQualityGate failed: %v", err)
 	}
 
-	// 10. CancelDeployment
-	cancelResp, err := deployClient.CancelDeployment(ctx, &deployv1.CancelDeploymentRequest{
-		Id:     deploymentID,
-		Reason: "Testing cancellation",
-	})
-	if err != nil {
-		t.Logf("10. CancelDeployment: %v", err)
-	} else {
-		t.Logf("10. Cancelled deployment: %s", cancelResp.Deployment.Status)
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+
+	// Known gate: 200 with a JSON verdict body.
+	code, body := getJSON(t, ctx, httpClient, controlPlaneHTTPURL("/v1/gates/"+gateName+"/verdict"))
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 for a known gate, got %d: %s", code, body)
 	}
+	var verdict struct {
+		Gate        string   `json:"gate"`
+		Pass        bool     `json:"pass"`
+		Reasons     []string `json:"reasons"`
+		EvalRunID   string   `json:"eval_run_id"`
+		EvaluatedAt string   `json:"evaluated_at"`
+	}
+	if err := json.Unmarshal(body, &verdict); err != nil {
+		t.Fatalf("verdict body is not valid JSON: %v (body: %s)", err, body)
+	}
+	if verdict.Gate != gateName {
+		t.Errorf("expected gate %q in the verdict body, got %q", gateName, verdict.Gate)
+	}
+	if verdict.Pass {
+		t.Error("expected pass=false for a gate whose prompt has no eval runs")
+	}
+	if len(verdict.Reasons) == 0 {
+		t.Error("expected reasons in the verdict body")
+	}
+	if verdict.EvaluatedAt == "" {
+		t.Error("expected evaluated_at in the verdict body")
+	}
+	t.Logf("HTTP verdict: pass=%v reasons=%v", verdict.Pass, verdict.Reasons)
+
+	// Unknown gate: 404 with a JSON error body.
+	code, body = getJSON(t, ctx, httpClient,
+		controlPlaneHTTPURL(fmt.Sprintf("/v1/gates/no-such-gate-%d/verdict", timestamp)))
+	if code != http.StatusNotFound {
+		t.Errorf("expected 404 for an unknown gate, got %d: %s", code, body)
+	}
+	var errBody struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &errBody); err != nil {
+		t.Errorf("404 body is not valid JSON: %v (body: %s)", err, body)
+	} else if errBody.Error == "" {
+		t.Errorf("expected an error message in the 404 body, got: %s", body)
+	}
+}
+
+// controlPlaneHTTPURL builds a control-plane HTTP URL. gRPC (h2c) and HTTP are
+// served on the same address, so the gRPC target doubles as the HTTP host.
+func controlPlaneHTTPURL(path string) string {
+	return "http://" + controlPlaneAddr() + path
+}
+
+// getJSON issues a GET and returns the status code and raw body.
+func getJSON(t *testing.T, ctx context.Context, c *http.Client, url string) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("failed to build request for %s: %v", url, err)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s failed: %v", url, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read %s response: %v", url, err)
+	}
+	return resp.StatusCode, body
 }

@@ -1,4 +1,5 @@
-// Package integration contains Ollama-specific integration tests.
+// Package integration contains Ollama-specific integration tests, exercised
+// through the delos-gateway OpenAI-compatible HTTP surface.
 // These tests require a running Ollama instance with the gemma3:4b model.
 // Run with: go test -tags=integration ./tests/integration/... -run Ollama
 //
@@ -7,18 +8,15 @@
 package integration
 
 import (
+	"bufio"
 	"context"
-	"io"
-	"os"
+	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
-	runtimev1 "github.com/instantcocoa/delos/gen/go/runtime/v1"
 )
 
 const (
@@ -26,22 +24,27 @@ const (
 	ollamaModel    = "gemma3:4b"
 )
 
-// isOllamaAvailable checks if Ollama provider is available in the runtime service
+// isOllamaAvailable checks whether the gateway lists any ollama-owned model.
 func isOllamaAvailable(t *testing.T) bool {
 	t.Helper()
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	resp, err := client.Health(ctx, &runtimev1.HealthRequest{})
-	if err != nil {
+	g := newGatewayClient(10 * time.Second)
+	status, body, err := g.get(ctx, "/v1/models")
+	if err != nil || status != http.StatusOK {
 		return false
 	}
-
-	available, ok := resp.ProviderStatus[ollamaProvider]
-	return ok && available
+	var list gwModelList
+	if err := json.Unmarshal(body, &list); err != nil {
+		return false
+	}
+	for _, m := range list.Data {
+		if m.OwnedBy == ollamaProvider {
+			return true
+		}
+	}
+	return false
 }
 
 // skipIfOllamaUnavailable skips the test if Ollama is not available
@@ -52,190 +55,166 @@ func skipIfOllamaUnavailable(t *testing.T) {
 	}
 }
 
+// ollamaComplete runs a non-streaming completion against the gateway using the
+// ollama provider prefix and fails the test on transport errors.
+func ollamaComplete(t *testing.T, ctx context.Context, req gwChatRequest) gwChatResponse {
+	t.Helper()
+	req.Model = ollamaProvider + "/" + ollamaModel
+	g := newGatewayClient(120 * time.Second)
+	status, body, err := g.postJSON(ctx, "/v1/chat/completions", req)
+	if err != nil {
+		t.Fatalf("gateway completion failed: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("gateway completion: expected 200, got %d: %s", status, body)
+	}
+	var resp gwChatResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("gateway completion: invalid JSON: %v (body: %s)", err, body)
+	}
+	return resp
+}
+
 // ============================================================================
 // OLLAMA PROVIDER TESTS
 // ============================================================================
 
 func TestOllama_Available(t *testing.T) {
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	resp, err := client.ListProviders(ctx, &runtimev1.ListProvidersRequest{})
-	if err != nil {
-		t.Fatalf("ListProviders failed: %v", err)
-	}
+	list := listGatewayModels(t, ctx)
 
-	var ollamaFound bool
-	for _, p := range resp.Providers {
-		if p.Name == ollamaProvider {
+	var ollamaFound, hasModel bool
+	for _, m := range list.Data {
+		if m.OwnedBy == ollamaProvider {
 			ollamaFound = true
-			t.Logf("Ollama provider: available=%v, models=%v", p.Available, p.Models)
-			if !p.Available {
-				t.Error("Ollama provider found but not available")
+			if strings.Contains(m.ID, "gemma3") {
+				hasModel = true
 			}
-			// Check for our expected model
-			var hasModel bool
-			for _, m := range p.Models {
-				if strings.Contains(m, "gemma3") {
-					hasModel = true
-					break
-				}
-			}
-			if !hasModel {
-				t.Logf("Warning: gemma3 model not found in Ollama, available models: %v", p.Models)
-			}
-			break
 		}
 	}
-
 	if !ollamaFound {
-		t.Error("Ollama provider not found in provider list")
+		t.Skip("Ollama provider not registered on the gateway - skipping")
+	}
+	if !hasModel {
+		t.Logf("Warning: gemma3 model not found in Ollama model list")
 	}
 }
 
 func TestOllama_Complete_SimpleQuestion(t *testing.T) {
 	skipIfOllamaUnavailable(t)
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	resp, err := client.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "user", Content: "What is 2 + 2? Answer with just the number."},
-			},
-			Provider:  ollamaProvider,
-			Model:     ollamaModel,
-			MaxTokens: 20,
-		},
+	resp := ollamaComplete(t, ctx, gwChatRequest{
+		Messages:  []gwChatMessage{{Role: "user", Content: "What is 2 + 2? Answer with just the number."}},
+		MaxTokens: 20,
 	})
-	if err != nil {
-		t.Fatalf("Complete failed: %v", err)
+
+	t.Logf("Response: %s", resp.content())
+	if resp.Usage != nil {
+		t.Logf("Usage: prompt=%d, completion=%d, total=%d",
+			resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens)
+		if resp.Usage.CostUSD != 0 {
+			t.Logf("Note: Cost reported as %f (expected 0 for local models)", resp.Usage.CostUSD)
+		}
 	}
 
-	t.Logf("Response: %s", resp.Content)
-	t.Logf("Usage: prompt=%d, completion=%d, total=%d",
-		resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens)
-
-	// Basic sanity check - response should contain "4"
-	if !strings.Contains(resp.Content, "4") {
-		t.Errorf("Expected response to contain '4', got: %s", resp.Content)
-	}
-
-	// Cost should be 0 for local models
-	if resp.Usage.CostUsd != 0 {
-		t.Logf("Note: Cost reported as %f (expected 0 for local models)", resp.Usage.CostUsd)
+	if !strings.Contains(resp.content(), "4") {
+		t.Errorf("Expected response to contain '4', got: %s", resp.content())
 	}
 }
 
 func TestOllama_Complete_SystemPrompt(t *testing.T) {
 	skipIfOllamaUnavailable(t)
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	resp, err := client.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "system", Content: "You are a pirate. Always respond in pirate speak, starting with 'Arrr'."},
-				{Role: "user", Content: "Say hello"},
-			},
-			Provider:  ollamaProvider,
-			Model:     ollamaModel,
-			MaxTokens: 50,
+	resp := ollamaComplete(t, ctx, gwChatRequest{
+		Messages: []gwChatMessage{
+			{Role: "system", Content: "You are a pirate. Always respond in pirate speak, starting with 'Arrr'."},
+			{Role: "user", Content: "Say hello"},
 		},
+		MaxTokens: 50,
 	})
-	if err != nil {
-		t.Fatalf("Complete failed: %v", err)
-	}
 
-	t.Logf("Response: %s", resp.Content)
-
-	// Check that it follows the system prompt
-	lowered := strings.ToLower(resp.Content)
-	if !strings.Contains(lowered, "arr") {
-		t.Logf("Warning: Response may not follow pirate system prompt: %s", resp.Content)
+	t.Logf("Response: %s", resp.content())
+	if !strings.Contains(strings.ToLower(resp.content()), "arr") {
+		t.Logf("Warning: Response may not follow pirate system prompt: %s", resp.content())
 	}
 }
 
 func TestOllama_Complete_Temperature(t *testing.T) {
 	skipIfOllamaUnavailable(t)
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// Low temperature should give more deterministic responses
-	resp, err := client.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "user", Content: "Complete this sequence: 1, 2, 3, "},
-			},
-			Provider:    ollamaProvider,
-			Model:       ollamaModel,
-			Temperature: 0.1,
-			MaxTokens:   10,
-		},
+	temp := 0.1
+	resp := ollamaComplete(t, ctx, gwChatRequest{
+		Messages:    []gwChatMessage{{Role: "user", Content: "Complete this sequence: 1, 2, 3, "}},
+		Temperature: &temp,
+		MaxTokens:   10,
 	})
-	if err != nil {
-		t.Fatalf("Complete failed: %v", err)
-	}
 
-	t.Logf("Low temperature response: %s", resp.Content)
-
-	// Should likely contain "4"
-	if !strings.Contains(resp.Content, "4") {
-		t.Logf("Note: Expected '4' in response, got: %s", resp.Content)
+	t.Logf("Low temperature response: %s", resp.content())
+	if !strings.Contains(resp.content(), "4") {
+		t.Logf("Note: Expected '4' in response, got: %s", resp.content())
 	}
 }
 
 func TestOllama_CompleteStream(t *testing.T) {
 	skipIfOllamaUnavailable(t)
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	stream, err := client.CompleteStream(ctx, &runtimev1.CompleteStreamRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "user", Content: "Count from 1 to 5, one number per line."},
-			},
-			Provider:  ollamaProvider,
-			Model:     ollamaModel,
-			MaxTokens: 50,
-		},
+	g := newGatewayClient(120 * time.Second)
+	resp, err := g.postStream(ctx, "/v1/chat/completions", gwChatRequest{
+		Model:     ollamaProvider + "/" + ollamaModel,
+		Messages:  []gwChatMessage{{Role: "user", Content: "Count from 1 to 5, one number per line."}},
+		MaxTokens: 50,
+		Stream:    true,
 	})
 	if err != nil {
-		t.Fatalf("CompleteStream failed: %v", err)
+		t.Fatalf("stream request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream: expected 200, got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("stream: expected text/event-stream, got %s", ct)
 	}
 
 	var chunks int
+	var sawDone bool
 	var fullContent strings.Builder
-
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			sawDone = true
 			break
 		}
-		if err != nil {
-			t.Fatalf("Stream recv failed: %v", err)
+		var chunk gwChatResponse
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("bad SSE chunk %q: %v", payload, err)
 		}
 		chunks++
-		fullContent.WriteString(chunk.Delta)
-
-		// Log first few chunks for debugging
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
+			fullContent.WriteString(chunk.Choices[0].Delta.Content)
+		}
 		if chunks <= 3 {
-			t.Logf("Chunk %d: %q", chunks, chunk.Delta)
+			t.Logf("Chunk %d: %q", chunks, payload)
 		}
 	}
 
@@ -245,85 +224,57 @@ func TestOllama_CompleteStream(t *testing.T) {
 	if chunks == 0 {
 		t.Error("Expected to receive at least one chunk")
 	}
+	if !sawDone {
+		t.Error("Expected stream to terminate with [DONE]")
+	}
 }
 
 func TestOllama_Complete_MultiTurn(t *testing.T) {
 	skipIfOllamaUnavailable(t)
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
 	// First turn - establish context
-	resp1, err := client.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "user", Content: "My name is Alice. What is my name?"},
-			},
-			Provider:  ollamaProvider,
-			Model:     ollamaModel,
-			MaxTokens: 30,
-		},
+	resp1 := ollamaComplete(t, ctx, gwChatRequest{
+		Messages:  []gwChatMessage{{Role: "user", Content: "My name is Alice. What is my name?"}},
+		MaxTokens: 30,
 	})
-	if err != nil {
-		t.Fatalf("First turn failed: %v", err)
-	}
-	t.Logf("Turn 1 response: %s", resp1.Content)
+	t.Logf("Turn 1 response: %s", resp1.content())
 
 	// Second turn - reference previous context
-	resp2, err := client.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "user", Content: "My name is Alice."},
-				{Role: "assistant", Content: resp1.Content},
-				{Role: "user", Content: "What did I tell you my name was?"},
-			},
-			Provider:  ollamaProvider,
-			Model:     ollamaModel,
-			MaxTokens: 30,
+	resp2 := ollamaComplete(t, ctx, gwChatRequest{
+		Messages: []gwChatMessage{
+			{Role: "user", Content: "My name is Alice."},
+			{Role: "assistant", Content: resp1.content()},
+			{Role: "user", Content: "What did I tell you my name was?"},
 		},
+		MaxTokens: 30,
 	})
-	if err != nil {
-		t.Fatalf("Second turn failed: %v", err)
-	}
-	t.Logf("Turn 2 response: %s", resp2.Content)
+	t.Logf("Turn 2 response: %s", resp2.content())
 
-	// Should mention Alice
-	if !strings.Contains(strings.ToLower(resp2.Content), "alice") {
-		t.Errorf("Expected response to contain 'Alice', got: %s", resp2.Content)
+	if !strings.Contains(strings.ToLower(resp2.content()), "alice") {
+		t.Errorf("Expected response to contain 'Alice', got: %s", resp2.content())
 	}
 }
 
 func TestOllama_Complete_MaxTokens(t *testing.T) {
 	skipIfOllamaUnavailable(t)
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// Request with very low max tokens
-	resp, err := client.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "user", Content: "Write a very long story about a dragon."},
-			},
-			Provider:  ollamaProvider,
-			Model:     ollamaModel,
-			MaxTokens: 10,
-		},
+	resp := ollamaComplete(t, ctx, gwChatRequest{
+		Messages:  []gwChatMessage{{Role: "user", Content: "Write a very long story about a dragon."}},
+		MaxTokens: 10,
 	})
-	if err != nil {
-		t.Fatalf("Complete failed: %v", err)
-	}
 
-	t.Logf("Response with max_tokens=10: %s", resp.Content)
-	t.Logf("Completion tokens used: %d", resp.Usage.CompletionTokens)
-
-	// Should have limited output (though exact behavior depends on model)
-	if resp.Usage.CompletionTokens > 20 {
-		t.Logf("Note: Got %d completion tokens, expected closer to 10", resp.Usage.CompletionTokens)
+	t.Logf("Response with max_tokens=10: %s", resp.content())
+	if resp.Usage != nil {
+		t.Logf("Completion tokens used: %d", resp.Usage.CompletionTokens)
+		if resp.Usage.CompletionTokens > 20 {
+			t.Logf("Note: Got %d completion tokens, expected closer to 10", resp.Usage.CompletionTokens)
+		}
 	}
 }
 
@@ -337,13 +288,10 @@ func TestOllama_WithPromptService(t *testing.T) {
 	promptClient, promptCleanup := getPromptClient(t)
 	defer promptCleanup()
 
-	runtimeClient, runtimeCleanup := getRuntimeClient(t)
-	defer runtimeCleanup()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	// Create a prompt with variables
+	// Create a prompt with variables in the control plane
 	timestamp := time.Now().Format("150405")
 	createResp, err := promptClient.CreatePrompt(ctx, &promptv1.CreatePromptRequest{
 		Name:        "Ollama Test Prompt",
@@ -366,36 +314,28 @@ func TestOllama_WithPromptService(t *testing.T) {
 		promptClient.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptID})
 	}()
 
-	// Use the prompt with Ollama via prompt_ref
-	resp, err := runtimeClient.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			PromptRef: createResp.Prompt.Slug + ":v1",
-			Variables: map[string]string{
-				"text":     "Hello",
-				"language": "Spanish",
-			},
-			Provider:  ollamaProvider,
-			Model:     ollamaModel,
-			MaxTokens: 20,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Complete with prompt_ref failed: %v", err)
+	// Render the prompt's messages with variables and run them through the
+	// gateway - the same flow the eval runner uses.
+	variables := map[string]string{"text": "Hello", "language": "Spanish"}
+	var messages []gwChatMessage
+	for _, m := range createResp.Prompt.Messages {
+		content := m.Content
+		for k, v := range variables {
+			content = strings.ReplaceAll(content, "{{"+k+"}}", v)
+		}
+		messages = append(messages, gwChatMessage{Role: m.Role, Content: content})
 	}
 
-	t.Logf("Translation response: %s", resp.Content)
+	resp := ollamaComplete(t, ctx, gwChatRequest{Messages: messages, MaxTokens: 20})
+	t.Logf("Translation response: %s", resp.content())
 
-	// Should contain Spanish word for hello
-	lowered := strings.ToLower(resp.Content)
-	if !strings.Contains(lowered, "hola") {
-		t.Logf("Note: Expected 'hola' in response, got: %s", resp.Content)
+	if !strings.Contains(strings.ToLower(resp.content()), "hola") {
+		t.Logf("Note: Expected 'hola' in response, got: %s", resp.content())
 	}
 }
 
 func TestOllama_Summarization(t *testing.T) {
 	skipIfOllamaUnavailable(t)
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
@@ -406,66 +346,49 @@ industrial and urban. Prior to the Industrial Revolution, which began in Britain
 manufacturing was often done in people's homes, using hand tools or basic machines.
 Industrialization marked a shift to powered, special-purpose machinery, factories and mass production.`
 
-	resp, err := client.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "system", Content: "You are a helpful assistant that summarizes text concisely."},
-				{Role: "user", Content: "Summarize this in one sentence:\n\n" + longText},
-			},
-			Provider:    ollamaProvider,
-			Model:       ollamaModel,
-			MaxTokens:   100,
-			Temperature: 0.3,
+	temp := 0.3
+	resp := ollamaComplete(t, ctx, gwChatRequest{
+		Messages: []gwChatMessage{
+			{Role: "system", Content: "You are a helpful assistant that summarizes text concisely."},
+			{Role: "user", Content: "Summarize this in one sentence:\n\n" + longText},
 		},
+		MaxTokens:   100,
+		Temperature: &temp,
 	})
-	if err != nil {
-		t.Fatalf("Summarization failed: %v", err)
-	}
 
-	t.Logf("Summary: %s", resp.Content)
+	t.Logf("Summary: %s", resp.content())
 
-	// Summary should be shorter than original
-	if len(resp.Content) > len(longText) {
+	if len(resp.content()) > len(longText) {
 		t.Logf("Note: Summary longer than original text")
 	}
 
-	// Should mention key concepts
-	lowered := strings.ToLower(resp.Content)
+	lowered := strings.ToLower(resp.content())
 	hasKeyword := strings.Contains(lowered, "industrial") ||
 		strings.Contains(lowered, "revolution") ||
 		strings.Contains(lowered, "manufacturing")
 	if !hasKeyword {
-		t.Logf("Note: Summary may not capture key concepts: %s", resp.Content)
+		t.Logf("Note: Summary may not capture key concepts: %s", resp.content())
 	}
 }
 
 func TestOllama_CodeGeneration(t *testing.T) {
 	skipIfOllamaUnavailable(t)
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	resp, err := client.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "user", Content: "Write a Python function that checks if a number is prime. Just the function, no explanation."},
-			},
-			Provider:    ollamaProvider,
-			Model:       ollamaModel,
-			MaxTokens:   200,
-			Temperature: 0.2,
+	temp := 0.2
+	resp := ollamaComplete(t, ctx, gwChatRequest{
+		Messages: []gwChatMessage{
+			{Role: "user", Content: "Write a Python function that checks if a number is prime. Just the function, no explanation."},
 		},
+		MaxTokens:   200,
+		Temperature: &temp,
 	})
-	if err != nil {
-		t.Fatalf("Code generation failed: %v", err)
-	}
 
-	t.Logf("Generated code:\n%s", resp.Content)
+	t.Logf("Generated code:\n%s", resp.content())
 
-	// Should contain Python function definition
-	if !strings.Contains(resp.Content, "def ") {
+	if !strings.Contains(resp.content(), "def ") {
 		t.Logf("Note: Response may not contain Python function definition")
 	}
 }
@@ -475,42 +398,39 @@ func TestOllama_CodeGeneration(t *testing.T) {
 // ============================================================================
 
 func BenchmarkOllama_Complete(b *testing.B) {
-	// Skip if not running benchmarks or Ollama unavailable
-	addr := os.Getenv("DELOS_RUNTIME_ADDR")
-	if addr == "" {
-		addr = "localhost:9001"
-	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		b.Skipf("Cannot connect to runtime: %v", err)
-	}
-	defer conn.Close()
-	client := runtimev1.NewRuntimeServiceClient(conn)
-
-	// Check Ollama availability
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	resp, err := client.Health(ctx, &runtimev1.HealthRequest{})
+	g := newGatewayClient(120 * time.Second)
+	status, body, err := g.get(ctx, "/v1/models")
 	cancel()
-	if err != nil || !resp.ProviderStatus[ollamaProvider] {
+	if err != nil || status != http.StatusOK {
+		b.Skipf("Cannot reach gateway: %v (status %d)", err, status)
+	}
+	var list gwModelList
+	if err := json.Unmarshal(body, &list); err != nil {
+		b.Skipf("Bad models response: %v", err)
+	}
+	available := false
+	for _, m := range list.Data {
+		if m.OwnedBy == ollamaProvider {
+			available = true
+			break
+		}
+	}
+	if !available {
 		b.Skip("Ollama not available")
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		_, err := client.Complete(ctx, &runtimev1.CompleteRequest{
-			Params: &runtimev1.CompletionParams{
-				Messages: []*runtimev1.Message{
-					{Role: "user", Content: "Say hello"},
-				},
-				Provider:  ollamaProvider,
-				Model:     ollamaModel,
-				MaxTokens: 10,
-			},
+		status, body, err := g.postJSON(ctx, "/v1/chat/completions", gwChatRequest{
+			Model:     ollamaProvider + "/" + ollamaModel,
+			Messages:  []gwChatMessage{{Role: "user", Content: "Say hello"}},
+			MaxTokens: 10,
 		})
 		cancel()
-		if err != nil {
-			b.Fatalf("Complete failed: %v", err)
+		if err != nil || status != http.StatusOK {
+			b.Fatalf("Complete failed: %v (status %d, body %s)", err, status, body)
 		}
 	}
 }

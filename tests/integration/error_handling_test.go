@@ -1,7 +1,8 @@
-// Package integration contains error handling tests for all services.
+// Package integration contains error handling tests for both binaries.
 //
-// Tests verify that services return appropriate gRPC error codes for various
-// error conditions (NOT_FOUND, INVALID_ARGUMENT, etc.).
+// Control-plane tests verify gRPC error codes (NOT_FOUND, INVALID_ARGUMENT,
+// ...). Gateway tests verify the OpenAI-compatible HTTP error envelope
+// {"error":{"message","type","code"}} and its status codes.
 //
 //go:build integration
 
@@ -10,6 +11,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +22,6 @@ import (
 	datasetsv1 "github.com/instantcocoa/delos/gen/go/datasets/v1"
 	evalv1 "github.com/instantcocoa/delos/gen/go/eval/v1"
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
-	runtimev1 "github.com/instantcocoa/delos/gen/go/runtime/v1"
 )
 
 // ============================================================================
@@ -302,67 +303,81 @@ func TestEvalService_CompareRuns_NotFound(t *testing.T) {
 }
 
 // ============================================================================
-// Runtime Service Error Handling
+// Gateway Error Handling (OpenAI-compatible surface)
 // ============================================================================
 
-func TestRuntimeService_Complete_InvalidProvider(t *testing.T) {
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func TestGateway_Complete_UnknownModel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	_, err := client.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "user", Content: "Hello"},
-			},
-			Provider: "nonexistent-provider",
-			Model:    "some-model",
-		},
+	g := newGatewayClient(15 * time.Second)
+	statusCode, body, err := g.postJSON(ctx, "/v1/chat/completions", gwChatRequest{
+		Model:    "nonexistent-provider/some-model",
+		Messages: []gwChatMessage{{Role: "user", Content: "Hello"}},
 	})
-	if err == nil {
-		t.Fatal("Expected error for invalid provider")
+	if err != nil {
+		t.Fatalf("gateway request failed: %v", err)
 	}
-
-	st, ok := status.FromError(err)
-	if !ok {
-		t.Fatalf("Expected gRPC status error, got: %v", err)
+	if statusCode != http.StatusNotFound {
+		t.Fatalf("Expected 404 for unknown model, got %d: %s", statusCode, body)
 	}
-
-	// Should indicate the provider doesn't exist
-	t.Logf("Invalid provider returned %s: %s", st.Code(), st.Message())
-	if !strings.Contains(strings.ToLower(st.Message()), "provider") {
-		t.Logf("Note: Expected error message to mention 'provider'")
+	env := decodeGatewayError(t, body)
+	if env.Error.Code != "model_not_found" {
+		t.Errorf("Expected code model_not_found, got %q", env.Error.Code)
+	}
+	if !strings.Contains(env.Error.Message, "request id:") {
+		t.Errorf("Expected error message to carry the request id, got %q", env.Error.Message)
 	}
 }
 
-func TestRuntimeService_Complete_EmptyMessages(t *testing.T) {
-	client, cleanup := getRuntimeClient(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func TestGateway_Complete_MalformedJSON(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	resp, err := client.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{},
-			Provider: "ollama",
-			Model:    "gemma3:4b",
-		},
-	})
-
-	// Service may accept empty messages (LLM will handle it) or return error
+	g := newGatewayClient(15 * time.Second)
+	statusCode, body, err := g.postRaw(ctx, "/v1/chat/completions", []byte(`{"model":`))
 	if err != nil {
-		st, ok := status.FromError(err)
-		if ok {
-			t.Logf("Empty messages returned %s: %s", st.Code(), st.Message())
-		} else {
-			t.Logf("Empty messages returned error: %v", err)
-		}
-	} else {
-		// Some services accept empty messages (LLM will return empty or error)
-		t.Logf("Empty messages accepted - response: content=%q", resp.Content)
+		t.Fatalf("gateway request failed: %v", err)
+	}
+	if statusCode != http.StatusBadRequest {
+		t.Fatalf("Expected 400 for malformed JSON, got %d: %s", statusCode, body)
+	}
+	env := decodeGatewayError(t, body)
+	if env.Error.Code != "invalid_json" {
+		t.Errorf("Expected code invalid_json, got %q", env.Error.Code)
+	}
+}
+
+func TestGateway_Complete_MissingFields(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	g := newGatewayClient(15 * time.Second)
+
+	statusCode, body, err := g.postJSON(ctx, "/v1/chat/completions", map[string]any{
+		"messages": []gwChatMessage{{Role: "user", Content: "Hello"}},
+	})
+	if err != nil {
+		t.Fatalf("gateway request failed: %v", err)
+	}
+	if statusCode != http.StatusBadRequest {
+		t.Fatalf("Expected 400 for missing model, got %d: %s", statusCode, body)
+	}
+	if env := decodeGatewayError(t, body); env.Error.Code != "missing_model" {
+		t.Errorf("Expected code missing_model, got %q", env.Error.Code)
+	}
+
+	statusCode, body, err = g.postJSON(ctx, "/v1/chat/completions", map[string]any{
+		"model": "gpt-4o",
+	})
+	if err != nil {
+		t.Fatalf("gateway request failed: %v", err)
+	}
+	if statusCode != http.StatusBadRequest {
+		t.Fatalf("Expected 400 for missing messages, got %d: %s", statusCode, body)
+	}
+	if env := decodeGatewayError(t, body); env.Error.Code != "missing_messages" {
+		t.Errorf("Expected code missing_messages, got %q", env.Error.Code)
 	}
 }
 

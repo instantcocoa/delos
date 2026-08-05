@@ -1,0 +1,65 @@
+{
+  "name": "anthropic: streaming tool use",
+  "provider": "anthropic",
+  "surface": "anthropic",
+  "request": {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 256,
+    "stream": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather in Paris?"
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather in a city",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "location"
+          ]
+        }
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/messages",
+  "upstream_body_contains": [
+    "\"stream\":true",
+    "\"input_schema\""
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "text/event-stream",
+      "body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_07Conformance\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5-20250929\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":402,\"output_tokens\":1}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01Conformance\",\"name\":\"get_weather\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"location\\\":\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"Paris\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":61}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "body_contains": [
+      "\"content_block\":{\"id\":\"toolu_01Conformance\",\"input\":{},\"name\":\"get_weather\",\"type\":\"tool_use\"}",
+      "\"type\":\"input_json_delta\"",
+      "\"stop_reason\":\"tool_use\""
+    ],
+    "sse": {
+      "deltas_join": "",
+      "done": true,
+      "events_contain": [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop"
+      ]
+    }
+  }
+}

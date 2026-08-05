@@ -1,0 +1,31 @@
+{
+  "name": "openai: usage mapping",
+  "provider": "openai",
+  "surface": "openai",
+  "request": {
+    "model": "gpt-4o",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Summarize."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"chatcmpl-A4\",\"object\":\"chat.completion\",\"created\":1730000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Summary.\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":1234,\"completion_tokens\":567,\"total_tokens\":1801,\"prompt_tokens_details\":{\"cached_tokens\":128},\"completion_tokens_details\":{\"reasoning_tokens\":64}}}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "choices.0.finish_reason": "length",
+      "usage.completion_tokens": 567,
+      "usage.prompt_tokens": 1234,
+      "usage.total_tokens": 1801
+    }
+  }
+}

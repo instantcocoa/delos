@@ -1,0 +1,33 @@
+{
+  "name": "gemini: embeddings",
+  "provider": "gemini",
+  "surface": "openai",
+  "endpoint": "/v1/embeddings",
+  "request": {
+    "model": "text-embedding-004",
+    "input": [
+      "hello world"
+    ]
+  },
+  "upstream_path_contains": ":batchEmbedContents",
+  "upstream_body_contains": [
+    "hello world",
+    "models/text-embedding-004"
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"embeddings\":[{\"values\":[0.01,0.02,0.03]}]}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "data.0.embedding.0": 0.01,
+      "data.0.embedding.2": 0.03,
+      "model": "text-embedding-004",
+      "object": "list"
+    }
+  }
+}

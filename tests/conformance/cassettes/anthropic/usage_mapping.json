@@ -1,0 +1,31 @@
+{
+  "name": "anthropic: usage mapping",
+  "provider": "anthropic",
+  "surface": "anthropic",
+  "request": {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 1024,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Summarize."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/messages",
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"msg_04Conformance\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5-20250929\",\"content\":[{\"type\":\"text\",\"text\":\"Summary.\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":1500,\"output_tokens\":250,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "stop_reason": "max_tokens",
+      "usage.input_tokens": 1500,
+      "usage.output_tokens": 250
+    }
+  }
+}

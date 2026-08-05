@@ -7,33 +7,17 @@ package integration
 import (
 	"context"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	datasetsv1 "github.com/instantcocoa/delos/gen/go/datasets/v1"
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
 )
 
-func getDatasetsClient(t *testing.T) (datasetsv1.DatasetsServiceClient, func()) {
-	t.Helper()
-
-	addr := os.Getenv("DELOS_DATASETS_ADDR")
-	if addr == "" {
-		addr = "localhost:9003"
-	}
-
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("failed to connect to datasets service: %v", err)
-	}
-
-	return datasetsv1.NewDatasetsServiceClient(conn), func() { conn.Close() }
-}
+// getDatasetsClient lives in clients_test.go; all control-plane services share
+// one gRPC address.
 
 // Helper to create structpb.Struct from map
 func toStruct(t *testing.T, m map[string]interface{}) *structpb.Struct {

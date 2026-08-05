@@ -1,0 +1,33 @@
+{
+  "name": "gemini: invalid request passthrough",
+  "provider": "gemini",
+  "surface": "openai",
+  "request": {
+    "model": "gemini-2.5-flash",
+    "temperature": 5,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": ":generateContent",
+  "upstream_responses": [
+    {
+      "status": 400,
+      "content_type": "application/json",
+      "body": "{\"error\":{\"code\":400,\"message\":\"Invalid value at 'generation_config.temperature' (5): must be in the range [0.0, 2.0]\",\"status\":\"INVALID_ARGUMENT\"}}"
+    }
+  ],
+  "expect": {
+    "status": 400,
+    "json_paths": {
+      "error.code": "provider_error"
+    },
+    "body_contains": [
+      "Invalid value at 'generation_config.temperature' (5): must be in the range [0.0, 2.0]",
+      "provider gemini:"
+    ]
+  }
+}

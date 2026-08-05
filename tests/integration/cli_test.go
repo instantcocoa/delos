@@ -49,7 +49,7 @@ func ensureCLIBinary(t *testing.T) string {
 		}
 
 		cliBinary = filepath.Join(tmpDir, "delos")
-		cmd := exec.Command("go", "build", "-o", cliBinary, filepath.Join(projectRoot, "cli"))
+		cmd := exec.Command("go", "build", "-o", cliBinary, filepath.Join(projectRoot, "cmd", "delos"))
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
@@ -70,14 +70,10 @@ func runCLI(t *testing.T, args ...string) (string, string, error) {
 	ensureCLIBinary(t)
 	cmd := exec.Command(cliBinary, args...)
 
-	// Set environment for service addresses
+	// Set environment for the two endpoints
 	cmd.Env = append(os.Environ(),
-		"DELOS_OBSERVE_ADDR="+getEnv("DELOS_OBSERVE_ADDR", "localhost:9000"),
-		"DELOS_RUNTIME_ADDR="+getEnv("DELOS_RUNTIME_ADDR", "localhost:9001"),
-		"DELOS_PROMPT_ADDR="+getEnv("DELOS_PROMPT_ADDR", "localhost:9002"),
-		"DELOS_DATASETS_ADDR="+getEnv("DELOS_DATASETS_ADDR", "localhost:9003"),
-		"DELOS_EVAL_ADDR="+getEnv("DELOS_EVAL_ADDR", "localhost:9004"),
-		"DELOS_DEPLOY_ADDR="+getEnv("DELOS_DEPLOY_ADDR", "localhost:9005"),
+		"DELOS_CONTROL_PLANE_ADDR="+getEnv("DELOS_CONTROL_PLANE_ADDR", "localhost:8081"),
+		"DELOS_GATEWAY_URL="+getEnv("DELOS_GATEWAY_URL", "http://localhost:8080"),
 	)
 
 	var stdout, stderr bytes.Buffer
@@ -128,7 +124,7 @@ func TestCLI_Help(t *testing.T) {
 		t.Errorf("Expected 'Delos' in help output, got: %s", stdout)
 	}
 	// Check that all subcommands are listed
-	for _, cmd := range []string{"prompt", "datasets", "eval", "deploy", "runtime", "observe"} {
+	for _, cmd := range []string{"prompt", "datasets", "eval", "gate", "gateway", "observe", "serve"} {
 		if !strings.Contains(stdout, cmd) {
 			t.Errorf("Expected %q in help output", cmd)
 		}
@@ -343,20 +339,74 @@ func TestCLI_Eval_Evaluators_JSON(t *testing.T) {
 }
 
 // ============================================================================
-// Deploy CLI Tests
+// Quality Gate CLI Tests
 // ============================================================================
+//
+// `delos gate` replaced `delos deploy`; the old name survives as an alias.
+// The CI contract is `delos gate check <name>`: exit 0 on pass, non-zero
+// otherwise.
 
-func TestCLI_Deploy_List(t *testing.T) {
-	stdout := mustRunCLI(t, "deploy", "list")
-	t.Logf("Deploy list output: %s", stdout)
+func TestCLI_Gate_List(t *testing.T) {
+	// Works against empty state - an empty gate list is not an error.
+	stdout := mustRunCLI(t, "gate", "list")
+	t.Logf("Gate list output: %s", stdout)
 }
 
-func TestCLI_Deploy_Gates(t *testing.T) {
-	// Use unique slug with timestamp to avoid conflicts
-	slug := fmt.Sprintf("deploy-gate-test-%d", time.Now().UnixNano())
+func TestCLI_Gate_List_DeployAlias(t *testing.T) {
+	// The pre-refocus command name must keep working.
+	stdout := mustRunCLI(t, "deploy", "list")
+	t.Logf("Gate list via deploy alias: %s", stdout)
+}
 
-	// Create a prompt first to have a valid prompt ID
-	mustRunCLI(t, "prompt", "create", "Deploy Gate Test",
+func TestCLI_Gate_Create_Validation(t *testing.T) {
+	// These fail on argument validation before any control-plane call, so
+	// they hold regardless of server state.
+	tests := []struct {
+		name     string
+		args     []string
+		contains string
+	}{
+		{
+			name:     "missing name",
+			args:     []string{"gate", "create"},
+			contains: "arg",
+		},
+		{
+			name:     "missing prompt",
+			args:     []string{"gate", "create", "some-gate", "--condition", "overall_score>=0.8"},
+			contains: "--prompt",
+		},
+		{
+			name:     "missing condition",
+			args:     []string{"gate", "create", "some-gate", "--prompt", "some-prompt"},
+			contains: "--condition",
+		},
+		{
+			name:     "malformed condition",
+			args:     []string{"gate", "create", "some-gate", "--prompt", "some-prompt", "--condition", "overall_score"},
+			contains: "condition",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stdout, stderr, err := runCLI(t, tt.args...)
+			if err == nil {
+				t.Fatalf("expected a validation error, got stdout: %s", stdout)
+			}
+			output := strings.ToLower(stdout + stderr)
+			if !strings.Contains(output, strings.ToLower(tt.contains)) {
+				t.Errorf("expected the error to mention %q, got: %s", tt.contains, output)
+			}
+		})
+	}
+}
+
+func TestCLI_Gate_Create_And_List(t *testing.T) {
+	timestamp := time.Now().UnixNano()
+	slug := fmt.Sprintf("gate-cli-test-%d", timestamp)
+
+	mustRunCLI(t, "prompt", "create", "Gate CLI Test",
 		"--slug", slug,
 		"--system", "Test prompt")
 
@@ -367,37 +417,58 @@ func TestCLI_Deploy_Gates(t *testing.T) {
 	var promptID string
 	for _, p := range prompts {
 		if s, ok := p["slug"].(string); ok && s == slug {
-			promptID = p["id"].(string)
+			promptID, _ = p["id"].(string)
 			break
 		}
 	}
+	if promptID == "" {
+		t.Skip("could not resolve the created prompt id - skipping")
+	}
+	defer runCLI(t, "prompt", "delete", promptID)
 
-	if promptID != "" {
-		// List gates (should be empty initially) - uses positional argument
-		stdout := mustRunCLI(t, "deploy", "gates", promptID)
-		t.Logf("Deploy gates output: %s", stdout)
+	gateName := fmt.Sprintf("cli-gate-%d", timestamp)
+	stdout := mustRunCLI(t, "gate", "create", gateName,
+		"--prompt", promptID,
+		"--condition", "overall_score>=0.8",
+		"--condition", "avg_latency_ms<=5000")
+	t.Logf("Gate create output: %s", stdout)
 
-		// Cleanup
-		runCLI(t, "prompt", "delete", promptID)
+	// The new gate shows up in a prompt-filtered listing.
+	stdout = mustRunCLI(t, "gate", "list", "--prompt", promptID)
+	if !strings.Contains(stdout, gateName) {
+		t.Errorf("expected gate %q in `gate list --prompt %s`, got: %s", gateName, promptID, stdout)
 	}
 }
 
+// TestCLI_Gate_Check_NotFound pins the CI contract: an unknown gate is a
+// non-zero exit, never a silent success.
+func TestCLI_Gate_Check_NotFound(t *testing.T) {
+	name := fmt.Sprintf("no-such-gate-%d", time.Now().UnixNano())
+	stdout, stderr, err := runCLI(t, "gate", "check", name)
+	if err == nil {
+		t.Fatalf("expected a non-zero exit for a missing gate, got stdout: %s", stdout)
+	}
+	// Either a NOT_FOUND from the control plane or a failing verdict exit(1)
+	// is acceptable here; what matters is that CI sees a non-zero status.
+	t.Logf("gate check for a missing gate exited non-zero: %v (stderr: %s)", err, stderr)
+}
+
 // ============================================================================
-// Runtime CLI Tests
+// Gateway CLI Tests
 // ============================================================================
 
-func TestCLI_Runtime_Providers(t *testing.T) {
-	stdout := mustRunCLI(t, "runtime", "providers")
-	// Should list providers
-	if !strings.Contains(stdout, "NAME") && !strings.Contains(stdout, "AVAILABLE") {
-		t.Logf("Runtime providers output: %s", stdout)
+func TestCLI_Gateway_Models(t *testing.T) {
+	stdout := mustRunCLI(t, "gateway", "models")
+	// Should list models (may be empty without provider keys)
+	if !strings.Contains(stdout, "ID") && !strings.Contains(stdout, "OWNED BY") {
+		t.Logf("Gateway models output: %s", stdout)
 	}
 }
 
-func TestCLI_Runtime_Providers_JSON(t *testing.T) {
-	stdout := mustRunCLI(t, "runtime", "providers", "-o", "json")
-	var providers []map[string]interface{}
-	if err := json.Unmarshal([]byte(stdout), &providers); err != nil {
+func TestCLI_Gateway_Models_JSON(t *testing.T) {
+	stdout := mustRunCLI(t, "gateway", "models", "-o", "json")
+	var models []map[string]interface{}
+	if err := json.Unmarshal([]byte(stdout), &models); err != nil {
 		// May be empty if no providers configured
 		if stdout != "null\n" && stdout != "[]\n" {
 			t.Errorf("Expected valid JSON, got: %s", stdout)
@@ -405,14 +476,25 @@ func TestCLI_Runtime_Providers_JSON(t *testing.T) {
 	}
 }
 
-func TestCLI_Runtime_Complete(t *testing.T) {
-	// This may fail if no API keys are configured - that's expected
-	stdout, stderr, err := runCLI(t, "runtime", "complete", "--message", "Say hello")
+func TestCLI_Gateway_Health(t *testing.T) {
+	stdout := mustRunCLI(t, "gateway", "health")
+	t.Logf("Gateway health output: %s", stdout)
+}
+
+func TestCLI_Gateway_RuntimeAlias(t *testing.T) {
+	// The old `runtime` command name must keep working as an alias.
+	stdout := mustRunCLI(t, "runtime", "health")
+	t.Logf("Gateway health via runtime alias: %s", stdout)
+}
+
+func TestCLI_Gateway_Complete(t *testing.T) {
+	// This may fail if no providers are configured - that's expected
+	stdout, stderr, err := runCLI(t, "gateway", "complete", "Say hello", "--model", "gpt-4o-mini")
 	if err != nil {
 		// Expected without API keys
-		t.Logf("Runtime complete (expected to fail without API keys): %s %s", stdout, stderr)
+		t.Logf("Gateway complete (expected to fail without provider keys): %s %s", stdout, stderr)
 	} else {
-		t.Logf("Runtime complete output: %s", stdout)
+		t.Logf("Gateway complete output: %s", stdout)
 	}
 }
 

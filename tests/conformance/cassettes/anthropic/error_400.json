@@ -1,0 +1,34 @@
+{
+  "name": "anthropic: invalid request passthrough",
+  "provider": "anthropic",
+  "surface": "anthropic",
+  "request": {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 64,
+    "messages": [
+      {
+        "role": "user",
+        "content": " "
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/messages",
+  "upstream_responses": [
+    {
+      "status": 400,
+      "content_type": "application/json",
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.0.content.0.text: text content blocks must contain non-whitespace text\"}}"
+    }
+  ],
+  "expect": {
+    "status": 400,
+    "json_paths": {
+      "error.type": "invalid_request_error",
+      "type": "error"
+    },
+    "body_contains": [
+      "messages.0.content.0.text: text content blocks must contain non-whitespace text",
+      "provider anthropic:"
+    ]
+  }
+}

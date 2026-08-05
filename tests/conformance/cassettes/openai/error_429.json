@@ -1,0 +1,37 @@
+{
+  "name": "openai: rate limit passthrough (with one retry)",
+  "provider": "openai",
+  "surface": "openai",
+  "request": {
+    "model": "gpt-4o",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_responses": [
+    {
+      "status": 429,
+      "content_type": "application/json",
+      "body": "{\"error\":{\"message\":\"Rate limit reached for gpt-4o in organization org-conformance on tokens per min (TPM): Limit 30000, Used 30000, Requested 42. Please try again in 84ms.\",\"type\":\"tokens\",\"param\":null,\"code\":\"rate_limit_exceeded\"}}"
+    },
+    {
+      "status": 429,
+      "content_type": "application/json",
+      "body": "{\"error\":{\"message\":\"Rate limit reached for gpt-4o in organization org-conformance on tokens per min (TPM): Limit 30000, Used 30000, Requested 42. Please try again in 84ms.\",\"type\":\"tokens\",\"param\":null,\"code\":\"rate_limit_exceeded\"}}"
+    }
+  ],
+  "expect": {
+    "status": 429,
+    "json_paths": {
+      "error.code": "provider_error"
+    },
+    "body_contains": [
+      "Rate limit reached for gpt-4o in organization org-conformance on tokens per min (TPM): Limit 30000, Used 30000, Requested 42. Please try again in 84ms.",
+      "provider openai:"
+    ]
+  }
+}
