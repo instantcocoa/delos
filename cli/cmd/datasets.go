@@ -9,8 +9,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	datasetsv1 "github.com/instantcocoa/delos/gen/go/datasets/v1"
 	"github.com/instantcocoa/delos/cli/internal/output"
+	datasetsv1 "github.com/instantcocoa/delos/gen/go/datasets/v1"
 )
 
 var datasetsCmd = &cobra.Command{
@@ -24,7 +24,7 @@ var datasetsListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List datasets",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.DatasetsAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -85,7 +85,7 @@ var datasetsGetCmd = &cobra.Command{
 	Short: "Get dataset details",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.DatasetsAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -110,7 +110,7 @@ var datasetsCreateCmd = &cobra.Command{
 	Short: "Create a new dataset",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.DatasetsAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -144,7 +144,7 @@ var datasetsDeleteCmd = &cobra.Command{
 	Short: "Delete a dataset",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.DatasetsAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -169,7 +169,7 @@ var datasetsExamplesCmd = &cobra.Command{
 	Short: "List examples in a dataset",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.DatasetsAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}

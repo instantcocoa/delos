@@ -8,13 +8,12 @@ import (
 
 // Config holds CLI configuration.
 type Config struct {
-	// Service endpoints
-	ObserveAddr  string
-	RuntimeAddr  string
-	PromptAddr   string
-	DatasetsAddr string
-	EvalAddr     string
-	DeployAddr   string
+	// ControlPlaneAddr is the gRPC address of the delos control plane, which
+	// serves observe, prompt, datasets, eval and deploy from one port.
+	ControlPlaneAddr string
+
+	// GatewayURL is the base HTTP URL of the delos-gateway data plane.
+	GatewayURL string
 
 	// Output format
 	Format string // json, table, yaml
@@ -26,14 +25,10 @@ type Config struct {
 // DefaultConfig returns the default configuration.
 func DefaultConfig() *Config {
 	return &Config{
-		ObserveAddr:  getEnv("DELOS_OBSERVE_ADDR", "localhost:9000"),
-		RuntimeAddr:  getEnv("DELOS_RUNTIME_ADDR", "localhost:9001"),
-		PromptAddr:   getEnv("DELOS_PROMPT_ADDR", "localhost:9002"),
-		DatasetsAddr: getEnv("DELOS_DATASETS_ADDR", "localhost:9003"),
-		EvalAddr:     getEnv("DELOS_EVAL_ADDR", "localhost:9004"),
-		DeployAddr:   getEnv("DELOS_DEPLOY_ADDR", "localhost:9005"),
-		Format:       getEnv("DELOS_FORMAT", "table"),
-		Verbose:      getEnvBool("DELOS_VERBOSE", false),
+		ControlPlaneAddr: getEnv("DELOS_CONTROL_PLANE_ADDR", "localhost:8081"),
+		GatewayURL:       getEnv("DELOS_GATEWAY_URL", "http://localhost:8080"),
+		Format:           getEnv("DELOS_FORMAT", "table"),
+		Verbose:          getEnvBool("DELOS_VERBOSE", false),
 	}
 }
 

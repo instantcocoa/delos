@@ -10,8 +10,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	observev1 "github.com/instantcocoa/delos/gen/go/observe/v1"
 	"github.com/instantcocoa/delos/cli/internal/output"
+	observev1 "github.com/instantcocoa/delos/gen/go/observe/v1"
 )
 
 var observeCmd = &cobra.Command{
@@ -24,7 +24,7 @@ var observeTracesCmd = &cobra.Command{
 	Use:   "traces",
 	Short: "Query traces",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ObserveAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -94,7 +94,7 @@ var observeTraceCmd = &cobra.Command{
 	Short: "Get a specific trace",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ObserveAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -107,6 +107,9 @@ var observeTraceCmd = &cobra.Command{
 		resp, err := client.GetTrace(ctx, &observev1.GetTraceRequest{TraceId: args[0]})
 		if err != nil {
 			return fmt.Errorf("failed to get trace: %w", err)
+		}
+		if resp.Trace == nil {
+			return fmt.Errorf("trace %s not found", args[0])
 		}
 
 		if cfg.Format == "json" || cfg.Format == "yaml" {
@@ -149,7 +152,7 @@ var observeMetricsCmd = &cobra.Command{
 	Use:   "metrics",
 	Short: "Query metrics",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ObserveAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -201,7 +204,7 @@ var observeHealthCmd = &cobra.Command{
 	Use:   "health",
 	Short: "Check observe service health",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ObserveAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
