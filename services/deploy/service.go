@@ -2,323 +2,149 @@ package deploy
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// DeployService handles deployment business logic.
+// DeployService evaluates quality gates. It holds gate definitions and reads
+// eval run summaries through the narrow EvalResults interface; the control
+// plane wires that to the eval module with a direct in-process adapter.
 type DeployService struct {
 	store Store
+	evals EvalResults
 }
 
-// NewDeployService creates a new deploy service.
-func NewDeployService(store Store) *DeployService {
-	return &DeployService{
-		store: store,
-	}
+// NewDeployService creates a gate service.
+func NewDeployService(store Store, evals EvalResults) *DeployService {
+	return &DeployService{store: store, evals: evals}
 }
 
-// CreateDeployment creates a new deployment.
-func (s *DeployService) CreateDeployment(ctx context.Context, input CreateDeploymentInput) (*Deployment, error) {
-	now := time.Now()
-
-	// Get current deployment to determine from_version
-	fromVersion := 0
-	current, err := s.store.GetCurrentDeployment(ctx, input.PromptID, input.Environment)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current deployment: %w", err)
+// CreateQualityGate validates and stores a gate.
+func (s *DeployService) CreateQualityGate(ctx context.Context, input CreateQualityGateInput) (*QualityGate, error) {
+	if input.Name == "" {
+		return nil, fmt.Errorf("gate name is required")
 	}
-	if current != nil {
-		fromVersion = current.ToVersion
+	if input.PromptID == "" {
+		return nil, fmt.Errorf("prompt id is required")
 	}
-
-	// Determine initial status
-	initialStatus := DeploymentStatusPendingApproval
-	if input.SkipApproval {
-		initialStatus = DeploymentStatusPendingGates
+	if len(input.Conditions) == 0 {
+		return nil, fmt.Errorf("at least one condition is required")
 	}
-
-	deployment := &Deployment{
-		ID:          uuid.New().String(),
-		PromptID:    input.PromptID,
-		FromVersion: fromVersion,
-		ToVersion:   input.ToVersion,
-		Environment: input.Environment,
-		Strategy:    input.Strategy,
-		Status:      initialStatus,
-		GatesPassed: false,
-		CreatedAt:   now,
-		CreatedBy:   input.CreatedBy,
-		Metadata:    input.Metadata,
-	}
-
-	if err := s.store.CreateDeployment(ctx, deployment); err != nil {
-		return nil, fmt.Errorf("failed to create deployment: %w", err)
-	}
-
-	// If skipping approval, trigger gate evaluation
-	if input.SkipApproval {
-		if err := s.evaluateGates(ctx, deployment); err != nil {
-			deployment.Status = DeploymentStatusGatesFailed
-			deployment.StatusMessage = err.Error()
-			s.store.UpdateDeployment(ctx, deployment)
+	for _, c := range input.Conditions {
+		if !isSupportedMetric(c.Metric) {
+			return nil, fmt.Errorf("unknown metric %q", c.Metric)
+		}
+		if c.Operator != OperatorGTE && c.Operator != OperatorLTE {
+			return nil, fmt.Errorf("condition on %q needs an operator (>= or <=)", c.Metric)
 		}
 	}
 
-	return deployment, nil
-}
-
-// GetDeployment retrieves a deployment by ID.
-func (s *DeployService) GetDeployment(ctx context.Context, id string) (*Deployment, error) {
-	deployment, err := s.store.GetDeployment(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get deployment: %w", err)
-	}
-	return deployment, nil
-}
-
-// ListDeployments returns deployments matching the query.
-func (s *DeployService) ListDeployments(ctx context.Context, query ListDeploymentsQuery) ([]*Deployment, int, error) {
-	deployments, total, err := s.store.ListDeployments(ctx, query)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to list deployments: %w", err)
-	}
-	return deployments, total, nil
-}
-
-// ApproveDeployment approves a pending deployment.
-func (s *DeployService) ApproveDeployment(ctx context.Context, id, approver, comment string) (*Deployment, error) {
-	deployment, err := s.store.GetDeployment(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get deployment: %w", err)
-	}
-	if deployment == nil {
-		return nil, fmt.Errorf("deployment not found: %s", id)
-	}
-
-	if deployment.Status != DeploymentStatusPendingApproval {
-		return nil, fmt.Errorf("deployment is not pending approval: status=%d", deployment.Status)
-	}
-
-	deployment.ApprovedBy = approver
-	deployment.Status = DeploymentStatusPendingGates
-	deployment.StatusMessage = comment
-
-	if err := s.store.UpdateDeployment(ctx, deployment); err != nil {
-		return nil, fmt.Errorf("failed to update deployment: %w", err)
-	}
-
-	// Trigger gate evaluation
-	if err := s.evaluateGates(ctx, deployment); err != nil {
-		deployment.Status = DeploymentStatusGatesFailed
-		deployment.StatusMessage = err.Error()
-		s.store.UpdateDeployment(ctx, deployment)
-	}
-
-	return deployment, nil
-}
-
-// RollbackDeployment rolls back to a previous version.
-func (s *DeployService) RollbackDeployment(ctx context.Context, id, reason string) (*Deployment, *Deployment, error) {
-	deployment, err := s.store.GetDeployment(ctx, id)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get deployment: %w", err)
-	}
-	if deployment == nil {
-		return nil, nil, fmt.Errorf("deployment not found: %s", id)
-	}
-
-	// Mark original deployment as rolled back
-	now := time.Now()
-	deployment.Status = DeploymentStatusRolledBack
-	deployment.StatusMessage = reason
-	deployment.CompletedAt = &now
-
-	if err := s.store.UpdateDeployment(ctx, deployment); err != nil {
-		return nil, nil, fmt.Errorf("failed to update deployment: %w", err)
-	}
-
-	// Create a new deployment to restore the previous version
-	rollbackDeployment := &Deployment{
-		ID:            uuid.New().String(),
-		PromptID:      deployment.PromptID,
-		FromVersion:   deployment.ToVersion,
-		ToVersion:     deployment.FromVersion,
-		Environment:   deployment.Environment,
-		Strategy:      DeploymentStrategy{Type: DeploymentTypeImmediate},
-		Status:        DeploymentStatusCompleted,
-		StatusMessage: fmt.Sprintf("Rollback from deployment %s: %s", id, reason),
-		GatesPassed:   true,
-		CreatedAt:     now,
-		StartedAt:     &now,
-		CompletedAt:   &now,
-		CreatedBy:     "system",
-		Metadata:      map[string]string{"rollback_from": id},
-	}
-
-	if err := s.store.CreateDeployment(ctx, rollbackDeployment); err != nil {
-		return nil, nil, fmt.Errorf("failed to create rollback deployment: %w", err)
-	}
-
-	return deployment, rollbackDeployment, nil
-}
-
-// CancelDeployment cancels a pending/in-progress deployment.
-func (s *DeployService) CancelDeployment(ctx context.Context, id, reason string) (*Deployment, error) {
-	deployment, err := s.store.GetDeployment(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get deployment: %w", err)
-	}
-	if deployment == nil {
-		return nil, fmt.Errorf("deployment not found: %s", id)
-	}
-
-	// Can only cancel pending or in-progress deployments
-	if deployment.Status != DeploymentStatusPendingApproval &&
-		deployment.Status != DeploymentStatusPendingGates &&
-		deployment.Status != DeploymentStatusInProgress {
-		return nil, fmt.Errorf("cannot cancel deployment with status: %d", deployment.Status)
-	}
-
-	now := time.Now()
-	deployment.Status = DeploymentStatusCancelled
-	deployment.StatusMessage = reason
-	deployment.CompletedAt = &now
-
-	if err := s.store.UpdateDeployment(ctx, deployment); err != nil {
-		return nil, fmt.Errorf("failed to update deployment: %w", err)
-	}
-
-	return deployment, nil
-}
-
-// GetDeploymentStatus gets the current status of a deployment.
-func (s *DeployService) GetDeploymentStatus(ctx context.Context, id string) (*Deployment, *DeploymentMetrics, *DeploymentMetrics, error) {
-	deployment, err := s.store.GetDeployment(ctx, id)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to get deployment: %w", err)
-	}
-	if deployment == nil {
-		return nil, nil, nil, fmt.Errorf("deployment not found: %s", id)
-	}
-
-	// In a real implementation, this would fetch real-time metrics
-	currentMetrics := &DeploymentMetrics{}
-	baselineMetrics := &DeploymentMetrics{}
-
-	return deployment, currentMetrics, baselineMetrics, nil
-}
-
-// CreateQualityGate creates a quality gate configuration.
-func (s *DeployService) CreateQualityGate(ctx context.Context, input CreateQualityGateInput) (*QualityGate, error) {
 	gate := &QualityGate{
-		ID:         uuid.New().String(),
-		Name:       input.Name,
-		PromptID:   input.PromptID,
-		Conditions: input.Conditions,
-		Required:   input.Required,
-		CreatedAt:  time.Now(),
-		CreatedBy:  input.CreatedBy,
+		ID:          uuid.NewString(),
+		Name:        input.Name,
+		Description: input.Description,
+		PromptID:    input.PromptID,
+		Conditions:  input.Conditions,
+		CreatedAt:   time.Now().UTC(),
+		CreatedBy:   input.CreatedBy,
 	}
-
 	if err := s.store.CreateQualityGate(ctx, gate); err != nil {
-		return nil, fmt.Errorf("failed to create quality gate: %w", err)
+		return nil, err
 	}
-
 	return gate, nil
 }
 
-// ListQualityGates returns quality gates for a prompt.
+// ListQualityGates lists gates, optionally filtered by prompt.
 func (s *DeployService) ListQualityGates(ctx context.Context, promptID string) ([]*QualityGate, error) {
-	gates, err := s.store.ListQualityGates(ctx, promptID)
+	return s.store.ListQualityGates(ctx, promptID)
+}
+
+// Verdict evaluates the named gate against the latest completed eval run for
+// its prompt.
+func (s *DeployService) Verdict(ctx context.Context, name string) (*GateVerdict, error) {
+	gate, err := s.store.GetQualityGateByName(ctx, name)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list quality gates: %w", err)
+		return nil, err
 	}
-	return gates, nil
-}
+	if gate == nil {
+		return nil, fmt.Errorf("%w: %s", ErrGateNotFound, name)
+	}
 
-// evaluateGates evaluates quality gates for a deployment.
-func (s *DeployService) evaluateGates(ctx context.Context, deployment *Deployment) error {
-	gates, err := s.store.ListQualityGates(ctx, deployment.PromptID)
+	verdict := &GateVerdict{Gate: gate, EvaluatedAt: time.Now().UTC()}
+
+	if s.evals == nil {
+		verdict.Reasons = []string{"no eval results source is configured"}
+		return verdict, nil
+	}
+	run, err := s.evals.LatestCompletedRun(ctx, gate.PromptID)
 	if err != nil {
-		return fmt.Errorf("failed to list quality gates: %w", err)
+		return nil, fmt.Errorf("failed to read eval results for prompt %s: %w", gate.PromptID, err)
 	}
-
-	if len(gates) == 0 {
-		// No gates to evaluate, mark as passed and start deployment
-		deployment.GatesPassed = true
-		deployment.Status = DeploymentStatusInProgress
-		now := time.Now()
-		deployment.StartedAt = &now
-
-		// For immediate deployments, complete right away
-		if deployment.Strategy.Type == DeploymentTypeImmediate {
-			deployment.Status = DeploymentStatusCompleted
-			deployment.CompletedAt = &now
+	if run == nil {
+		verdict.Reasons = []string{
+			fmt.Sprintf("no completed eval run found for prompt %q - run an eval before checking this gate", gate.PromptID),
 		}
-
-		return s.store.UpdateDeployment(ctx, deployment)
+		return verdict, nil
 	}
 
-	// Evaluate each gate
-	var results []QualityGateResult
-	allPassed := true
-
-	for _, gate := range gates {
-		result := s.evaluateGate(ctx, gate, deployment)
-		results = append(results, result)
-
-		if !result.Passed && gate.Required {
-			allPassed = false
+	verdict.EvalRunID = run.RunID
+	verdict.Pass = true
+	for _, c := range gate.Conditions {
+		value, ok := run.Metric(c.Metric)
+		if !ok {
+			verdict.Pass = false
+			verdict.Reasons = append(verdict.Reasons, fmt.Sprintf("%s: metric not present in run summary: fail", c.Metric))
+			continue
 		}
-	}
-
-	deployment.GateResults = results
-	deployment.GatesPassed = allPassed
-
-	if allPassed {
-		deployment.Status = DeploymentStatusInProgress
-		now := time.Now()
-		deployment.StartedAt = &now
-
-		// For immediate deployments, complete right away
-		if deployment.Strategy.Type == DeploymentTypeImmediate {
-			deployment.Status = DeploymentStatusCompleted
-			deployment.CompletedAt = &now
+		holds := (c.Operator == OperatorGTE && value >= c.Threshold) ||
+			(c.Operator == OperatorLTE && value <= c.Threshold)
+		state := "pass"
+		if !holds {
+			state = "fail"
+			verdict.Pass = false
 		}
-	} else {
-		deployment.Status = DeploymentStatusGatesFailed
-		deployment.StatusMessage = "One or more required quality gates failed"
+		verdict.Reasons = append(verdict.Reasons, fmt.Sprintf("%s %s %s %s: %s",
+			c.Metric, formatNumber(value), c.Operator, formatNumber(c.Threshold), state))
 	}
-
-	return s.store.UpdateDeployment(ctx, deployment)
+	verdict.Reasons = append(verdict.Reasons,
+		fmt.Sprintf("evaluated against run %s (completed %s)", run.RunID, run.CompletedAt.UTC().Format(time.RFC3339)))
+	return verdict, nil
 }
 
-// evaluateGate evaluates a single quality gate.
-func (s *DeployService) evaluateGate(ctx context.Context, gate *QualityGate, deployment *Deployment) QualityGateResult {
-	result := QualityGateResult{
-		GateID:   gate.ID,
-		GateName: gate.Name,
-		Passed:   true,
-	}
-
-	// In a real implementation, this would evaluate each condition
-	// by fetching eval results, latency metrics, etc.
-	var conditionResults []ConditionResult
-	for _, condition := range gate.Conditions {
-		conditionResult := ConditionResult{
-			Type:     condition.Type,
-			Expected: condition.Threshold,
-			Actual:   condition.Threshold, // Simulated: actual equals expected
-			Passed:   true,
+// VerdictHandler serves GET /v1/gates/{gate}/verdict as JSON for CI systems
+// and dashboards. Mounted by the control plane.
+func (s *DeployService) VerdictHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("gate")
+		if name == "" {
+			http.Error(w, `{"error":"gate name required"}`, http.StatusBadRequest)
+			return
 		}
-		conditionResults = append(conditionResults, conditionResult)
-	}
-
-	result.ConditionResults = conditionResults
-	result.Message = "All conditions passed"
-
-	return result
+		verdict, err := s.Verdict(r.Context(), name)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errorsIs(err, ErrGateNotFound) {
+				status = http.StatusNotFound
+			}
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"gate":         verdict.Gate.Name,
+			"pass":         verdict.Pass,
+			"reasons":      verdict.Reasons,
+			"eval_run_id":  verdict.EvalRunID,
+			"evaluated_at": verdict.EvaluatedAt.Format(time.RFC3339),
+		})
+	})
 }
+
+// errorsIs is a local alias to keep the import list tidy.
+func errorsIs(err, target error) bool { return errors.Is(err, target) }

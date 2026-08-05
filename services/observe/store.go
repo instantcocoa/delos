@@ -24,8 +24,8 @@ type MetricStore interface {
 // MemorySpanStore is an in-memory implementation of SpanStore.
 type MemorySpanStore struct {
 	mu     sync.RWMutex
-	spans  map[string][]Span  // traceID -> spans
-	traces map[string]*Trace  // traceID -> computed trace
+	spans  map[string][]Span // traceID -> spans
+	traces map[string]*Trace // traceID -> computed trace
 }
 
 // NewMemorySpanStore creates a new in-memory span store.

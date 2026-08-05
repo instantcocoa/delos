@@ -2,10 +2,10 @@ syntax = "proto3";
 
 package delos.observe.v1;
 
-option go_package = "github.com/instantcocoa/delos/proto/observe/v1;observev1";
-
-import "google/protobuf/timestamp.proto";
 import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/instantcocoa/delos/proto/observe/v1;observev1";
 
 // ObserveService provides tracing and metrics functionality
 service ObserveService {
@@ -20,6 +20,9 @@ service ObserveService {
 
   // Query metrics
   rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
+
+  // Query aggregated cost/latency/token statistics derived from gen_ai spans
+  rpc QueryStats(QueryStatsRequest) returns (QueryStatsResponse);
 
   // Health check
   rpc Health(HealthRequest) returns (HealthResponse);
@@ -37,6 +40,20 @@ message Span {
   SpanStatus status = 8;
   map<string, string> attributes = 9;
   repeated SpanEvent events = 10;
+
+  // OTLP span kind, lowercased ("client", "server", "internal", ...)
+  string kind = 11;
+  google.protobuf.Timestamp end_time = 12;
+  string status_message = 13;
+
+  // Promoted gen_ai.* semantic-convention attributes. Populated for any span
+  // that carries them, regardless of which SDK or gateway emitted it.
+  string gen_ai_system = 14;
+  string request_model = 15;
+  string response_model = 16;
+  int64 input_tokens = 17;
+  int64 output_tokens = 18;
+  double cost_usd = 19;
 }
 
 message SpanEvent {
@@ -113,6 +130,50 @@ message MetricDataPoint {
 
 message QueryMetricsResponse {
   repeated MetricDataPoint data_points = 1;
+}
+
+// QueryStats
+message QueryStatsRequest {
+  google.protobuf.Timestamp start_time = 1;
+  google.protobuf.Timestamp end_time = 2;
+  string service_name = 3;
+  string model = 4;
+  // Bucket width for the cost-over-time series. Defaults to 1h.
+  google.protobuf.Duration bucket = 5;
+}
+
+// ModelStats aggregates request volume, tokens, cost and latency per model.
+message ModelStats {
+  string model = 1;
+  string gen_ai_system = 2;
+  int64 request_count = 3;
+  int64 error_count = 4;
+  int64 input_tokens = 5;
+  int64 output_tokens = 6;
+  double cost_usd = 7;
+  double p50_latency_ms = 8;
+  double p95_latency_ms = 9;
+}
+
+// CostBucket is one point in the cost-over-time series for a model.
+message CostBucket {
+  google.protobuf.Timestamp bucket_start = 1;
+  string model = 2;
+  double cost_usd = 3;
+  int64 request_count = 4;
+  int64 input_tokens = 5;
+  int64 output_tokens = 6;
+}
+
+message QueryStatsResponse {
+  google.protobuf.Timestamp start_time = 1;
+  google.protobuf.Timestamp end_time = 2;
+  int64 total_requests = 3;
+  double total_cost_usd = 4;
+  int64 total_input_tokens = 5;
+  int64 total_output_tokens = 6;
+  repeated ModelStats by_model = 7;
+  repeated CostBucket cost_over_time = 8;
 }
 
 // Health
