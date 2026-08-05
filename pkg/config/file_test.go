@@ -17,7 +17,20 @@ func writeFile(t *testing.T, body string) string {
 	return path
 }
 
+// clearDelosEnv blanks every DELOS_* variable for the test so that file-layer
+// assertions are hermetic: env beats file by design, and CI exports DELOS_DB_*
+// for the integration database.
+func clearDelosEnv(t *testing.T) {
+	t.Helper()
+	for _, kv := range os.Environ() {
+		if key, _, ok := strings.Cut(kv, "="); ok && strings.HasPrefix(key, "DELOS_") {
+			t.Setenv(key, "")
+		}
+	}
+}
+
 func TestLoadFileValid(t *testing.T) {
+	clearDelosEnv(t)
 	path := writeFile(t, `
 env: production
 log_level: debug
@@ -172,6 +185,7 @@ telemetry:
 }
 
 func TestEnvOverridesFile(t *testing.T) {
+	clearDelosEnv(t)
 	path := writeFile(t, "port: 9091\ngateway:\n  port: 9090\n  url: https://gw.internal\n")
 	f, err := LoadFile(path)
 	if err != nil {
@@ -196,6 +210,7 @@ func TestEnvOverridesFile(t *testing.T) {
 }
 
 func TestDefaultsWithNoFile(t *testing.T) {
+	clearDelosEnv(t)
 	cfg, err := loadWith("test", "", nil)
 	if err != nil {
 		t.Fatalf("loadWith: %v", err)
@@ -215,6 +230,7 @@ func TestDefaultsWithNoFile(t *testing.T) {
 }
 
 func TestCacheOffEnv(t *testing.T) {
+	clearDelosEnv(t)
 	t.Setenv("DELOS_CACHE", "off")
 	cfg, err := loadWith("test", "", nil)
 	if err != nil {
