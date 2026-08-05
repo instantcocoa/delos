@@ -11,7 +11,8 @@ func TestCacheKeyDeterministic(t *testing.T) {
 		Model:    "gpt-4o",
 		Messages: []Message{TextMessage("user", "hello")},
 	}
-	if CacheKey(params) != CacheKey(params) {
+	first, second := CacheKey(params), CacheKey(params)
+	if first != second {
 		t.Fatal("same params must produce the same key")
 	}
 

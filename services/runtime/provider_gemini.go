@@ -24,7 +24,6 @@ type GeminiProvider struct {
 	pricing    map[string]float64 // model -> USD per 1K total tokens
 }
 
-// NewGeminiProvider creates the provider for generativelanguage.googleapis.com.
 // GeminiOption configures the provider.
 type GeminiOption func(*GeminiProvider)
 
@@ -33,6 +32,7 @@ func WithGeminiBaseURL(url string) GeminiOption {
 	return func(p *GeminiProvider) { p.baseURL = url }
 }
 
+// NewGeminiProvider creates the provider for generativelanguage.googleapis.com.
 func NewGeminiProvider(apiKey string, opts ...GeminiOption) *GeminiProvider {
 	p := &GeminiProvider{
 		apiKey:     apiKey,
