@@ -8,8 +8,7 @@ import (
 func TestDefaultConfig(t *testing.T) {
 	// Clear environment for testing
 	envVars := []string{
-		"DELOS_OBSERVE_ADDR", "DELOS_RUNTIME_ADDR", "DELOS_PROMPT_ADDR",
-		"DELOS_DATASETS_ADDR", "DELOS_EVAL_ADDR", "DELOS_DEPLOY_ADDR",
+		"DELOS_CONTROL_PLANE_ADDR", "DELOS_GATEWAY_URL",
 		"DELOS_FORMAT", "DELOS_VERBOSE",
 	}
 	originalValues := make(map[string]string)
@@ -30,23 +29,11 @@ func TestDefaultConfig(t *testing.T) {
 	t.Run("default values", func(t *testing.T) {
 		cfg := DefaultConfig()
 
-		if cfg.ObserveAddr != "localhost:9000" {
-			t.Errorf("ObserveAddr = %v, want localhost:9000", cfg.ObserveAddr)
+		if cfg.ControlPlaneAddr != "localhost:8081" {
+			t.Errorf("ControlPlaneAddr = %v, want localhost:8081", cfg.ControlPlaneAddr)
 		}
-		if cfg.RuntimeAddr != "localhost:9001" {
-			t.Errorf("RuntimeAddr = %v, want localhost:9001", cfg.RuntimeAddr)
-		}
-		if cfg.PromptAddr != "localhost:9002" {
-			t.Errorf("PromptAddr = %v, want localhost:9002", cfg.PromptAddr)
-		}
-		if cfg.DatasetsAddr != "localhost:9003" {
-			t.Errorf("DatasetsAddr = %v, want localhost:9003", cfg.DatasetsAddr)
-		}
-		if cfg.EvalAddr != "localhost:9004" {
-			t.Errorf("EvalAddr = %v, want localhost:9004", cfg.EvalAddr)
-		}
-		if cfg.DeployAddr != "localhost:9005" {
-			t.Errorf("DeployAddr = %v, want localhost:9005", cfg.DeployAddr)
+		if cfg.GatewayURL != "http://localhost:8080" {
+			t.Errorf("GatewayURL = %v, want http://localhost:8080", cfg.GatewayURL)
 		}
 		if cfg.Format != "table" {
 			t.Errorf("Format = %v, want table", cfg.Format)
@@ -57,34 +44,18 @@ func TestDefaultConfig(t *testing.T) {
 	})
 
 	t.Run("from environment", func(t *testing.T) {
-		os.Setenv("DELOS_OBSERVE_ADDR", "observe.example.com:9000")
-		os.Setenv("DELOS_RUNTIME_ADDR", "runtime.example.com:9001")
-		os.Setenv("DELOS_PROMPT_ADDR", "prompt.example.com:9002")
-		os.Setenv("DELOS_DATASETS_ADDR", "datasets.example.com:9003")
-		os.Setenv("DELOS_EVAL_ADDR", "eval.example.com:9004")
-		os.Setenv("DELOS_DEPLOY_ADDR", "deploy.example.com:9005")
+		os.Setenv("DELOS_CONTROL_PLANE_ADDR", "control.example.com:8081")
+		os.Setenv("DELOS_GATEWAY_URL", "https://gateway.example.com")
 		os.Setenv("DELOS_FORMAT", "json")
 		os.Setenv("DELOS_VERBOSE", "true")
 
 		cfg := DefaultConfig()
 
-		if cfg.ObserveAddr != "observe.example.com:9000" {
-			t.Errorf("ObserveAddr = %v, want observe.example.com:9000", cfg.ObserveAddr)
+		if cfg.ControlPlaneAddr != "control.example.com:8081" {
+			t.Errorf("ControlPlaneAddr = %v, want control.example.com:8081", cfg.ControlPlaneAddr)
 		}
-		if cfg.RuntimeAddr != "runtime.example.com:9001" {
-			t.Errorf("RuntimeAddr = %v, want runtime.example.com:9001", cfg.RuntimeAddr)
-		}
-		if cfg.PromptAddr != "prompt.example.com:9002" {
-			t.Errorf("PromptAddr = %v, want prompt.example.com:9002", cfg.PromptAddr)
-		}
-		if cfg.DatasetsAddr != "datasets.example.com:9003" {
-			t.Errorf("DatasetsAddr = %v, want datasets.example.com:9003", cfg.DatasetsAddr)
-		}
-		if cfg.EvalAddr != "eval.example.com:9004" {
-			t.Errorf("EvalAddr = %v, want eval.example.com:9004", cfg.EvalAddr)
-		}
-		if cfg.DeployAddr != "deploy.example.com:9005" {
-			t.Errorf("DeployAddr = %v, want deploy.example.com:9005", cfg.DeployAddr)
+		if cfg.GatewayURL != "https://gateway.example.com" {
+			t.Errorf("GatewayURL = %v, want https://gateway.example.com", cfg.GatewayURL)
 		}
 		if cfg.Format != "json" {
 			t.Errorf("Format = %v, want json", cfg.Format)
@@ -167,33 +138,17 @@ func TestGetEnvBool(t *testing.T) {
 
 func TestConfig_Fields(t *testing.T) {
 	cfg := &Config{
-		ObserveAddr:  "addr1",
-		RuntimeAddr:  "addr2",
-		PromptAddr:   "addr3",
-		DatasetsAddr: "addr4",
-		EvalAddr:     "addr5",
-		DeployAddr:   "addr6",
-		Format:       "yaml",
-		Verbose:      true,
+		ControlPlaneAddr: "addr1",
+		GatewayURL:       "http://addr2",
+		Format:           "yaml",
+		Verbose:          true,
 	}
 
-	if cfg.ObserveAddr != "addr1" {
-		t.Errorf("ObserveAddr = %v, want addr1", cfg.ObserveAddr)
+	if cfg.ControlPlaneAddr != "addr1" {
+		t.Errorf("ControlPlaneAddr = %v, want addr1", cfg.ControlPlaneAddr)
 	}
-	if cfg.RuntimeAddr != "addr2" {
-		t.Errorf("RuntimeAddr = %v, want addr2", cfg.RuntimeAddr)
-	}
-	if cfg.PromptAddr != "addr3" {
-		t.Errorf("PromptAddr = %v, want addr3", cfg.PromptAddr)
-	}
-	if cfg.DatasetsAddr != "addr4" {
-		t.Errorf("DatasetsAddr = %v, want addr4", cfg.DatasetsAddr)
-	}
-	if cfg.EvalAddr != "addr5" {
-		t.Errorf("EvalAddr = %v, want addr5", cfg.EvalAddr)
-	}
-	if cfg.DeployAddr != "addr6" {
-		t.Errorf("DeployAddr = %v, want addr6", cfg.DeployAddr)
+	if cfg.GatewayURL != "http://addr2" {
+		t.Errorf("GatewayURL = %v, want http://addr2", cfg.GatewayURL)
 	}
 	if cfg.Format != "yaml" {
 		t.Errorf("Format = %v, want yaml", cfg.Format)

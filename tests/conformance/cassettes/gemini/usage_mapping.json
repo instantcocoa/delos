@@ -1,0 +1,31 @@
+{
+  "name": "gemini: usage mapping",
+  "provider": "gemini",
+  "surface": "openai",
+  "request": {
+    "model": "gemini-2.5-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Summarize."
+      }
+    ]
+  },
+  "upstream_path_contains": ":generateContent",
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Summary.\"}]},\"finishReason\":\"MAX_TOKENS\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":2048,\"candidatesTokenCount\":128,\"totalTokenCount\":2176,\"thoughtsTokenCount\":64},\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"cRUusage\"}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "choices.0.finish_reason": "length",
+      "usage.completion_tokens": 128,
+      "usage.prompt_tokens": 2048,
+      "usage.total_tokens": 2176
+    }
+  }
+}

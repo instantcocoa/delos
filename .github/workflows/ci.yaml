@@ -9,21 +9,27 @@ on:
 env:
   GO_VERSION: '1.25'
   BUF_VERSION: '1.47.2'
+  # Both binaries ship CGO-free; build and test that way everywhere. The one
+  # exception is the -race step below, which requires cgo.
+  CGO_ENABLED: '0'
+
+# Every `uses:` is pinned to a full commit SHA (supply-chain hygiene); the
+# trailing comment records the human-readable version it resolved from.
 
 jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
 
       - name: Setup Buf
-        uses: bufbuild/buf-setup-action@v1
+        uses: bufbuild/buf-setup-action@9672cee01808979ea1249f81d6d321217b9a10f6 # v1.47.2
         with:
           version: ${{ env.BUF_VERSION }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -50,10 +56,10 @@ jobs:
     name: Proto Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Buf
-        uses: bufbuild/buf-setup-action@v1
+        uses: bufbuild/buf-setup-action@9672cee01808979ea1249f81d6d321217b9a10f6 # v1.47.2
         with:
           version: ${{ env.BUF_VERSION }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -61,9 +67,13 @@ jobs:
       - name: Buf Lint
         run: buf lint
 
-      - name: Buf Breaking
-        run: buf breaking --against '.git#branch=main'
-        if: github.event_name == 'pull_request'
+      # NOTE: the `buf breaking` check is intentionally disabled while the
+      # two-binaries topology change lands (it deliberately breaks the protos).
+      # Reinstate it once the refactor is merged to main:
+      #
+      #   - name: Buf Breaking
+      #     run: buf breaking --against '.git#branch=main'
+      #     if: github.event_name == 'pull_request'
 
   test:
     name: Test
@@ -83,26 +93,16 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
-      redis:
-        image: redis:7
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
 
       - name: Setup Buf
-        uses: bufbuild/buf-setup-action@v1
+        uses: bufbuild/buf-setup-action@9672cee01808979ea1249f81d6d321217b9a10f6 # v1.47.2
         with:
           version: ${{ env.BUF_VERSION }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -111,7 +111,7 @@ jobs:
         run: buf generate
 
       - name: Cache Go modules
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cache/go-build
@@ -127,30 +127,74 @@ jobs:
           DELOS_DB_USER: delos
           DELOS_DB_PASSWORD: delos
           DELOS_DB_NAME: delos_test
-          DELOS_REDIS_URL: redis://localhost:6379
+          # The race detector is the one thing that needs cgo; everything
+          # else in this workflow builds with CGO_ENABLED=0.
+          CGO_ENABLED: '1'
         run: |
           go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Upload coverage
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
           files: coverage.out
           fail_ci_if_error: false
 
-  build:
-    name: Build
+  conformance:
+    name: Provider Conformance
     runs-on: ubuntu-latest
-    needs: [lint, test]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # The gateway does not depend on generated proto code, so this job needs
+      # no buf step: it replays cassettes through services/runtime directly.
+      - name: Replay provider cassettes
+        run: go test ./tests/conformance/ -count=1 -v
+
+  compat:
+    name: Client Compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Set up uv (Python clients)
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+
+      - name: Set up Node (openai npm client)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Run the official clients against the gateway
+        env:
+          # A missing client runtime is a failure in CI, not a skip.
+          COMPAT_REQUIRE_ALL: '1'
+        run: ./tests/compat/run.sh
+
+  vulncheck:
+    name: Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
 
       - name: Setup Buf
-        uses: bufbuild/buf-setup-action@v1
+        uses: bufbuild/buf-setup-action@9672cee01808979ea1249f81d6d321217b9a10f6 # v1.47.2
         with:
           version: ${{ env.BUF_VERSION }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -158,13 +202,38 @@ jobs:
       - name: Generate proto code
         run: buf generate
 
-      - name: Build all services
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup Buf
+        uses: bufbuild/buf-setup-action@9672cee01808979ea1249f81d6d321217b9a10f6 # v1.47.2
+        with:
+          version: ${{ env.BUF_VERSION }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate proto code
+        run: buf generate
+
+      - name: Build everything
         run: |
           go build -v ./...
 
-      - name: Build CLI
+      - name: Build binaries
         run: |
-          go build -v -o bin/delos ./cli
+          go build -v -o bin/delos ./cmd/delos
+          go build -v -o bin/delos-gateway ./cmd/delos-gateway
 
   docker:
     name: Docker Build
@@ -173,21 +242,19 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     strategy:
       matrix:
-        service:
-          - observe
-          - runtime
-          - prompt
-          - datasets
-          - eval
-          - deploy
+        include:
+          - name: delos
+            dockerfile: Dockerfile.delos
+          - name: delos-gateway
+            dockerfile: Dockerfile.gateway
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Login to Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -195,35 +262,50 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: ghcr.io/${{ github.repository }}-${{ matrix.service }}
+          images: ghcr.io/${{ github.repository }}-${{ matrix.name }}
           tags: |
             type=sha,prefix=
             type=raw,value=latest
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
-          file: services/${{ matrix.service }}/Dockerfile
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  helm-lint:
-    name: Helm Lint
+  # ---------------------------------------------------------------------------
+  # Executable documentation. Owned by the DevX workstream; keep this job last.
+  # ---------------------------------------------------------------------------
+  docs-test:
+    name: Docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Set up Helm
-        uses: azure/setup-helm@v4
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          version: v3.13.0
+          go-version: ${{ env.GO_VERSION }}
 
-      - name: Lint Helm chart
-        run: |
-          helm lint deploy/k8s/delos
+      - name: Setup Buf
+        uses: bufbuild/buf-setup-action@9672cee01808979ea1249f81d6d321217b9a10f6 # v1.47.2
+        with:
+          version: ${{ env.BUF_VERSION }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate proto code
+        run: buf generate
+
+      # Extracts every fenced bash block whose first line is "# docs-test" from
+      # README.md, GETTING_STARTED.md, TROUBLESHOOTING.md and docs/**, then runs
+      # each one in a scratch directory with bin/ on PATH. A documented command
+      # that stops working fails the build.
+      - name: Run documentation blocks
+        run: make docs-test

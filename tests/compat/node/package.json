@@ -1,0 +1,13 @@
+{
+  "name": "delos-compat-node",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Compatibility check: the official openai npm client against delos-gateway",
+  "scripts": {
+    "test": "node compat_test.mjs"
+  },
+  "dependencies": {
+    "openai": "^4.77.0"
+  }
+}

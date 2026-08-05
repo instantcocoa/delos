@@ -1,0 +1,31 @@
+{
+  "name": "ollama (OpenAI-compatible): usage mapping",
+  "provider": "ollama",
+  "surface": "openai",
+  "request": {
+    "model": "gemma3:4b",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Summarize."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"chatcmpl-340\",\"object\":\"chat.completion\",\"created\":1730000000,\"model\":\"gemma3:4b\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Summary.\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":320,\"completion_tokens\":64,\"total_tokens\":384}}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "choices.0.finish_reason": "length",
+      "usage.completion_tokens": 64,
+      "usage.prompt_tokens": 320,
+      "usage.total_tokens": 384
+    }
+  }
+}

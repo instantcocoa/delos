@@ -1,0 +1,39 @@
+{
+  "name": "openai: chat completion",
+  "provider": "openai",
+  "surface": "openai",
+  "request": {
+    "model": "gpt-4o",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_body_contains": [
+    "\"model\":\"gpt-4o\"",
+    "Say hello."
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"chatcmpl-A1\",\"object\":\"chat.completion\",\"created\":1730000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello there!\"},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3,\"total_tokens\":14},\"system_fingerprint\":\"fp_conformance\"}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "choices.0.finish_reason": "stop",
+      "choices.0.message.content": "Hello there!",
+      "choices.0.message.role": "assistant",
+      "model": "gpt-4o-2024-08-06",
+      "object": "chat.completion",
+      "usage.completion_tokens": 3,
+      "usage.prompt_tokens": 11,
+      "usage.total_tokens": 14
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "openai: embeddings",
+  "provider": "openai",
+  "surface": "openai",
+  "endpoint": "/v1/embeddings",
+  "request": {
+    "model": "text-embedding-3-small",
+    "input": "hello world"
+  },
+  "upstream_path_contains": "/v1/embeddings",
+  "upstream_body_contains": [
+    "hello world",
+    "text-embedding-3-small"
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.0023,-0.009,0.015]}],\"model\":\"text-embedding-3-small\",\"usage\":{\"prompt_tokens\":2,\"total_tokens\":2}}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "data.0.embedding.0": 0.0023,
+      "data.0.embedding.2": 0.015,
+      "data.0.object": "embedding",
+      "model": "text-embedding-3-small",
+      "object": "list",
+      "usage.prompt_tokens": 2,
+      "usage.total_tokens": 2
+    }
+  }
+}

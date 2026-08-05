@@ -1,11 +1,20 @@
-x-service-defaults: &service-defaults
+# Delos local stack: two binaries + Postgres.
+#
+#   docker compose up          -> postgres + gateway (8080) + delos control plane (8081)
+#
+# Optional profiles (not started by default):
+#   --profile ollama           -> local LLM via Ollama (11434) + model pull
+#   --profile observability    -> Jaeger UI (16686)
+#   --profile test             -> LocalStack (4566)
+
+x-env: &env-files
   env_file:
-    - .env
-    - .env.local
-  restart: unless-stopped
+    - path: .env
+      required: false
+    - path: .env.local
+      required: false
 
 services:
-  # Infrastructure
   postgres:
     image: postgres:15-alpine
     container_name: delos-postgres
@@ -23,142 +32,57 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
-  redis:
-    image: redis:7-alpine
-    container_name: delos-redis
-    command: redis-server --appendonly yes
+  # Data plane: stateless LLM gateway. No database.
+  gateway:
+    <<: *env-files
+    build:
+      context: ../..
+      dockerfile: Dockerfile.gateway
+    container_name: delos-gateway
     ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
+      - "8080:8080"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8080/healthz || exit 1"]
+      interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
-  nats:
-    image: nats:2.10-alpine
-    container_name: delos-nats
-    command: ["-js", "-m", "8222"]
+  # Control plane: prompts, datasets, evals, deploys. Migrates itself at startup.
+  delos:
+    <<: *env-files
+    build:
+      context: ../..
+      dockerfile: Dockerfile.delos
+    command: ["serve"]
+    container_name: delos-control-plane
+    environment:
+      DELOS_PORT: "8081"
+      DELOS_STORAGE_BACKEND: postgres
+      DELOS_DB_HOST: postgres
+      DELOS_DB_PORT: "5432"
+      DELOS_DB_USER: delos
+      DELOS_DB_PASSWORD: delos
+      DELOS_DB_NAME: delos
+      DELOS_DB_SSLMODE: disable
+      DELOS_GATEWAY_URL: http://gateway:8080
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      gateway:
+        condition: service_started
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
-      interval: 5s
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8081/healthz || exit 1"]
+      interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
-  # Delos Services
-  observe:
-    <<: *service-defaults
-    build:
-      context: ../..
-      dockerfile: services/observe/Dockerfile
-    container_name: delos-observe
-    ports:
-      - "9000:9000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
-  runtime:
-    <<: *service-defaults
-    build:
-      context: ../..
-      dockerfile: services/runtime/Dockerfile
-    container_name: delos-runtime
-    ports:
-      - "9001:9001"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      observe:
-        condition: service_started
-      ollama:
-        condition: service_healthy
-
-  prompt:
-    <<: *service-defaults
-    build:
-      context: ../..
-      dockerfile: services/prompt/Dockerfile
-    container_name: delos-prompt
-    ports:
-      - "9002:9002"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      observe:
-        condition: service_started
-
-  datasets:
-    <<: *service-defaults
-    build:
-      context: ../..
-      dockerfile: services/datasets/Dockerfile
-    container_name: delos-datasets
-    ports:
-      - "9003:9003"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      observe:
-        condition: service_started
-      prompt:
-        condition: service_started
-
-  eval:
-    <<: *service-defaults
-    build:
-      context: ../..
-      dockerfile: services/eval/Dockerfile
-    container_name: delos-eval
-    ports:
-      - "9004:9004"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      observe:
-        condition: service_started
-      runtime:
-        condition: service_started
-      prompt:
-        condition: service_started
-      datasets:
-        condition: service_started
-
-  deploy:
-    <<: *service-defaults
-    build:
-      context: ../..
-      dockerfile: services/deploy/Dockerfile
-    container_name: delos-deploy
-    ports:
-      - "9005:9005"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      observe:
-        condition: service_started
-      eval:
-        condition: service_started
-
-  # Local LLM (Ollama)
+  # --- optional: local LLM (docker compose --profile ollama up) ---
   ollama:
     image: ollama/ollama:latest
     container_name: delos-ollama
@@ -172,8 +96,9 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    profiles:
+      - ollama
 
-  # Init container to pull gemma3 model
   ollama-init:
     image: ollama/ollama:latest
     container_name: delos-ollama-init
@@ -194,8 +119,23 @@ services:
         fi
         echo "Model ready!"
     restart: "no"
+    profiles:
+      - ollama
 
-  # Optional testing infrastructure
+  # --- optional: tracing UI (docker compose --profile observability up) ---
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    container_name: delos-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+    profiles:
+      - observability
+
+  # --- optional: S3 for tests (docker compose --profile test up) ---
   localstack:
     image: localstack/localstack:3.0
     container_name: delos-localstack
@@ -216,22 +156,8 @@ services:
     profiles:
       - test
 
-  # Optional observability
-  jaeger:
-    image: jaegertracing/all-in-one:1.54
-    container_name: delos-jaeger
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
-    ports:
-      - "16686:16686"
-      - "4317:4317"
-      - "4318:4318"
-    profiles:
-      - observability
-
 volumes:
   postgres_data:
-  redis_data:
   localstack_data:
   ollama_data:
 

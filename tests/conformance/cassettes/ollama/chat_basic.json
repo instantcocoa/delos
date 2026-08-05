@@ -1,0 +1,36 @@
+{
+  "name": "ollama (OpenAI-compatible): chat completion",
+  "provider": "ollama",
+  "surface": "openai",
+  "request": {
+    "model": "gemma3:4b",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_body_contains": [
+    "gemma3:4b",
+    "Say hello."
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"chatcmpl-337\",\"object\":\"chat.completion\",\"created\":1730000000,\"model\":\"gemma3:4b\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello there!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":4,\"total_tokens\":18},\"system_fingerprint\":\"fp_ollama\"}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "choices.0.finish_reason": "stop",
+      "choices.0.message.content": "Hello there!",
+      "model": "gemma3:4b",
+      "object": "chat.completion",
+      "usage.total_tokens": 18
+    }
+  }
+}

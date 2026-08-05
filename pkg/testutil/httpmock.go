@@ -11,10 +11,10 @@ import (
 
 // MockHTTPClient provides a configurable mock HTTP client for testing.
 type MockHTTPClient struct {
-	mu           sync.Mutex
-	responses    []MockResponse
-	requests     []*http.Request
-	requestBodies [][]byte
+	mu              sync.Mutex
+	responses       []MockResponse
+	requests        []*http.Request
+	requestBodies   [][]byte
 	defaultResponse *MockResponse
 }
 

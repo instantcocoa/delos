@@ -1,0 +1,43 @@
+{
+  "name": "gemini: chat completion on the OpenAI surface",
+  "provider": "gemini",
+  "surface": "openai",
+  "request": {
+    "model": "gemini-2.5-flash",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are terse."
+      },
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": ":generateContent",
+  "upstream_body_contains": [
+    "\"systemInstruction\"",
+    "\"contents\"",
+    "Say hello."
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello there!\"}]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":6,\"candidatesTokenCount\":3,\"totalTokenCount\":9},\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"cRUconformance\"}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "choices.0.finish_reason": "stop",
+      "choices.0.message.content": "Hello there!",
+      "id": "cRUconformance",
+      "model": "gemini-2.5-flash",
+      "usage.completion_tokens": 3,
+      "usage.prompt_tokens": 6,
+      "usage.total_tokens": 9
+    }
+  }
+}

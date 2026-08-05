@@ -1,90 +1,43 @@
--- Traces table
-CREATE TABLE traces (
-    trace_id TEXT PRIMARY KEY,
-    root_service TEXT NOT NULL,
-    root_operation TEXT NOT NULL,
-    start_time TIMESTAMPTZ NOT NULL,
-    duration_ns BIGINT NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+-- Observe stores OTLP spans flat, one row per span, with the gen_ai.*
+-- essentials promoted to typed columns so cost/latency queries never dig
+-- through JSONB. Traces are derived by aggregating spans at query time.
+
+CREATE TABLE IF NOT EXISTS spans (
+    trace_id       TEXT NOT NULL,
+    span_id        TEXT NOT NULL,
+    parent_span_id TEXT NOT NULL DEFAULT '',
+    name           TEXT NOT NULL,
+    kind           TEXT NOT NULL DEFAULT '',
+    service_name   TEXT NOT NULL DEFAULT '',
+    start_time     TIMESTAMPTZ NOT NULL,
+    duration_ns    BIGINT NOT NULL DEFAULT 0,
+    status         TEXT NOT NULL DEFAULT '',
+    status_msg     TEXT NOT NULL DEFAULT '',
+    attributes     JSONB NOT NULL DEFAULT '{}',
+    events         JSONB NOT NULL DEFAULT '[]',
+
+    -- promoted gen_ai.* essentials
+    gen_ai_system  TEXT NOT NULL DEFAULT '',
+    request_model  TEXT NOT NULL DEFAULT '',
+    response_model TEXT NOT NULL DEFAULT '',
+    input_tokens   BIGINT NOT NULL DEFAULT 0,
+    output_tokens  BIGINT NOT NULL DEFAULT 0,
+    cost_usd       DOUBLE PRECISION NOT NULL DEFAULT 0,
+
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (trace_id, span_id)
 );
 
-CREATE INDEX idx_traces_root_service ON traces(root_service);
-CREATE INDEX idx_traces_root_operation ON traces(root_operation);
-CREATE INDEX idx_traces_start_time ON traces(start_time);
-CREATE INDEX idx_traces_duration ON traces(duration_ns);
+CREATE INDEX IF NOT EXISTS idx_spans_service_time ON spans (service_name, start_time DESC);
+CREATE INDEX IF NOT EXISTS idx_spans_trace ON spans (trace_id);
+CREATE INDEX IF NOT EXISTS idx_spans_model_time ON spans (request_model, start_time DESC) WHERE request_model <> '';
 
--- Spans table
-CREATE TABLE spans (
-    span_id TEXT NOT NULL,
-    trace_id TEXT NOT NULL REFERENCES traces(trace_id) ON DELETE CASCADE,
-    parent_span_id TEXT,
-    name TEXT NOT NULL,
-    service_name TEXT NOT NULL,
-    start_time TIMESTAMPTZ NOT NULL,
-    duration_ns BIGINT NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'ok',
-    PRIMARY KEY(trace_id, span_id)
+CREATE TABLE IF NOT EXISTS metrics (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name         TEXT NOT NULL,
+    service_name TEXT NOT NULL DEFAULT '',
+    value        DOUBLE PRECISION NOT NULL,
+    timestamp    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_spans_trace_id ON spans(trace_id);
-CREATE INDEX idx_spans_service_name ON spans(service_name);
-CREATE INDEX idx_spans_start_time ON spans(start_time);
-
--- Span attributes
-CREATE TABLE span_attributes (
-    trace_id TEXT NOT NULL,
-    span_id TEXT NOT NULL,
-    key TEXT NOT NULL,
-    value TEXT NOT NULL,
-    PRIMARY KEY(trace_id, span_id, key),
-    FOREIGN KEY(trace_id, span_id) REFERENCES spans(trace_id, span_id) ON DELETE CASCADE
-);
-
--- Span events
-CREATE TABLE span_events (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    trace_id TEXT NOT NULL,
-    span_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    timestamp TIMESTAMPTZ NOT NULL,
-    FOREIGN KEY(trace_id, span_id) REFERENCES spans(trace_id, span_id) ON DELETE CASCADE
-);
-
-CREATE INDEX idx_span_events_span ON span_events(trace_id, span_id);
-
--- Span event attributes
-CREATE TABLE span_event_attributes (
-    event_id UUID NOT NULL REFERENCES span_events(id) ON DELETE CASCADE,
-    key TEXT NOT NULL,
-    value TEXT NOT NULL,
-    PRIMARY KEY(event_id, key)
-);
-
--- Metrics table (for aggregated metrics)
-CREATE TABLE metrics (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name TEXT NOT NULL,
-    service_name TEXT,
-    value DOUBLE PRECISION NOT NULL,
-    unit TEXT,
-    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX idx_metrics_name ON metrics(name);
-CREATE INDEX idx_metrics_service ON metrics(service_name);
-CREATE INDEX idx_metrics_timestamp ON metrics(timestamp);
-
--- Partitioning hint for future: could partition traces/spans by time
--- For now, add a cleanup policy via scheduled job
-
--- Create a function to clean old traces (called by cron)
-CREATE OR REPLACE FUNCTION cleanup_old_traces(retention_days INTEGER DEFAULT 7)
-RETURNS INTEGER AS $$
-DECLARE
-    deleted_count INTEGER;
-BEGIN
-    DELETE FROM traces WHERE created_at < NOW() - (retention_days || ' days')::INTERVAL;
-    GET DIAGNOSTICS deleted_count = ROW_COUNT;
-    RETURN deleted_count;
-END;
-$$ LANGUAGE plpgsql;
+CREATE INDEX IF NOT EXISTS idx_metrics_name_time ON metrics (name, timestamp DESC);

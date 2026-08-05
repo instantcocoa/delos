@@ -14,16 +14,17 @@ import (
 
 	datasetsv1 "github.com/instantcocoa/delos/gen/go/datasets/v1"
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
-	runtimev1 "github.com/instantcocoa/delos/gen/go/runtime/v1"
 )
 
-// Runner executes evaluation runs by coordinating with runtime, prompt, and datasets services.
+// Runner executes evaluation runs by fetching prompts and examples from the
+// in-process prompt and datasets modules and running completions through the
+// LLM gateway.
 type Runner struct {
-	logger         *slog.Logger
-	store          Store
-	runtimeClient  runtimev1.RuntimeServiceClient
-	promptClient   promptv1.PromptServiceClient
-	datasetsClient datasetsv1.DatasetsServiceClient
+	logger   *slog.Logger
+	store    Store
+	gateway  CompletionClient
+	prompts  PromptSource
+	examples ExampleSource
 
 	// Configuration
 	pollInterval time.Duration
@@ -44,9 +45,9 @@ type RunnerConfig struct {
 func NewRunner(
 	logger *slog.Logger,
 	store Store,
-	runtimeClient runtimev1.RuntimeServiceClient,
-	promptClient promptv1.PromptServiceClient,
-	datasetsClient datasetsv1.DatasetsServiceClient,
+	gateway CompletionClient,
+	prompts PromptSource,
+	examples ExampleSource,
 	cfg RunnerConfig,
 ) *Runner {
 	if cfg.PollInterval == 0 {
@@ -57,14 +58,14 @@ func NewRunner(
 	}
 
 	return &Runner{
-		logger:         logger.With("component", "runner"),
-		store:          store,
-		runtimeClient:  runtimeClient,
-		promptClient:   promptClient,
-		datasetsClient: datasetsClient,
-		pollInterval:   cfg.PollInterval,
-		concurrency:    cfg.Concurrency,
-		stopCh:         make(chan struct{}),
+		logger:       logger.With("component", "runner"),
+		store:        store,
+		gateway:      gateway,
+		prompts:      prompts,
+		examples:     examples,
+		pollInterval: cfg.PollInterval,
+		concurrency:  cfg.Concurrency,
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -155,27 +156,19 @@ func (r *Runner) executeRun(ctx context.Context, run *EvalRun) {
 
 func (r *Runner) doExecute(ctx context.Context, run *EvalRun) error {
 	// Step 1: Fetch prompt (use ID directly - versioning handled at run creation time)
-	promptResp, err := r.promptClient.GetPrompt(ctx, &promptv1.GetPromptRequest{
-		Id: run.PromptID,
-	})
+	prompt, err := r.prompts.GetPrompt(ctx, run.PromptID)
 	if err != nil {
 		return fmt.Errorf("failed to fetch prompt: %w", err)
 	}
-	if promptResp.Prompt == nil {
+	if prompt == nil {
 		return fmt.Errorf("prompt not found: %s", run.PromptID)
 	}
-	prompt := promptResp.Prompt
 
 	// Step 2: Fetch examples from dataset
-	examplesResp, err := r.datasetsClient.GetExamples(ctx, &datasetsv1.GetExamplesRequest{
-		DatasetId: run.DatasetID,
-		Limit:     1000, // TODO: use sampling config
-		Shuffle:   run.Config.Shuffle,
-	})
+	examples, err := r.examples.GetExamples(ctx, run.DatasetID, 1000, run.Config.Shuffle)
 	if err != nil {
 		return fmt.Errorf("failed to fetch examples: %w", err)
 	}
-	examples := examplesResp.Examples
 	if len(examples) == 0 {
 		return fmt.Errorf("no examples found in dataset %s", run.DatasetID)
 	}
@@ -203,12 +196,12 @@ func (r *Runner) doExecute(ctx context.Context, run *EvalRun) error {
 		if err != nil {
 			r.logger.Warn("failed to process example", "example_id", example.Id, "error", err)
 			result = &EvalResult{
-				ID:          uuid.New().String(),
-				EvalRunID:   run.ID,
-				ExampleID:   example.Id,
-				Input:       example.Input.AsMap(),
-				Error:       err.Error(),
-				Passed:      false,
+				ID:           uuid.New().String(),
+				EvalRunID:    run.ID,
+				ExampleID:    example.Id,
+				Input:        example.Input.AsMap(),
+				Error:        err.Error(),
+				Passed:       false,
 				OverallScore: 0,
 			}
 		}
@@ -268,15 +261,13 @@ func (r *Runner) processExample(ctx context.Context, run *EvalRun, prompt *promp
 	// Build messages from prompt template
 	messages := r.renderPrompt(prompt, example.Input.AsMap())
 
-	// Call runtime for completion
-	completeResp, err := r.runtimeClient.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages:    messages,
-			Provider:    run.Config.Provider,
-			Model:       run.Config.Model,
-			Temperature: 0, // Deterministic for eval
-			MaxTokens:   1000,
-		},
+	// Call the gateway for completion
+	completeResp, err := r.gateway.Complete(ctx, CompletionRequest{
+		Messages:    messages,
+		Provider:    run.Config.Provider,
+		Model:       run.Config.Model,
+		Temperature: 0, // Deterministic for eval
+		MaxTokens:   1000,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("completion failed: %w", err)
@@ -288,8 +279,8 @@ func (r *Runner) processExample(ctx context.Context, run *EvalRun, prompt *promp
 	actualOutput := map[string]interface{}{
 		"content": completeResp.Content,
 	}
-	if completeResp.Message != nil {
-		actualOutput["role"] = completeResp.Message.Role
+	if completeResp.Role != "" {
+		actualOutput["role"] = completeResp.Role
 	}
 
 	// Expected output from example
@@ -336,12 +327,8 @@ func (r *Runner) processExample(ctx context.Context, run *EvalRun, prompt *promp
 	passed := overallScore >= 0.5
 
 	// Extract usage info
-	tokensUsed := 0
-	costUSD := 0.0
-	if completeResp.Usage != nil {
-		tokensUsed = int(completeResp.Usage.TotalTokens)
-		costUSD = completeResp.Usage.CostUsd
-	}
+	tokensUsed := completeResp.TotalTokens
+	costUSD := completeResp.CostUSD
 
 	return &EvalResult{
 		ID:               uuid.New().String(),
@@ -359,8 +346,8 @@ func (r *Runner) processExample(ctx context.Context, run *EvalRun, prompt *promp
 	}, nil
 }
 
-func (r *Runner) renderPrompt(prompt *promptv1.Prompt, variables map[string]interface{}) []*runtimev1.Message {
-	var messages []*runtimev1.Message
+func (r *Runner) renderPrompt(prompt *promptv1.Prompt, variables map[string]interface{}) []ChatMessage {
+	var messages []ChatMessage
 
 	for _, msg := range prompt.Messages {
 		content := msg.Content
@@ -371,7 +358,7 @@ func (r *Runner) renderPrompt(prompt *promptv1.Prompt, variables map[string]inte
 			content = strings.ReplaceAll(content, placeholder, fmt.Sprintf("%v", v))
 		}
 
-		messages = append(messages, &runtimev1.Message{
+		messages = append(messages, ChatMessage{
 			Role:    msg.Role,
 			Content: content,
 		})
@@ -417,16 +404,12 @@ Evaluation Criteria: %s
 Respond with ONLY a JSON object in this format:
 {"score": <0-10>, "explanation": "<brief explanation>"}`, expectedStr, actualStr, criteria)
 
-	// Call runtime for judgment
-	resp, err := r.runtimeClient.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Messages: []*runtimev1.Message{
-				{Role: "user", Content: judgePrompt},
-			},
-			Model:       model,
-			Temperature: 0,
-			MaxTokens:   200,
-		},
+	// Call the gateway for judgment
+	resp, err := r.gateway.Complete(ctx, CompletionRequest{
+		Messages:    []ChatMessage{{Role: "user", Content: judgePrompt}},
+		Model:       model,
+		Temperature: 0,
+		MaxTokens:   200,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("llm judge call failed: %w", err)
@@ -488,29 +471,17 @@ func (r *Runner) evaluateSemanticSimilarity(ctx context.Context, config Evaluato
 	expectedStr := extractStringValue(expected)
 	actualStr := extractStringValue(actual)
 
-	// Get embeddings for both texts
-	expectedEmbed, err := r.runtimeClient.Embed(ctx, &runtimev1.EmbedRequest{
-		Texts: []string{expectedStr},
-		Model: model,
-	})
+	// Get embeddings for both texts in one call
+	embeddings, err := r.gateway.Embed(ctx, []string{expectedStr, actualStr}, model)
 	if err != nil {
-		return nil, fmt.Errorf("failed to embed expected: %w", err)
+		return nil, fmt.Errorf("failed to embed texts: %w", err)
 	}
-
-	actualEmbed, err := r.runtimeClient.Embed(ctx, &runtimev1.EmbedRequest{
-		Texts: []string{actualStr},
-		Model: model,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to embed actual: %w", err)
-	}
-
-	if len(expectedEmbed.Embeddings) == 0 || len(actualEmbed.Embeddings) == 0 {
+	if len(embeddings) < 2 || len(embeddings[0]) == 0 || len(embeddings[1]) == 0 {
 		return nil, fmt.Errorf("no embeddings returned")
 	}
 
 	// Calculate cosine similarity
-	similarity := cosineSimilarity(expectedEmbed.Embeddings[0].Values, actualEmbed.Embeddings[0].Values)
+	similarity := cosineSimilarity(embeddings[0], embeddings[1])
 
 	return &EvaluatorResult{
 		EvaluatorType: "semantic_similarity",

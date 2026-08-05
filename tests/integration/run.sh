@@ -10,8 +10,9 @@
 #   ./run.sh --skip-if-down     Skip tests (exit 0) if services unavailable
 #
 # Environment:
-#   DELOS_*_ADDR               Override service addresses
-#   DELOS_OPENAI_API_KEY       Required for LLM completion tests
+#   DELOS_CONTROL_PLANE_ADDR   Control plane gRPC address (default localhost:8081)
+#   DELOS_GATEWAY_URL          Gateway base URL (default http://localhost:8080)
+#   OPENAI_API_KEY             Required for cloud LLM completion tests
 
 set -e
 
@@ -24,13 +25,9 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Default service addresses
-export DELOS_OBSERVE_ADDR=${DELOS_OBSERVE_ADDR:-"localhost:9000"}
-export DELOS_RUNTIME_ADDR=${DELOS_RUNTIME_ADDR:-"localhost:9001"}
-export DELOS_PROMPT_ADDR=${DELOS_PROMPT_ADDR:-"localhost:9002"}
-export DELOS_DATASETS_ADDR=${DELOS_DATASETS_ADDR:-"localhost:9003"}
-export DELOS_EVAL_ADDR=${DELOS_EVAL_ADDR:-"localhost:9004"}
-export DELOS_DEPLOY_ADDR=${DELOS_DEPLOY_ADDR:-"localhost:9005"}
+# The whole system is two endpoints: the control plane (gRPC) and the gateway (HTTP).
+export DELOS_CONTROL_PLANE_ADDR=${DELOS_CONTROL_PLANE_ADDR:-"localhost:8081"}
+export DELOS_GATEWAY_URL=${DELOS_GATEWAY_URL:-"http://localhost:8080"}
 
 # Options
 START_SERVICES=false
@@ -61,7 +58,11 @@ while [[ $# -gt 0 ]]; do
             TEST_FILTER="-run TestOllama"
             shift
             ;;
-        prompt|datasets|eval|deploy|runtime|observe)
+        gateway)
+            TEST_FILTER="-run TestGateway"
+            shift
+            ;;
+        prompt|datasets|eval|deploy|observe)
             TEST_FILTER="-run Test$(echo $1 | sed 's/.*/\u&/')Service"
             shift
             ;;
@@ -77,11 +78,11 @@ while [[ $# -gt 0 ]]; do
             echo "Test filters:"
             echo "  cli                  Run CLI tests only"
             echo "  ollama               Run Ollama integration tests only"
+            echo "  gateway              Run gateway HTTP surface tests only"
             echo "  prompt               Run prompt service tests only"
             echo "  datasets             Run datasets service tests only"
             echo "  eval                 Run eval service tests only"
             echo "  deploy               Run deploy service tests only"
-            echo "  runtime              Run runtime service tests only"
             echo "  observe              Run observe service tests only"
             exit 0
             ;;
@@ -96,18 +97,15 @@ echo -e "${YELLOW}Delos Integration Tests${NC}"
 echo "========================"
 echo ""
 
-# Check if a service is available (portable - works without nc)
-check_service() {
+# Check that a TCP endpoint accepts connections (portable - works without nc)
+check_tcp() {
     local name=$1
     local addr=$2
     local host=${addr%:*}
     local port=${addr#*:}
 
-    # Try multiple methods for portability
     if command -v nc &>/dev/null; then
         nc -z "$host" "$port" 2>/dev/null
-    elif command -v curl &>/dev/null; then
-        curl -s --connect-timeout 1 "http://$addr" &>/dev/null || curl -s --connect-timeout 1 "$addr" &>/dev/null
     else
         # Fallback to bash /dev/tcp (works on most systems)
         (echo >/dev/tcp/"$host"/"$port") 2>/dev/null
@@ -122,37 +120,44 @@ check_service() {
     fi
 }
 
+# Check the gateway health endpoint over HTTP
+check_gateway() {
+    if curl -sf --connect-timeout 2 "$DELOS_GATEWAY_URL/healthz" >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} gateway ($DELOS_GATEWAY_URL)"
+        return 0
+    else
+        echo -e "  ${RED}✗${NC} gateway ($DELOS_GATEWAY_URL)"
+        return 1
+    fi
+}
+
 # Start services if requested
 if [ "$START_SERVICES" = true ]; then
     echo "Starting services via Docker Compose..."
     cd "$PROJECT_ROOT"
-    docker-compose -f deploy/local/docker-compose.yaml up -d
+    docker compose -f deploy/local/docker-compose.yaml up -d
     echo ""
     echo "Waiting for services to be ready..."
     sleep 5
 fi
 
-# Check service availability
+# Check availability of the two endpoints
 echo "Checking service availability..."
 SERVICES_OK=true
-check_service "observe" "$DELOS_OBSERVE_ADDR" || SERVICES_OK=false
-check_service "runtime" "$DELOS_RUNTIME_ADDR" || SERVICES_OK=false
-check_service "prompt" "$DELOS_PROMPT_ADDR" || SERVICES_OK=false
-check_service "datasets" "$DELOS_DATASETS_ADDR" || SERVICES_OK=false
-check_service "eval" "$DELOS_EVAL_ADDR" || SERVICES_OK=false
-check_service "deploy" "$DELOS_DEPLOY_ADDR" || SERVICES_OK=false
+check_tcp "control plane" "$DELOS_CONTROL_PLANE_ADDR" || SERVICES_OK=false
+check_gateway || SERVICES_OK=false
 echo ""
 
 if [ "$SERVICES_OK" = false ]; then
     if [ "$SKIP_IF_DOWN" = true ]; then
         echo -e "${YELLOW}Services unavailable - skipping integration tests${NC}"
-        echo "To start services: docker-compose -f deploy/local/docker-compose.yaml up -d"
+        echo "To start services: docker compose -f deploy/local/docker-compose.yaml up -d"
         exit 0
     else
-        echo -e "${RED}Some services are not available.${NC}"
+        echo -e "${RED}The control plane or gateway is not available.${NC}"
         echo ""
         echo "Options:"
-        echo "  1. Start services: docker-compose -f deploy/local/docker-compose.yaml up -d"
+        echo "  1. Start services: docker compose -f deploy/local/docker-compose.yaml up -d"
         echo "  2. Auto-start:     $0 --start-services"
         echo "  3. Skip tests:     $0 --skip-if-down"
         exit 1
@@ -160,8 +165,8 @@ if [ "$SERVICES_OK" = false ]; then
 fi
 
 # Check for LLM API keys
-if [ -n "$DELOS_OPENAI_API_KEY" ] || [ -n "$DELOS_ANTHROPIC_API_KEY" ]; then
-    echo -e "${GREEN}LLM API keys detected - completion tests will run${NC}"
+if [ -n "$OPENAI_API_KEY" ] || [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$DELOS_RUNTIME_OPENAI_KEY" ] || [ -n "$DELOS_RUNTIME_ANTHROPIC_KEY" ]; then
+    echo -e "${GREEN}LLM API keys detected - cloud completion tests will run${NC}"
 else
     echo -e "${YELLOW}No LLM API keys - cloud completion tests will be skipped${NC}"
 fi
@@ -170,7 +175,7 @@ fi
 OLLAMA_HOST=${DELOS_RUNTIME_OLLAMA_URL:-"http://localhost:11434"}
 OLLAMA_PORT=${OLLAMA_HOST##*:}
 OLLAMA_PORT=${OLLAMA_PORT%%/*}
-if check_service "ollama" "localhost:$OLLAMA_PORT" 2>/dev/null; then
+if check_tcp "ollama" "localhost:$OLLAMA_PORT" 2>/dev/null; then
     echo -e "${GREEN}Ollama detected - local LLM tests will run${NC}"
 else
     echo -e "${YELLOW}Ollama not detected - local LLM tests will be skipped${NC}"
@@ -180,9 +185,9 @@ echo ""
 # Ensure CLI binary exists
 CLI_BINARY="$PROJECT_ROOT/bin/delos"
 if [ ! -f "$CLI_BINARY" ]; then
-    echo "Building CLI binary..."
+    echo "Building delos binary..."
     cd "$PROJECT_ROOT"
-    make build-cli
+    make build
     echo ""
 fi
 

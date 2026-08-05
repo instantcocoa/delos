@@ -19,8 +19,12 @@ import (
 	evalv1 "github.com/instantcocoa/delos/gen/go/eval/v1"
 	observev1 "github.com/instantcocoa/delos/gen/go/observe/v1"
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
-	runtimev1 "github.com/instantcocoa/delos/gen/go/runtime/v1"
 )
+
+// These workflows span both binaries: prompts, datasets, evals and gate verdicts
+// live in the control plane (gRPC on one address), while completions go to the
+// gateway over HTTP. The eval service itself calls the gateway for completions,
+// so eval runs exercise that hop server-side.
 
 // ============================================================================
 // PROMPT VERSIONING WORKFLOW TESTS
@@ -168,31 +172,13 @@ func TestPromptVersioningWorkflow(t *testing.T) {
 // ============================================================================
 
 func TestPromptWithOllamaCompletion(t *testing.T) {
-	runtimeClient, runtimeCleanup := getRuntimeClient(t)
-	defer runtimeCleanup()
+	skipIfOllamaUnavailable(t)
 
 	promptClient, promptCleanup := getPromptClient(t)
 	defer promptCleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-
-	// Check if Ollama is available
-	providersResp, err := runtimeClient.ListProviders(ctx, &runtimev1.ListProvidersRequest{})
-	if err != nil {
-		t.Fatalf("ListProviders failed: %v", err)
-	}
-
-	ollamaAvailable := false
-	for _, p := range providersResp.Providers {
-		if p.Name == "ollama" && p.Available {
-			ollamaAvailable = true
-			break
-		}
-	}
-	if !ollamaAvailable {
-		t.Skip("Ollama not available - skipping prompt+LLM integration test")
-	}
 
 	// Create a prompt with variables
 	slug := fmt.Sprintf("ollama-prompt-%d", time.Now().UnixNano())
@@ -227,36 +213,30 @@ func TestPromptWithOllamaCompletion(t *testing.T) {
 	}
 
 	// Render the prompt messages manually (in real app, prompt service would do this)
-	renderedMessages := make([]*runtimev1.Message, len(getResp.Prompt.Messages))
+	renderedMessages := make([]gwChatMessage, len(getResp.Prompt.Messages))
 	for i, msg := range getResp.Prompt.Messages {
 		content := msg.Content
 		content = strings.ReplaceAll(content, "{{role}}", "math tutor")
 		content = strings.ReplaceAll(content, "{{question}}", "What is 15 * 7?")
-		renderedMessages[i] = &runtimev1.Message{
+		renderedMessages[i] = gwChatMessage{
 			Role:    msg.Role,
 			Content: content,
 		}
 	}
 
-	// Call Ollama with rendered prompt
-	completeResp, err := runtimeClient.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Provider:    "ollama",
-			Model:       "gemma3:4b",
-			Messages:    renderedMessages,
-			Temperature: getResp.Prompt.DefaultConfig.Temperature,
-			MaxTokens:   int32(getResp.Prompt.DefaultConfig.MaxTokens),
-		},
+	// Call Ollama through the gateway with the rendered prompt
+	temperature := getResp.Prompt.DefaultConfig.Temperature
+	completeResp := ollamaComplete(t, ctx, gwChatRequest{
+		Messages:    renderedMessages,
+		Temperature: &temperature,
+		MaxTokens:   int(getResp.Prompt.DefaultConfig.MaxTokens),
 	})
-	if err != nil {
-		t.Fatalf("Complete failed: %v", err)
-	}
 
-	t.Logf("Response: %s", completeResp.Content)
+	t.Logf("Response: %s", completeResp.content())
 
 	// Verify the response contains the answer
-	if !strings.Contains(completeResp.Content, "105") {
-		t.Logf("Note: Expected '105' in response, got: %s", completeResp.Content)
+	if !strings.Contains(completeResp.content(), "105") {
+		t.Logf("Note: Expected '105' in response, got: %s", completeResp.content())
 	}
 }
 
@@ -265,8 +245,7 @@ func TestPromptWithOllamaCompletion(t *testing.T) {
 // ============================================================================
 
 func TestEvalWithOllama(t *testing.T) {
-	runtimeClient, runtimeCleanup := getRuntimeClient(t)
-	defer runtimeCleanup()
+	skipIfOllamaUnavailable(t)
 
 	promptClient, promptCleanup := getPromptClient(t)
 	defer promptCleanup()
@@ -279,23 +258,6 @@ func TestEvalWithOllama(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
-
-	// Check if Ollama is available
-	providersResp, err := runtimeClient.ListProviders(ctx, &runtimev1.ListProvidersRequest{})
-	if err != nil {
-		t.Fatalf("ListProviders failed: %v", err)
-	}
-
-	ollamaAvailable := false
-	for _, p := range providersResp.Providers {
-		if p.Name == "ollama" && p.Available {
-			ollamaAvailable = true
-			break
-		}
-	}
-	if !ollamaAvailable {
-		t.Skip("Ollama not available - skipping eval+Ollama integration test")
-	}
 
 	// Step 1: Create a math prompt
 	t.Log("Step 1: Creating math prompt")
@@ -461,8 +423,7 @@ func TestEvalWithOllama(t *testing.T) {
 // ============================================================================
 
 func TestOllamaCallsAreTraced(t *testing.T) {
-	runtimeClient, runtimeCleanup := getRuntimeClient(t)
-	defer runtimeCleanup()
+	skipIfOllamaUnavailable(t)
 
 	observeClient, observeCleanup := getObserveClient(t)
 	defer observeCleanup()
@@ -470,42 +431,16 @@ func TestOllamaCallsAreTraced(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// Check if Ollama is available
-	providersResp, err := runtimeClient.ListProviders(ctx, &runtimev1.ListProvidersRequest{})
-	if err != nil {
-		t.Fatalf("ListProviders failed: %v", err)
-	}
-
-	ollamaAvailable := false
-	for _, p := range providersResp.Providers {
-		if p.Name == "ollama" && p.Available {
-			ollamaAvailable = true
-			break
-		}
-	}
-	if !ollamaAvailable {
-		t.Skip("Ollama not available - skipping tracing test")
-	}
-
 	// Generate a unique identifier for this test
 	testID := fmt.Sprintf("trace-test-%d", time.Now().UnixNano())
 
 	// Step 1: Make an Ollama completion with unique content
 	t.Log("Step 1: Making Ollama completion request")
-	completeResp, err := runtimeClient.Complete(ctx, &runtimev1.CompleteRequest{
-		Params: &runtimev1.CompletionParams{
-			Provider: "ollama",
-			Model:    "gemma3:4b",
-			Messages: []*runtimev1.Message{
-				{Role: "user", Content: fmt.Sprintf("Test ID: %s. What is 1+1?", testID)},
-			},
-			MaxTokens: 10,
-		},
+	completeResp := ollamaComplete(t, ctx, gwChatRequest{
+		Messages:  []gwChatMessage{{Role: "user", Content: fmt.Sprintf("Test ID: %s. What is 1+1?", testID)}},
+		MaxTokens: 10,
 	})
-	if err != nil {
-		t.Fatalf("Complete failed: %v", err)
-	}
-	t.Logf("Got response: %s", completeResp.Content)
+	t.Logf("Got response: %s", completeResp.content())
 
 	// Step 2: Wait a moment for traces to be ingested
 	t.Log("Step 2: Waiting for traces to be ingested...")
@@ -514,14 +449,14 @@ func TestOllamaCallsAreTraced(t *testing.T) {
 	// Step 3: Query for recent traces from the runtime service
 	t.Log("Step 3: Querying for runtime service traces")
 	queryResp, err := observeClient.QueryTraces(ctx, &observev1.QueryTracesRequest{
-		ServiceName: "runtime",
+		ServiceName: "delos-gateway",
 		Limit:       20,
 	})
 	if err != nil {
 		t.Fatalf("QueryTraces failed: %v", err)
 	}
 
-	t.Logf("Found %d traces from runtime service", len(queryResp.Traces))
+	t.Logf("Found %d traces from the gateway", len(queryResp.Traces))
 
 	// Check if we can find traces with LLM-related operations
 	foundLLMTrace := false
@@ -553,14 +488,13 @@ func TestOllamaCallsAreTraced(t *testing.T) {
 }
 
 // ============================================================================
-// END-TO-END WORKFLOW: PROMPT -> DATASET -> EVAL -> DEPLOY
+// END-TO-END WORKFLOW: PROMPT -> DATASET -> EVAL -> GATE VERDICT
 // ============================================================================
 
 func TestEndToEndWorkflow(t *testing.T) {
-	// Get all clients
-	runtimeClient, runtimeCleanup := getRuntimeClient(t)
-	defer runtimeCleanup()
+	skipIfOllamaUnavailable(t)
 
+	// Get all clients
 	promptClient, promptCleanup := getPromptClient(t)
 	defer promptCleanup()
 
@@ -575,23 +509,6 @@ func TestEndToEndWorkflow(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
-
-	// Check if Ollama is available
-	providersResp, err := runtimeClient.ListProviders(ctx, &runtimev1.ListProvidersRequest{})
-	if err != nil {
-		t.Fatalf("ListProviders failed: %v", err)
-	}
-
-	ollamaAvailable := false
-	for _, p := range providersResp.Providers {
-		if p.Name == "ollama" && p.Available {
-			ollamaAvailable = true
-			break
-		}
-	}
-	if !ollamaAvailable {
-		t.Skip("Ollama not available - skipping end-to-end workflow test")
-	}
 
 	timestamp := time.Now().UnixNano()
 
@@ -691,6 +608,7 @@ func TestEndToEndWorkflow(t *testing.T) {
 	maxWait := 120 * time.Second
 	deadline := time.Now().Add(maxWait)
 	var evalScore float64
+	evalCompleted := false
 
 	for time.Now().Before(deadline) {
 		statusResp, err := evalClient.GetEvalRun(ctx, &evalv1.GetEvalRunRequest{Id: evalRunID})
@@ -702,6 +620,7 @@ func TestEndToEndWorkflow(t *testing.T) {
 			if statusResp.EvalRun.Summary != nil {
 				evalScore = float64(statusResp.EvalRun.Summary.OverallScore)
 			}
+			evalCompleted = true
 			t.Logf("Eval completed: score=%.2f", evalScore)
 			break
 		}
@@ -714,51 +633,96 @@ func TestEndToEndWorkflow(t *testing.T) {
 	}
 
 	// ========================================
-	// PHASE 4: Create Quality Gate
+	// PHASE 4: Quality Gate the run should pass
 	// ========================================
-	t.Log("=== PHASE 4: Creating Quality Gate ===")
+	t.Log("=== PHASE 4: Creating a Quality Gate the run passes ===")
 
-	gateResp, err := deployClient.CreateQualityGate(ctx, &deployv1.CreateQualityGateRequest{
-		Name:     fmt.Sprintf("e2e-gate-%d", timestamp),
-		PromptId: promptID,
+	passGateName := fmt.Sprintf("e2e-gate-pass-%d", timestamp)
+	passGateResp, err := deployClient.CreateQualityGate(ctx, &deployv1.CreateQualityGateRequest{
+		Name:        passGateName,
+		Description: "Permissive gate: the eval run above should clear it",
+		PromptId:    promptID,
 		Conditions: []*deployv1.GateCondition{
 			{
-				Type:      "eval_score",
-				Operator:  "gte",
-				Threshold: 0.5, // 50% pass rate required
+				Metric:    "overall_score",
+				Operator:  deployv1.GateOperator_GATE_OPERATOR_GTE,
+				Threshold: 0.1,
 			},
 		},
-		Required: true,
 	})
 	if err != nil {
-		t.Logf("CreateQualityGate failed (may already exist): %v", err)
+		t.Fatalf("CreateQualityGate (permissive) failed: %v", err)
+	}
+	t.Logf("Created quality gate: %s (%s)", passGateResp.QualityGate.Name, passGateResp.QualityGate.Id)
+
+	// ========================================
+	// PHASE 5: Gate verdicts (what CI acts on)
+	// ========================================
+	t.Log("=== PHASE 5: Reading Gate Verdicts ===")
+
+	passVerdict, err := deployClient.GetGateVerdict(ctx, &deployv1.GetGateVerdictRequest{
+		Name: passGateName,
+	})
+	if err != nil {
+		t.Fatalf("GetGateVerdict (permissive) failed: %v", err)
+	}
+	t.Logf("Permissive gate verdict: pass=%v run=%s reasons=%v",
+		passVerdict.Pass, passVerdict.EvalRunId, passVerdict.Reasons)
+	if len(passVerdict.Reasons) == 0 {
+		t.Error("expected the verdict to explain itself")
+	}
+	if evalCompleted {
+		// The verdict must agree with the score the run actually produced.
+		want := evalScore >= 0.1
+		if passVerdict.Pass != want {
+			t.Errorf("gate overall_score>=0.1 returned pass=%v for a run scoring %.2f: %v",
+				passVerdict.Pass, evalScore, passVerdict.Reasons)
+		}
+		if !want {
+			t.Logf("note: the model scored %.2f, below the permissive threshold", evalScore)
+		}
+		if passVerdict.EvalRunId == "" {
+			t.Error("expected the verdict to name the eval run it was computed from")
+		}
 	} else {
-		t.Logf("Created quality gate: %s", gateResp.QualityGate.Id)
+		t.Logf("eval run did not complete; verdict reported pass=%v", passVerdict.Pass)
 	}
 
-	// ========================================
-	// PHASE 5: Create Deployment
-	// ========================================
-	t.Log("=== PHASE 5: Creating Deployment ===")
+	// A gate no real run clears: same prompt, impossible threshold.
+	strictGateName := fmt.Sprintf("e2e-gate-strict-%d", timestamp)
+	if _, err := deployClient.CreateQualityGate(ctx, &deployv1.CreateQualityGateRequest{
+		Name:        strictGateName,
+		Description: "Strict gate: no realistic run clears it",
+		PromptId:    promptID,
+		Conditions: []*deployv1.GateCondition{
+			{
+				Metric:    "overall_score",
+				Operator:  deployv1.GateOperator_GATE_OPERATOR_GTE,
+				Threshold: 0.99,
+			},
+			{
+				Metric:    "avg_latency_ms",
+				Operator:  deployv1.GateOperator_GATE_OPERATOR_LTE,
+				Threshold: 0.001,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("CreateQualityGate (strict) failed: %v", err)
+	}
 
-	deployResp, err := deployClient.CreateDeployment(ctx, &deployv1.CreateDeploymentRequest{
-		PromptId:     promptID,
-		ToVersion:    1,
-		Environment:  "staging",
-		SkipApproval: true, // Auto-approve for test
-		Strategy: &deployv1.DeploymentStrategy{
-			Type: deployv1.DeploymentType_DEPLOYMENT_TYPE_IMMEDIATE,
-		},
-		Metadata: map[string]string{
-			"eval_run_id": evalRunID,
-			"eval_score":  fmt.Sprintf("%.2f", evalScore),
-		},
+	strictVerdict, err := deployClient.GetGateVerdict(ctx, &deployv1.GetGateVerdictRequest{
+		Name: strictGateName,
 	})
 	if err != nil {
-		t.Fatalf("CreateDeployment failed: %v", err)
+		t.Fatalf("GetGateVerdict (strict) failed: %v", err)
 	}
-	deploymentID := deployResp.Deployment.Id
-	t.Logf("Created deployment: %s (status: %s)", deploymentID, deployResp.Deployment.Status)
+	t.Logf("Strict gate verdict: pass=%v reasons=%v", strictVerdict.Pass, strictVerdict.Reasons)
+	if strictVerdict.Pass {
+		t.Errorf("expected the strict gate to fail, reasons: %v", strictVerdict.Reasons)
+	}
+	if len(strictVerdict.Reasons) == 0 {
+		t.Error("expected the failing verdict to explain which condition failed")
+	}
 
 	// ========================================
 	// PHASE 6: Update Prompt to v2
@@ -836,7 +800,7 @@ func TestEndToEndWorkflow(t *testing.T) {
 	t.Logf("Prompt: %s (v1 -> v2)", promptID)
 	t.Logf("Dataset: %s (2 examples)", datasetID)
 	t.Logf("Eval Runs: %s (v1), %s (v2)", evalRunID, evalRun2ID)
-	t.Logf("Deployment: %s", deploymentID)
+	t.Logf("Gates: %s (pass=%v), %s (pass=%v)", passGateName, passVerdict.Pass, strictGateName, strictVerdict.Pass)
 }
 
 // ============================================================================

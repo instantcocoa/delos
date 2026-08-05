@@ -479,11 +479,11 @@ func TestCopyPrompt_Nil(t *testing.T) {
 
 func TestCopyPrompt_DeepCopy(t *testing.T) {
 	original := &Prompt{
-		ID:       "test",
-		Name:     "Test",
-		Messages: []PromptMessage{{Role: "user", Content: "Hello"}},
+		ID:        "test",
+		Name:      "Test",
+		Messages:  []PromptMessage{{Role: "user", Content: "Hello"}},
 		Variables: []PromptVariable{{Name: "name", Type: "string"}},
-		Tags:     []string{"tag1", "tag2"},
+		Tags:      []string{"tag1", "tag2"},
 		DefaultConfig: GenerationConfig{
 			Stop: []string{"stop1"},
 		},

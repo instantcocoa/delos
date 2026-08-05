@@ -12,253 +12,366 @@ Verify your setup:
 ```bash
 go version      # Should show 1.25+
 docker --version
-docker-compose --version
+docker compose version
 ```
 
-## Service Architecture
+## Architecture
 
-### Service Ports
+Delos is **two binaries plus PostgreSQL**:
 
-| Service | Port | Description |
-|---------|------|-------------|
-| observe | 9000 | Tracing and metrics (foundation) |
-| runtime | 9001 | LLM provider gateway |
-| prompt | 9002 | Prompt versioning |
-| datasets | 9003 | Test data management |
-| eval | 9004 | Quality evaluation |
-| deploy | 9005 | Deployment orchestration |
-
-### Service Dependencies & Startup Order
-
-Services have the following dependency graph:
+| Binary | Role | Port | State |
+|--------|------|------|-------|
+| `delos-gateway` | Data plane - OpenAI/Anthropic-compatible LLM gateway | 8080 | Stateless, no database |
+| `delos` | Control plane + CLI - prompts, datasets, evals, quality gates, traces | 8081 (`delos serve`) | PostgreSQL (or in-memory) |
 
 ```
-observe (no dependencies - start first)
-    ↑
-runtime ←→ prompt ←→ datasets
-    ↓         ↓         ↓
-         eval (depends on runtime, prompt, datasets)
-           ↓
-        deploy (depends on eval)
+your app ──► delos-gateway :8080 ──► OpenAI / Anthropic / Gemini / Bedrock /
+                  ▲                  Ollama / any OpenAI-compatible endpoint
+                  │ DELOS_GATEWAY_URL
+                  │
+delos CLI ──► delos serve :8081 ──► PostgreSQL
+              (observe, prompt, datasets, eval, gates)
 ```
 
-**Recommended startup order:**
-1. `observe` - Foundation service, no dependencies
-2. `runtime`, `prompt`, `datasets` - Core services (can start in parallel)
-3. `eval` - Depends on runtime for completions
-4. `deploy` - Depends on eval for quality gates
+There is no startup ordering to worry about. The gateway is completely
+standalone - it needs no database and no control plane. The control plane only
+calls the gateway when it needs completions (for example while running an
+evaluation), and it applies its own database migrations at startup, so there is
+no separate migration step.
 
-**What happens if services start out of order?**
-- Services use gRPC with automatic reconnection
-- If a dependency isn't available, the service logs a warning but continues starting
-- Operations requiring missing dependencies will fail with `UNAVAILABLE` until the dependency comes up
-- No manual restart needed - connections auto-recover
-
-## Option 1: Full Docker Setup (Recommended)
-
-This runs everything in containers - no local Go builds needed.
+## Clone and Configure
 
 ```bash
-# Clone the repo
 git clone https://github.com/instantcocoa/delos.git
 cd delos
 
-# Copy environment file
+# Base config for Docker Compose (safe to check in)
 cp deploy/local/.env.example deploy/local/.env
-
-# Start everything
-docker-compose -f deploy/local/docker-compose.yaml up -d --build
-
-# Verify services are running
-docker-compose -f deploy/local/docker-compose.yaml ps
 ```
 
-All services should show as "Up" with healthy status for infrastructure.
-
-### Build the CLI to interact with services
+Put your provider API keys in `deploy/local/.env.local` (gitignored, never
+commit keys):
 
 ```bash
-make build-cli
-./bin/delos --help
-./bin/delos prompt list
+# deploy/local/.env.local
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-## Option 2: Local Development Setup
+The gateway registers one provider for each key it finds. Without any key it
+still starts, logs a warning, and serves health checks - completions will fail
+until a provider is configured.
 
-This builds and runs services locally (faster iteration).
-
-### Step 1: Start Infrastructure
+## Option 1: Everything in Docker
 
 ```bash
-# Start PostgreSQL, Redis, and NATS
+# postgres + gateway (8080) + control plane (8081) - three containers
+make up-all
+
+# Watch them come up
+docker compose -f deploy/local/docker-compose.yaml ps
+make logs
+```
+
+## Option 2: Postgres in Docker, binaries locally
+
+Faster iteration - rebuild and restart in seconds.
+
+```bash
+# PostgreSQL only - that's all Delos needs
 make up
 
-# Verify they're running
-docker ps
-```
-
-You should see `delos-postgres`, `delos-redis`, and `delos-nats` containers.
-
-### Step 2: Build Everything
-
-```bash
-# Build all services
+# Build bin/delos and bin/delos-gateway
 make build
 
-# Build CLI
-make build-cli
-```
-
-Binaries are output to `./bin/`.
-
-### Step 3: Run Services
-
-**Option A: Run all services (background)**
-```bash
+# Run both in the background
 make run-all
+
+# ... and stop them when you're done
+make stop-all
 ```
 
-Note: This runs services as background processes. To stop them:
+Or run either binary in the foreground, one per terminal, for debugging:
+
 ```bash
-pkill -f 'bin/(observe|runtime|prompt|datasets|eval|deploy)'
+make run-gateway        # go run ./cmd/delos-gateway   (:8080)
+make run-control-plane  # go run ./cmd/delos serve     (:8081)
 ```
 
-**Option B: Run services individually (foreground, for debugging)**
+When running locally, point the control plane at the local gateway and database:
 
-Open 6 terminal windows and run one service in each:
 ```bash
-# Terminal 1
-./bin/observe
-
-# Terminal 2
-./bin/runtime
-
-# Terminal 3
-./bin/prompt
-
-# Terminal 4
-./bin/datasets
-
-# Terminal 5
-./bin/eval
-
-# Terminal 6
-./bin/deploy
+export DELOS_GATEWAY_URL=http://localhost:8080
+export DELOS_STORAGE_BACKEND=postgres
+export DELOS_DB_HOST=localhost
 ```
 
-### Step 4: Verify Services
+## Verify
 
 ```bash
-# Check all services respond
+curl http://localhost:8080/healthz    # gateway: {"status":"ok","providers":N}
+curl http://localhost:8081/healthz    # control plane: {"status":"ok"}
+```
+
+## Dev mode: what you get with no configuration
+
+With no config file and no database, the gateway starts in **dev mode**:
+
+- **Any API key is accepted.** `delos-dev` is only a convention; the gateway
+  logs `virtual keys are NOT enforced` at startup so it is never a surprise.
+  Enforcement switches on the moment `DELOS_STORAGE_BACKEND=postgres` is set —
+  then every request needs a real key from `delos key create`.
+- **Model names pass straight through** to whichever providers have keys in the
+  environment. Aliases and fallback chains are opt-in (`gateway.routes`).
+- **The cache is in-process** (an LRU), so restarting clears it.
+- **Nothing is metered** — no budgets, no usage rows.
+- **Tracing is off** until you point `telemetry.otlp_endpoint` somewhere or set
+  `telemetry.stdout: true`.
+
+Dev mode is for hello-world and local iteration. Everything it turns off is one
+config line away; see [docs/deploy.md](docs/deploy.md) for the production shape.
+
+## Your First Completion
+
+The gateway speaks the OpenAI and Anthropic HTTP APIs, so anything that talks to
+those providers works with the base URL swapped. There is no Delos SDK to
+install.
+
+With curl:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+With the OpenAI Python client:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="delos-dev")
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)
+```
+
+With the Anthropic client:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(base_url="http://localhost:8080", api_key="delos-dev")
+```
+
+Gateway endpoints:
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/chat/completions` | OpenAI-compatible completions (streaming supported) |
+| `POST /v1/embeddings` | Embeddings |
+| `GET /v1/models`, `GET /v1/models/{model}` | Model discovery |
+| `POST /v1/messages` | Anthropic-compatible messages |
+| `GET /v1/events` | Live request stream (SSE) — what `delos tail` reads |
+| `GET /healthz` | Health and provider count |
+
+Models are resolved by name (`gpt-4o-mini`, `claude-sonnet-4-20250514`,
+`gemini-1.5-flash`) or with an explicit provider prefix (`openai/gpt-4o`,
+`ollama/gemma3:4b`).
+
+## Your First CLI Commands
+
+The `delos` binary is both the control-plane server and the CLI. Every
+subcommand other than `serve` is a client.
+
+```bash
+# Against the gateway (DELOS_GATEWAY_URL, default http://localhost:8080)
+./bin/delos gateway health
+./bin/delos gateway models
+./bin/delos gateway complete "Summarize the Odyssey in one line." --model gpt-4o-mini
+./bin/delos gateway complete "Tell me a story." --model gpt-4o-mini --stream
+
+# Against the control plane (DELOS_CONTROL_PLANE_ADDR, default localhost:8081)
+./bin/delos prompt create "Summarizer" --slug summarizer \
+  --system "Summarize the following text concisely."
 ./bin/delos prompt list
 ./bin/delos datasets list
 ./bin/delos eval evaluators
-./bin/delos deploy list
+./bin/delos gate list
+./bin/delos gate check <name>   # exit 0 = pass, 1 = fail
 ```
 
-## Database Migrations
+Global flags: `-o/--output` (`table`, `json`, `yaml`) and `-v/--verbose`.
+`delos runtime` is an alias for `delos gateway`, and `delos deploy` is an alias
+for `delos gate`.
 
-When using PostgreSQL storage backend, you need to run database migrations.
-
-### With Docker Compose (Automatic)
-
-If using Docker Compose, migrations run automatically on container startup.
-
-### Manual Migration (Local Development)
+Every command has help text:
 
 ```bash
-# Install golang-migrate CLI
-go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
-
-# Set database URL
-export DELOS_DB_URL="postgres://delos:delos@localhost:5432/delos?sslmode=disable"
-
-# Run all migrations (all services share one database)
-migrate -path services/observe/migrations -database "$DELOS_DB_URL" up
-migrate -path services/prompt/migrations -database "$DELOS_DB_URL" up
-migrate -path services/datasets/migrations -database "$DELOS_DB_URL" up
-migrate -path services/eval/migrations -database "$DELOS_DB_URL" up
-migrate -path services/deploy/migrations -database "$DELOS_DB_URL" up
+# docs-test
+delos --help
+delos tail --help
+delos config validate --help
 ```
 
-### Check Migration Status
+## Watching traffic: `delos tail`
+
+`delos tail` prints one line per request as it happens — the fastest way to see
+whether your app is really going through Delos, which provider answered, and
+what it cost.
 
 ```bash
-migrate -path services/prompt/migrations -database "$DELOS_DB_URL" version
+delos tail                 # live
+delos tail --replay 20     # the last 20 requests first, then live
+delos tail --json | jq .   # raw events for scripting
 ```
 
-### Rollback Migrations
+```
+TIME      STATUS  MODEL       PROVIDER   LATENCY  TOKENS   COST      CACHE  KEY
+14:22:03  200     gpt-4o      openai       1.2s   842->96  $0.00131  -      web-prod
+14:22:04  200     gpt-4o      openai      188us   842->96  $0.00131  hit    web-prod
+14:22:07  404     ghost       -             2ms   -        -         -      -      model_not_found: ...
+```
+
+It reads `GET /v1/events` on the gateway (`DELOS_GATEWAY_URL`), a plain SSE
+stream — `curl -N http://localhost:8080/v1/events` shows the same JSON without
+the CLI. The stream is lossy by design: a slow reader drops events rather than
+slowing the gateway down. Turn it off entirely with `DELOS_TAIL=off`.
+
+When virtual keys are enforced, `delos tail` needs one: export
+`DELOS_API_KEY=<key>`.
+
+## Configuration: `delos.yaml`
+
+Delos needs no config file. When you want one — a fixed port, routes, Postgres,
+an OTLP endpoint — there is exactly one:
 
 ```bash
-# Rollback last migration for a service
-migrate -path services/prompt/migrations -database "$DELOS_DB_URL" down 1
+# docs-test
+cp delos.yaml.example delos.yaml
+delos config validate delos.yaml
+```
 
-# Rollback all migrations (dangerous!)
-migrate -path services/prompt/migrations -database "$DELOS_DB_URL" down
+Precedence is **environment variable > `delos.yaml` > default**. The file is
+found at `$DELOS_CONFIG`, else `./delos.yaml`. Secrets are environment-only
+(provider keys, `DELOS_DB_PASSWORD`), so the file is safe to commit.
+
+`validate` is offline and structural. `doctor` actually probes what the config
+points at — control plane, gateway, Postgres, and provider connectivity through
+`GET /v1/models`:
+
+```bash
+delos config doctor
+```
+
+```
+ok    config file    /srv/delos/delos.yaml parses cleanly
+ok    control plane  localhost:8081 healthy ({"status":"ok"})
+ok    gateway        http://localhost:8080 healthy, 2 provider(s) registered
+FAIL  postgres       cannot connect to localhost:5432/delos: dial tcp ...
+      -> start it with `make up`, or fix DELOS_DB_* / database: in delos.yaml
+ok    providers      37 model(s) reachable via openai, anthropic
+```
+
+It exits 1 if any check fails, so it works as a CI smoke test. `-o json` gives
+machine-readable output.
+
+## Virtual keys and budgets
+
+Keys are enforced as soon as the gateway has Postgres configured. They are
+stored as argon2id hashes, and the plaintext is shown exactly once:
+
+```bash
+delos key create web-prod --usd-budget 250 --models 'openai/*,gpt-4o'
+delos key list
+delos key revoke <id>          # the id from `delos key list`
+```
+
+Then use the key like any provider key:
+
+```python
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="dk_...")
+```
+
+An over-budget or out-of-scope request is refused with a structured 429/403
+before any provider is contacted — you can see those refusals in `delos tail`.
+
+## Prompts as files
+
+Prompts live in your repo as `.prompt.yaml` files; the control plane is an index
+and a serving cache, not the source of truth.
+
+```bash
+delos prompt pull ./prompts            # write every prompt to a directory
+$EDITOR ./prompts/summarizer.prompt.yaml
+delos prompt diff ./prompts            # semantic diff against the control plane
+delos prompt push ./prompts --dry-run  # show what would change
+delos prompt push ./prompts            # sync (repo wins)
+delos prompt render ./prompts/summarizer.prompt.yaml --var topic=Odyssey
+```
+
+## Gates in CI
+
+`delos gate check` turns eval results into an exit code, so a pipeline can block
+on quality:
+
+```bash
+delos gate create nightly --prompt summarizer --condition 'overall_score>=0.8'
+delos gate list
+delos gate check nightly   # exit 0 = pass, 1 = fail
+```
+
+Put that last line in a CI step and the merge blocks when the gate fails. Delos
+emits the verdict; your CI system decides what to do with it.
+
+## Optional Compose Profiles
+
+None of these start by default.
+
+```bash
+# Local models via Ollama (:11434) - starts Ollama and pulls gemma3:4b
+make up-ollama
+make ollama-ready
+
+# Then enable it for the gateway:
+#   DELOS_RUNTIME_OLLAMA_ENABLED=true
+#   DELOS_RUNTIME_OLLAMA_URL=http://ollama:11434   (http://localhost:11434 locally)
+
+# Jaeger tracing UI on http://localhost:16686
+docker compose -f deploy/local/docker-compose.yaml --profile observability up -d
+
+# LocalStack S3 on :4566 (used by some tests)
+docker compose -f deploy/local/docker-compose.yaml --profile test up -d
 ```
 
 ## Running Tests
 
-### Unit Tests
-
 ```bash
-# Run all unit tests (no external dependencies needed)
-go test ./...
+# Unit tests, no external dependencies
+make test-unit
+
+# Full test run (starts postgres and localstack first)
+make test
+
+# Coverage report -> coverage.html
+make test-coverage
 ```
 
-### Integration Tests
-
-Integration tests require services to be running:
+Integration tests need the stack running:
 
 ```bash
-# Option 1: With Docker Compose (recommended)
-docker-compose -f deploy/local/docker-compose.yaml up -d
-./tests/integration/run.sh
+make up-all
+make test-integration
 
-# Option 2: With local services
-make up
-make run-all
-./tests/integration/run.sh
-
-# Run specific test suites
+# Or drive the runner directly
 ./tests/integration/run.sh cli      # CLI tests only
-./tests/integration/run.sh prompt   # Prompt service tests only
+./tests/integration/run.sh ollama   # Ollama tests only
 ./tests/integration/run.sh -v       # Verbose output
 ```
 
-## Configuration
-
-### Environment Variables
-
-Services read configuration from environment variables. For local development:
-
-1. **Docker Compose**: Edit `deploy/local/.env`
-2. **Local services**: Export variables or create a `.env` file
-
-Key variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DELOS_OBSERVE_ADDR` | `localhost:9000` | Observe service address |
-| `DELOS_RUNTIME_ADDR` | `localhost:9001` | Runtime service address |
-| `DELOS_PROMPT_ADDR` | `localhost:9002` | Prompt service address |
-| `DELOS_DATASETS_ADDR` | `localhost:9003` | Datasets service address |
-| `DELOS_EVAL_ADDR` | `localhost:9004` | Eval service address |
-| `DELOS_DEPLOY_ADDR` | `localhost:9005` | Deploy service address |
-| `DELOS_RUNTIME_OPENAI_KEY` | - | OpenAI API key (for completions) |
-| `DELOS_RUNTIME_ANTHROPIC_KEY` | - | Anthropic API key (for completions) |
-
-### LLM Provider Keys
-
-To use the runtime service for completions, configure at least one provider:
-
-```bash
-# In deploy/local/.env
-DELOS_RUNTIME_OPENAI_KEY=sk-...
-DELOS_RUNTIME_ANTHROPIC_KEY=sk-ant-...
-```
-
-Without keys, the runtime service starts but completions will fail.
+`make test-ollama` runs the Ollama suite only.
 
 ## Making Changes
 
@@ -268,10 +381,10 @@ Without keys, the runtime service starts but completions will fail.
 # Edit files in proto/
 vim proto/prompt/v1/prompt.proto
 
-# Regenerate Go and Python code
+# Regenerate Go code
 make proto
 
-# Rebuild affected services
+# Rebuild
 make build
 ```
 
@@ -279,15 +392,18 @@ make build
 
 1. Define the RPC in the proto file
 2. Run `make proto`
-3. Implement the handler in the service
-4. Add tests
-5. Update CLI if needed
-6. Update SDK if needed
+3. Implement the handler in the service package under `services/`
+4. Wire it up in `controlplane/controlplane.go` if it is a new module
+5. Add tests
+6. Update the CLI if needed
+
+Gateway HTTP endpoints are not proto-driven - add them in
+`services/runtime/httpapi.go` (with `openai_api.go` / `anthropic_api.go`).
 
 ### Code Style
 
 ```bash
-# Run linters
+# Run linters (Go + proto)
 make lint
 
 # Format code
@@ -301,32 +417,36 @@ See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for common issues and solutions.
 
 ### Quick Fixes
 
-**Services won't start - port already in use**
+**Port already in use**
 ```bash
-# Kill existing processes
-pkill -f 'bin/(observe|runtime|prompt|datasets|eval|deploy)'
-# Or find and kill specific port
-lsof -ti:9001 | xargs kill -9
+make stop-all
+# Or find and kill whatever holds the port
+lsof -ti:8080 | xargs kill -9
+lsof -ti:8081 | xargs kill -9
 ```
 
 **Docker containers won't start**
 ```bash
-# Clean up and restart
-docker-compose -f deploy/local/docker-compose.yaml down -v
-docker-compose -f deploy/local/docker-compose.yaml up -d
+docker compose -f deploy/local/docker-compose.yaml down -v
+make up-all
+```
+
+**Completions fail with "no providers available"**
+```bash
+# Check what the gateway actually registered
+curl http://localhost:8080/healthz
+# Then confirm your keys are in deploy/local/.env.local and restart the gateway
 ```
 
 **Tests fail with "service unavailable"**
 ```bash
-# Ensure services are running
-docker-compose -f deploy/local/docker-compose.yaml ps
-# Or
-curl -s localhost:9002/health || echo "Prompt service not running"
+docker compose -f deploy/local/docker-compose.yaml ps
+curl -sf http://localhost:8081/healthz || echo "Control plane not running"
 ```
 
 ## Next Steps
 
 - Read [CLAUDE.md](CLAUDE.md) for architecture details and coding standards
-- Check out the [CLI source](cli/) to understand command structure
-- Look at [sdk/python/](sdk/python/) for SDK implementation
+- Check out the [CLI source](cli/cmd/) to understand command structure
+- Read [deploy/local/.env.example](deploy/local/.env.example) for every configuration option
 - Browse [tests/integration/](tests/integration/) for test examples

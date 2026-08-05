@@ -2,325 +2,196 @@ package deploy
 
 import (
 	"context"
+	"log/slog"
+	"os"
 	"testing"
 	"time"
 )
 
-func TestMemoryStore_CreateAndGetDeployment(t *testing.T) {
-	store := NewMemoryStore()
-	ctx := context.Background()
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+}
 
-	deployment := &Deployment{
-		ID:          "deploy-1",
-		PromptID:    "prompt-1",
-		ToVersion:   1,
-		Environment: "production",
-		Status:      DeploymentStatusPendingApproval,
-		CreatedAt:   time.Now(),
-	}
-
-	if err := store.CreateDeployment(ctx, deployment); err != nil {
-		t.Fatalf("failed to create deployment: %v", err)
-	}
-
-	retrieved, err := store.GetDeployment(ctx, "deploy-1")
-	if err != nil {
-		t.Fatalf("failed to get deployment: %v", err)
-	}
-
-	if retrieved == nil {
-		t.Fatal("expected deployment, got nil")
-	}
-
-	if retrieved.PromptID != "prompt-1" {
-		t.Errorf("expected prompt ID 'prompt-1', got '%s'", retrieved.PromptID)
+func testGate(name, prompt string, conditions ...GateCondition) *QualityGate {
+	return &QualityGate{
+		ID:         "id-" + name,
+		Name:       name,
+		PromptID:   prompt,
+		Conditions: conditions,
+		CreatedAt:  time.Now(),
 	}
 }
 
-func TestMemoryStore_CreateDuplicateDeployment(t *testing.T) {
+func TestMemoryStoreGateCRUD(t *testing.T) {
 	store := NewMemoryStore()
 	ctx := context.Background()
 
-	deployment := &Deployment{ID: "deploy-1", PromptID: "prompt-1"}
-	if err := store.CreateDeployment(ctx, deployment); err != nil {
-		t.Fatalf("failed to create deployment: %v", err)
+	gate := testGate("release", "prompt-1", GateCondition{Metric: MetricOverallScore, Operator: OperatorGTE, Threshold: 0.8})
+	if err := store.CreateQualityGate(ctx, gate); err != nil {
+		t.Fatalf("create failed: %v", err)
 	}
 
-	err := store.CreateDeployment(ctx, deployment)
-	if err == nil {
-		t.Fatal("expected error for duplicate deployment")
+	// duplicate name rejected (case-insensitive)
+	dup := testGate("RELEASE", "prompt-2")
+	dup.ID = "other-id"
+	if err := store.CreateQualityGate(ctx, dup); err == nil {
+		t.Error("duplicate gate name must be rejected")
+	}
+
+	byName, err := store.GetQualityGateByName(ctx, "release")
+	if err != nil || byName == nil || byName.ID != gate.ID {
+		t.Fatalf("GetQualityGateByName = %v, %v", byName, err)
+	}
+	if missing, err := store.GetQualityGateByName(ctx, "nope"); err != nil || missing != nil {
+		t.Errorf("missing gate should be (nil, nil), got %v, %v", missing, err)
+	}
+
+	all, err := store.ListQualityGates(ctx, "")
+	if err != nil || len(all) != 1 {
+		t.Errorf("list all = %v, %v", all, err)
+	}
+	filtered, err := store.ListQualityGates(ctx, "prompt-1")
+	if err != nil || len(filtered) != 1 {
+		t.Errorf("list filtered = %v, %v", filtered, err)
+	}
+	none, err := store.ListQualityGates(ctx, "prompt-x")
+	if err != nil || len(none) != 0 {
+		t.Errorf("list none = %v, %v", none, err)
 	}
 }
 
-func TestMemoryStore_GetNonexistentDeployment(t *testing.T) {
-	store := NewMemoryStore()
-	ctx := context.Background()
-
-	retrieved, err := store.GetDeployment(ctx, "nonexistent")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestParseConditionTable(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    GateCondition
+		wantErr bool
+	}{
+		{"overall_score>=0.8", GateCondition{MetricOverallScore, OperatorGTE, 0.8}, false},
+		{"pass_rate >= 0.9", GateCondition{MetricPassRate, OperatorGTE, 0.9}, false},
+		{"avg_latency_ms<=2000", GateCondition{MetricAvgLatencyMs, OperatorLTE, 2000}, false},
+		{"total_cost_usd <= 1.5", GateCondition{MetricTotalCostUSD, OperatorLTE, 1.5}, false},
+		{"overall_score>0.8", GateCondition{}, true},  // unsupported operator
+		{"bogus_metric>=1", GateCondition{}, true},    // unknown metric
+		{"overall_score>=abc", GateCondition{}, true}, // bad threshold
+		{">=0.8", GateCondition{}, true},              // missing metric
 	}
-
-	if retrieved != nil {
-		t.Fatal("expected nil for nonexistent deployment")
-	}
-}
-
-func TestMemoryStore_UpdateDeployment(t *testing.T) {
-	store := NewMemoryStore()
-	ctx := context.Background()
-
-	deployment := &Deployment{ID: "deploy-1", Status: DeploymentStatusPendingApproval}
-	if err := store.CreateDeployment(ctx, deployment); err != nil {
-		t.Fatalf("failed to create deployment: %v", err)
-	}
-
-	deployment.Status = DeploymentStatusCompleted
-	if err := store.UpdateDeployment(ctx, deployment); err != nil {
-		t.Fatalf("failed to update deployment: %v", err)
-	}
-
-	retrieved, _ := store.GetDeployment(ctx, "deploy-1")
-	if retrieved.Status != DeploymentStatusCompleted {
-		t.Errorf("expected status Completed, got %d", retrieved.Status)
-	}
-}
-
-func TestMemoryStore_UpdateNonexistentDeployment(t *testing.T) {
-	store := NewMemoryStore()
-	ctx := context.Background()
-
-	deployment := &Deployment{ID: "nonexistent"}
-	err := store.UpdateDeployment(ctx, deployment)
-	if err == nil {
-		t.Fatal("expected error for nonexistent deployment")
-	}
-}
-
-func TestMemoryStore_ListDeployments(t *testing.T) {
-	store := NewMemoryStore()
-	ctx := context.Background()
-
-	for i := 0; i < 5; i++ {
-		deployment := &Deployment{
-			ID:          string(rune('a' + i)),
-			PromptID:    "prompt-1",
-			Environment: "production",
-			Status:      DeploymentStatusPendingApproval,
-			CreatedAt:   time.Now().Add(time.Duration(i) * time.Hour),
+	for _, tc := range cases {
+		got, err := ParseCondition(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("ParseCondition(%q) should fail", tc.in)
+			}
+			continue
 		}
-		if err := store.CreateDeployment(ctx, deployment); err != nil {
-			t.Fatalf("failed to create deployment: %v", err)
+		if err != nil {
+			t.Errorf("ParseCondition(%q) error: %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("ParseCondition(%q) = %+v, want %+v", tc.in, got, tc.want)
 		}
 	}
-
-	// List all
-	deployments, total, err := store.ListDeployments(ctx, ListDeploymentsQuery{})
-	if err != nil {
-		t.Fatalf("failed to list deployments: %v", err)
-	}
-	if total != 5 {
-		t.Errorf("expected 5 deployments, got %d", total)
-	}
-
-	// Verify sorted by created_at descending
-	if deployments[0].ID != "e" {
-		t.Errorf("expected first deployment to be 'e', got '%s'", deployments[0].ID)
-	}
-
-	// List with limit
-	deployments, total, _ = store.ListDeployments(ctx, ListDeploymentsQuery{Limit: 2})
-	if len(deployments) != 2 {
-		t.Errorf("expected 2 deployments with limit, got %d", len(deployments))
-	}
-	if total != 5 {
-		t.Errorf("expected total 5, got %d", total)
-	}
-
-	// List with offset
-	deployments, _, _ = store.ListDeployments(ctx, ListDeploymentsQuery{Offset: 3})
-	if len(deployments) != 2 {
-		t.Errorf("expected 2 deployments with offset 3, got %d", len(deployments))
-	}
 }
 
-func TestMemoryStore_ListDeploymentsWithFilters(t *testing.T) {
-	store := NewMemoryStore()
-	ctx := context.Background()
-
-	deployments := []*Deployment{
-		{ID: "1", PromptID: "prompt-1", Environment: "production", Status: DeploymentStatusCompleted, CreatedAt: time.Now()},
-		{ID: "2", PromptID: "prompt-1", Environment: "staging", Status: DeploymentStatusPendingApproval, CreatedAt: time.Now()},
-		{ID: "3", PromptID: "prompt-2", Environment: "production", Status: DeploymentStatusPendingApproval, CreatedAt: time.Now()},
-	}
-
-	for _, d := range deployments {
-		if err := store.CreateDeployment(ctx, d); err != nil {
-			t.Fatalf("failed to create deployment: %v", err)
-		}
-	}
-
-	// Filter by prompt ID
-	results, _, _ := store.ListDeployments(ctx, ListDeploymentsQuery{PromptID: "prompt-1"})
-	if len(results) != 2 {
-		t.Errorf("expected 2 deployments for prompt-1, got %d", len(results))
-	}
-
-	// Filter by environment
-	results, _, _ = store.ListDeployments(ctx, ListDeploymentsQuery{Environment: "production"})
-	if len(results) != 2 {
-		t.Errorf("expected 2 production deployments, got %d", len(results))
-	}
-
-	// Filter by status
-	results, _, _ = store.ListDeployments(ctx, ListDeploymentsQuery{Status: DeploymentStatusPendingApproval})
-	if len(results) != 2 {
-		t.Errorf("expected 2 pending deployments, got %d", len(results))
-	}
+// fakeEvals returns a fixed run summary.
+type fakeEvals struct {
+	run *RunSummary
+	err error
 }
 
-func TestMemoryStore_GetCurrentDeployment(t *testing.T) {
-	store := NewMemoryStore()
-	ctx := context.Background()
-
-	now := time.Now()
-	earlier := now.Add(-time.Hour)
-
-	// Create two completed deployments
-	d1 := &Deployment{
-		ID:          "1",
-		PromptID:    "prompt-1",
-		Environment: "production",
-		ToVersion:   1,
-		Status:      DeploymentStatusCompleted,
-		CompletedAt: &earlier,
-		CreatedAt:   earlier,
-	}
-	d2 := &Deployment{
-		ID:          "2",
-		PromptID:    "prompt-1",
-		Environment: "production",
-		ToVersion:   2,
-		Status:      DeploymentStatusCompleted,
-		CompletedAt: &now,
-		CreatedAt:   now,
-	}
-	store.CreateDeployment(ctx, d1)
-	store.CreateDeployment(ctx, d2)
-
-	current, err := store.GetCurrentDeployment(ctx, "prompt-1", "production")
-	if err != nil {
-		t.Fatalf("failed to get current deployment: %v", err)
-	}
-	if current == nil {
-		t.Fatal("expected current deployment, got nil")
-	}
-	if current.ToVersion != 2 {
-		t.Errorf("expected version 2, got %d", current.ToVersion)
-	}
-
-	// Non-existent prompt
-	current, _ = store.GetCurrentDeployment(ctx, "nonexistent", "production")
-	if current != nil {
-		t.Error("expected nil for nonexistent prompt")
-	}
+func (f fakeEvals) LatestCompletedRun(ctx context.Context, promptID string) (*RunSummary, error) {
+	return f.run, f.err
 }
 
-func TestMemoryStore_CreateAndGetQualityGate(t *testing.T) {
-	store := NewMemoryStore()
+func TestVerdict(t *testing.T) {
 	ctx := context.Background()
+	store := NewMemoryStore()
+	run := &RunSummary{
+		RunID:        "run-1",
+		PromptID:     "prompt-1",
+		OverallScore: 0.85,
+		PassRate:     0.9,
+		AvgLatencyMs: 1200,
+		TotalCostUSD: 0.42,
+		CompletedAt:  time.Now(),
+	}
+	svc := NewDeployService(store, fakeEvals{run: run})
 
-	gate := &QualityGate{
-		ID:       "gate-1",
-		Name:     "Test Gate",
+	_, err := svc.CreateQualityGate(ctx, CreateQualityGateInput{
+		Name:     "release",
 		PromptID: "prompt-1",
-		Required: true,
 		Conditions: []GateCondition{
-			{Type: "eval_score", Operator: "gte", Threshold: 0.9},
+			{Metric: MetricOverallScore, Operator: OperatorGTE, Threshold: 0.8},
+			{Metric: MetricAvgLatencyMs, Operator: OperatorLTE, Threshold: 2000},
 		},
-		CreatedAt: time.Now(),
-	}
-
-	if err := store.CreateQualityGate(ctx, gate); err != nil {
-		t.Fatalf("failed to create quality gate: %v", err)
-	}
-
-	retrieved, err := store.GetQualityGate(ctx, "gate-1")
+	})
 	if err != nil {
-		t.Fatalf("failed to get quality gate: %v", err)
+		t.Fatalf("create gate: %v", err)
 	}
 
-	if retrieved == nil {
-		t.Fatal("expected quality gate, got nil")
-	}
-
-	if retrieved.Name != "Test Gate" {
-		t.Errorf("expected name 'Test Gate', got '%s'", retrieved.Name)
-	}
-}
-
-func TestMemoryStore_CreateDuplicateQualityGate(t *testing.T) {
-	store := NewMemoryStore()
-	ctx := context.Background()
-
-	gate := &QualityGate{ID: "gate-1", Name: "Test"}
-	if err := store.CreateQualityGate(ctx, gate); err != nil {
-		t.Fatalf("failed to create quality gate: %v", err)
-	}
-
-	err := store.CreateQualityGate(ctx, gate)
-	if err == nil {
-		t.Fatal("expected error for duplicate quality gate")
-	}
-}
-
-func TestMemoryStore_GetNonexistentQualityGate(t *testing.T) {
-	store := NewMemoryStore()
-	ctx := context.Background()
-
-	retrieved, err := store.GetQualityGate(ctx, "nonexistent")
+	verdict, err := svc.Verdict(ctx, "release")
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("verdict: %v", err)
+	}
+	if !verdict.Pass {
+		t.Errorf("expected pass, reasons: %v", verdict.Reasons)
+	}
+	if verdict.EvalRunID != "run-1" {
+		t.Errorf("run id = %s", verdict.EvalRunID)
 	}
 
-	if retrieved != nil {
-		t.Fatal("expected nil for nonexistent quality gate")
+	// A failing condition flips the verdict with an explanatory reason.
+	_, err = svc.CreateQualityGate(ctx, CreateQualityGateInput{
+		Name:     "strict",
+		PromptID: "prompt-1",
+		Conditions: []GateCondition{
+			{Metric: MetricOverallScore, Operator: OperatorGTE, Threshold: 0.95},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create strict gate: %v", err)
 	}
-}
-
-func TestMemoryStore_ListQualityGates(t *testing.T) {
-	store := NewMemoryStore()
-	ctx := context.Background()
-
-	gates := []*QualityGate{
-		{ID: "1", Name: "Gate 1", PromptID: "prompt-1", CreatedAt: time.Now()},
-		{ID: "2", Name: "Gate 2", PromptID: "prompt-1", CreatedAt: time.Now().Add(time.Hour)},
-		{ID: "3", Name: "Gate 3", PromptID: "prompt-2", CreatedAt: time.Now()},
+	verdict, err = svc.Verdict(ctx, "strict")
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	for _, g := range gates {
-		if err := store.CreateQualityGate(ctx, g); err != nil {
-			t.Fatalf("failed to create quality gate: %v", err)
+	if verdict.Pass {
+		t.Error("expected fail")
+	}
+	found := false
+	for _, r := range verdict.Reasons {
+		if r == "overall_score 0.85 >= 0.95: fail" {
+			found = true
 		}
 	}
+	if !found {
+		t.Errorf("expected explanatory reason, got %v", verdict.Reasons)
+	}
+}
 
-	// List for prompt-1
-	results, err := store.ListQualityGates(ctx, "prompt-1")
+func TestVerdictNoRuns(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	svc := NewDeployService(store, fakeEvals{run: nil})
+
+	_, err := svc.CreateQualityGate(ctx, CreateQualityGateInput{
+		Name:       "empty",
+		PromptID:   "prompt-x",
+		Conditions: []GateCondition{{Metric: MetricPassRate, Operator: OperatorGTE, Threshold: 0.5}},
+	})
 	if err != nil {
-		t.Fatalf("failed to list quality gates: %v", err)
+		t.Fatal(err)
 	}
-	if len(results) != 2 {
-		t.Errorf("expected 2 gates for prompt-1, got %d", len(results))
+	verdict, err := svc.Verdict(ctx, "empty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verdict.Pass {
+		t.Error("a gate with no eval runs must fail closed")
 	}
 
-	// Verify sorted by created_at ascending
-	if results[0].ID != "1" {
-		t.Errorf("expected first gate to be '1', got '%s'", results[0].ID)
-	}
-
-	// List for nonexistent prompt
-	results, _ = store.ListQualityGates(ctx, "nonexistent")
-	if len(results) != 0 {
-		t.Errorf("expected 0 gates for nonexistent prompt, got %d", len(results))
+	// unknown gate -> ErrGateNotFound
+	if _, err := svc.Verdict(ctx, "missing"); err == nil || !errorsIs(err, ErrGateNotFound) {
+		t.Errorf("expected ErrGateNotFound, got %v", err)
 	}
 }

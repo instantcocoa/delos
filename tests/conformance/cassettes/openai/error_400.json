@@ -1,0 +1,34 @@
+{
+  "name": "openai: invalid request passthrough",
+  "provider": "openai",
+  "surface": "openai",
+  "request": {
+    "model": "gpt-4o",
+    "temperature": 5,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_responses": [
+    {
+      "status": 400,
+      "content_type": "application/json",
+      "body": "{\"error\":{\"message\":\"Invalid value for 'temperature': must be a number between 0 and 2, inclusive.\",\"type\":\"invalid_request_error\",\"param\":\"temperature\",\"code\":null}}"
+    }
+  ],
+  "expect": {
+    "status": 400,
+    "json_paths": {
+      "error.code": "provider_error",
+      "error.type": "invalid_request_error"
+    },
+    "body_contains": [
+      "Invalid value for 'temperature': must be a number between 0 and 2, inclusive.",
+      "provider openai:"
+    ]
+  }
+}

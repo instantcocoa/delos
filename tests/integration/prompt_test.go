@@ -8,31 +8,14 @@ package integration
 import (
 	"context"
 	"fmt"
-	"os"
 	"testing"
 	"time"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
 )
 
-func getPromptClient(t *testing.T) (promptv1.PromptServiceClient, func()) {
-	t.Helper()
-
-	addr := os.Getenv("DELOS_PROMPT_ADDR")
-	if addr == "" {
-		addr = "localhost:9002"
-	}
-
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("failed to connect to prompt service: %v", err)
-	}
-
-	return promptv1.NewPromptServiceClient(conn), func() { conn.Close() }
-}
+// getPromptClient lives in clients_test.go; all control-plane services share
+// one gRPC address.
 
 func TestPromptService_CreateAndGet(t *testing.T) {
 	client, cleanup := getPromptClient(t)

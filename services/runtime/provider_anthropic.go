@@ -11,410 +11,505 @@ import (
 )
 
 const (
-	anthropicBaseURL = "https://api.anthropic.com/v1"
-	anthropicVersion = "2023-06-01"
+	anthropicBaseURL    = "https://api.anthropic.com/v1"
+	anthropicAPIVersion = "2023-06-01"
 )
 
-// AnthropicProvider implements the Provider interface for Anthropic.
+// AnthropicProvider speaks the Anthropic Messages API.
 type AnthropicProvider struct {
 	apiKey     string
+	baseURL    string
 	httpClient *http.Client
 	models     []string
+	pricing    map[string]float64
 }
 
-// NewAnthropicProvider creates a new Anthropic provider.
-func NewAnthropicProvider(apiKey string) *AnthropicProvider {
-	return &AnthropicProvider{
+// AnthropicOption configures the provider.
+type AnthropicOption func(*AnthropicProvider)
+
+// WithAnthropicBaseURL overrides the API base URL (testing and proxies).
+func WithAnthropicBaseURL(url string) AnthropicOption {
+	return func(p *AnthropicProvider) { p.baseURL = url }
+}
+
+// NewAnthropicProvider creates the provider for api.anthropic.com.
+func NewAnthropicProvider(apiKey string, opts ...AnthropicOption) *AnthropicProvider {
+	p := &AnthropicProvider{
 		apiKey:     apiKey,
+		baseURL:    anthropicBaseURL,
 		httpClient: &http.Client{},
 		models: []string{
+			"claude-opus-4-5",
+			"claude-sonnet-4-5",
+			"claude-haiku-4-5",
+			"claude-opus-4-1",
 			"claude-sonnet-4-20250514",
-			"claude-opus-4-20250514",
-			"claude-3-5-sonnet-20241022",
-			"claude-3-5-haiku-20241022",
-			"claude-3-opus-20240229",
+		},
+		pricing: map[string]float64{
+			"claude-opus-4-5":          0.0125,
+			"claude-sonnet-4-5":        0.003,
+			"claude-haiku-4-5":         0.001,
+			"claude-opus-4-1":          0.015,
+			"claude-sonnet-4-20250514": 0.003,
 		},
 	}
-}
-
-func (p *AnthropicProvider) Name() string {
-	return "anthropic"
-}
-
-func (p *AnthropicProvider) Models() []string {
-	return p.models
-}
-
-func (p *AnthropicProvider) Available(ctx context.Context) bool {
-	return p.apiKey != ""
-}
-
-func (p *AnthropicProvider) CostPer1KTokens() map[string]float64 {
-	return map[string]float64{
-		"claude-sonnet-4-20250514":   0.003,
-		"claude-opus-4-20250514":     0.015,
-		"claude-3-5-sonnet-20241022": 0.003,
-		"claude-3-5-haiku-20241022":  0.0008,
-		"claude-3-opus-20240229":     0.015,
+	for _, opt := range opts {
+		opt(p)
 	}
+	return p
 }
 
-// Anthropic API types
-type anthropicMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
+func (p *AnthropicProvider) Name() string                        { return "anthropic" }
+func (p *AnthropicProvider) Models(ctx context.Context) []string { return p.models }
 
-type anthropicRequest struct {
-	Model       string             `json:"model"`
-	MaxTokens   int                `json:"max_tokens"`
-	Messages    []anthropicMessage `json:"messages"`
-	System      string             `json:"system,omitempty"`
-	Temperature float64            `json:"temperature,omitempty"`
-	TopP        float64            `json:"top_p,omitempty"`
-	StopSeqs    []string           `json:"stop_sequences,omitempty"`
-	Stream      bool               `json:"stream,omitempty"`
-}
+// ---- wire types (Anthropic Messages format) ----
 
-type anthropicContentBlock struct {
+type anthBlock struct {
 	Type string `json:"type"`
-	Text string `json:"text"`
+
+	// text
+	Text string `json:"text,omitempty"`
+
+	// image
+	Source *anthImageSource `json:"source,omitempty"`
+
+	// tool_use
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+
+	// tool_result
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	Content   any    `json:"content,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"`
 }
 
-type anthropicUsage struct {
+type anthImageSource struct {
+	Type      string `json:"type"` // "base64" | "url"
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
+}
+
+type anthWireMessage struct {
+	Role    string      `json:"role"`
+	Content []anthBlock `json:"content"`
+}
+
+type anthTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+type anthRequest struct {
+	Model         string            `json:"model"`
+	MaxTokens     int               `json:"max_tokens"`
+	Messages      []anthWireMessage `json:"messages"`
+	System        string            `json:"system,omitempty"`
+	Temperature   *float64          `json:"temperature,omitempty"`
+	TopP          *float64          `json:"top_p,omitempty"`
+	StopSequences []string          `json:"stop_sequences,omitempty"`
+	Stream        bool              `json:"stream,omitempty"`
+	Tools         []anthTool        `json:"tools,omitempty"`
+	ToolChoice    map[string]any    `json:"tool_choice,omitempty"`
+}
+
+type anthWireUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 }
 
-type anthropicResponse struct {
-	ID           string                  `json:"id"`
-	Type         string                  `json:"type"`
-	Role         string                  `json:"role"`
-	Content      []anthropicContentBlock `json:"content"`
-	Model        string                  `json:"model"`
-	StopReason   string                  `json:"stop_reason"`
-	StopSequence string                  `json:"stop_sequence"`
-	Usage        anthropicUsage          `json:"usage"`
+type anthResponse struct {
+	ID         string        `json:"id"`
+	Model      string        `json:"model"`
+	Content    []anthBlock   `json:"content"`
+	StopReason string        `json:"stop_reason"`
+	Usage      anthWireUsage `json:"usage"`
 }
 
-type anthropicError struct {
-	Type  string `json:"type"`
-	Error struct {
+// ---- request translation ----
+
+// anthPartToBlock converts one internal content part.
+func anthPartToBlock(part ContentPart) (anthBlock, error) {
+	switch part.Type {
+	case "text":
+		return anthBlock{Type: "text", Text: part.Text}, nil
+	case "image":
+		if part.ImageURL != "" {
+			return anthBlock{Type: "image", Source: &anthImageSource{Type: "url", URL: part.ImageURL}}, nil
+		}
+		return anthBlock{Type: "image", Source: &anthImageSource{
+			Type: "base64", MediaType: part.MediaType, Data: part.ImageData,
+		}}, nil
+	default:
+		return anthBlock{}, fmt.Errorf("unsupported content part type %q", part.Type)
+	}
+}
+
+// anthFromMessages converts internal messages to (system, wire messages).
+// System messages are extracted; tool results become tool_result blocks in
+// user messages; consecutive same-role messages are merged because the
+// Messages API requires alternating roles.
+func anthFromMessages(messages []Message) (string, []anthWireMessage, error) {
+	var system strings.Builder
+	var out []anthWireMessage
+
+	appendBlocks := func(role string, blocks []anthBlock) {
+		if len(out) > 0 && out[len(out)-1].Role == role {
+			out[len(out)-1].Content = append(out[len(out)-1].Content, blocks...)
+			return
+		}
+		out = append(out, anthWireMessage{Role: role, Content: blocks})
+	}
+
+	for _, m := range messages {
+		switch m.Role {
+		case "system":
+			if system.Len() > 0 {
+				system.WriteString("\n\n")
+			}
+			system.WriteString(m.Text())
+
+		case "tool":
+			block := anthBlock{Type: "tool_result", ToolUseID: m.ToolCallID}
+			if text := m.Text(); text != "" {
+				block.Content = text
+			}
+			appendBlocks("user", []anthBlock{block})
+
+		case "assistant":
+			var blocks []anthBlock
+			for _, part := range m.Content {
+				b, err := anthPartToBlock(part)
+				if err != nil {
+					return "", nil, err
+				}
+				blocks = append(blocks, b)
+			}
+			for _, tc := range m.ToolCalls {
+				input := json.RawMessage(tc.Arguments)
+				if len(input) == 0 {
+					input = json.RawMessage("{}")
+				}
+				blocks = append(blocks, anthBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: input})
+			}
+			if len(blocks) == 0 {
+				blocks = []anthBlock{{Type: "text", Text: ""}}
+			}
+			appendBlocks("assistant", blocks)
+
+		default: // user
+			var blocks []anthBlock
+			for _, part := range m.Content {
+				b, err := anthPartToBlock(part)
+				if err != nil {
+					return "", nil, err
+				}
+				blocks = append(blocks, b)
+			}
+			if len(blocks) == 0 {
+				blocks = []anthBlock{{Type: "text", Text: ""}}
+			}
+			appendBlocks("user", blocks)
+		}
+	}
+	return system.String(), out, nil
+}
+
+func (p *AnthropicProvider) buildRequest(params CompletionParams, stream bool) (*anthRequest, error) {
+	if params.ResponseFormat != nil {
+		return nil, fmt.Errorf("anthropic: response_format is not supported for this backend")
+	}
+	system, messages, err := anthFromMessages(params.Messages)
+	if err != nil {
+		return nil, err
+	}
+	maxTokens := params.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 4096
+	}
+	req := &anthRequest{
+		Model:         params.Model,
+		MaxTokens:     maxTokens,
+		Messages:      messages,
+		System:        system,
+		Temperature:   params.Temperature,
+		TopP:          params.TopP,
+		StopSequences: params.Stop,
+		Stream:        stream,
+	}
+	for _, t := range params.Tools {
+		schema := t.Parameters
+		if len(schema) == 0 {
+			schema = json.RawMessage(`{"type":"object"}`)
+		}
+		req.Tools = append(req.Tools, anthTool{Name: t.Name, Description: t.Description, InputSchema: schema})
+	}
+	if tc := params.ToolChoice; tc != nil {
+		switch tc.Mode {
+		case "auto":
+			req.ToolChoice = map[string]any{"type": "auto"}
+		case "required":
+			req.ToolChoice = map[string]any{"type": "any"}
+		case "none":
+			req.ToolChoice = map[string]any{"type": "none"}
+		case "tool":
+			req.ToolChoice = map[string]any{"type": "tool", "name": tc.Name}
+		}
+	}
+	return req, nil
+}
+
+func (p *AnthropicProvider) post(ctx context.Context, body any) (*http.Response, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/messages", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", p.apiKey)
+	req.Header.Set("anthropic-version", anthropicAPIVersion)
+	return p.httpClient.Do(req)
+}
+
+func (p *AnthropicProvider) apiError(resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) == nil && envelope.Error.Message != "" {
+		return &ProviderError{Provider: "anthropic", StatusCode: resp.StatusCode, Message: envelope.Error.Message}
+	}
+	return &ProviderError{Provider: "anthropic", StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
+}
+
+func (p *AnthropicProvider) cost(model string, usage anthWireUsage) float64 {
+	rate, ok := p.pricing[model]
+	if !ok {
+		// Model IDs may carry a date suffix (claude-sonnet-4-5-20250929).
+		for m, r := range p.pricing {
+			if strings.HasPrefix(model, m) {
+				rate = r
+				break
+			}
+		}
+	}
+	return rate * float64(usage.InputTokens+usage.OutputTokens) / 1000
+}
+
+func anthFinishReason(stop string) string {
+	switch stop {
+	case "tool_use":
+		return FinishToolCalls
+	case "max_tokens":
+		return FinishLength
+	case "refusal":
+		return FinishContentFilter
+	default:
+		return FinishStop
+	}
+}
+
+// ---- Provider implementation ----
+
+func (p *AnthropicProvider) Complete(ctx context.Context, params CompletionParams) (*CompletionResult, error) {
+	req, err := p.buildRequest(params, false)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := p.post(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, p.apiError(resp)
+	}
+
+	var out anthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("anthropic: invalid response: %w", err)
+	}
+
+	msg := Message{Role: "assistant"}
+	for _, block := range out.Content {
+		switch block.Type {
+		case "text":
+			msg.Content = append(msg.Content, TextPart(block.Text))
+		case "tool_use":
+			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
+				ID:        block.ID,
+				Name:      block.Name,
+				Arguments: string(block.Input),
+			})
+		}
+	}
+
+	usage := Usage{
+		PromptTokens:     out.Usage.InputTokens,
+		CompletionTokens: out.Usage.OutputTokens,
+		TotalTokens:      out.Usage.InputTokens + out.Usage.OutputTokens,
+		CostUSD:          p.cost(out.Model, out.Usage),
+	}
+	return &CompletionResult{
+		ID:           out.ID,
+		Message:      msg,
+		FinishReason: anthFinishReason(out.StopReason),
+		Provider:     "anthropic",
+		Model:        out.Model,
+		Usage:        usage,
+	}, nil
+}
+
+// anthStreamEvent covers every SSE event type we consume.
+type anthStreamEvent struct {
+	Type    string `json:"type"`
+	Message *struct {
+		ID    string        `json:"id"`
+		Model string        `json:"model"`
+		Usage anthWireUsage `json:"usage"`
+	} `json:"message"`
+	Index        int        `json:"index"`
+	ContentBlock *anthBlock `json:"content_block"`
+	Delta        *struct {
+		Type        string `json:"type"`
+		Text        string `json:"text"`
+		PartialJSON string `json:"partial_json"`
+		StopReason  string `json:"stop_reason"`
+	} `json:"delta"`
+	Usage *anthWireUsage `json:"usage"`
+	Error *struct {
 		Type    string `json:"type"`
 		Message string `json:"message"`
 	} `json:"error"`
 }
 
-func (p *AnthropicProvider) Complete(ctx context.Context, params CompletionParams) (*CompletionResult, error) {
-	model := params.Model
-	if model == "" {
-		model = "claude-3-5-sonnet-20241022"
-	}
-
-	maxTokens := params.MaxTokens
-	if maxTokens == 0 {
-		maxTokens = 4096
-	}
-
-	var system string
-	messages := make([]anthropicMessage, 0, len(params.Messages))
-	for _, m := range params.Messages {
-		if m.Role == "system" {
-			system = m.Content
-			continue
-		}
-		messages = append(messages, anthropicMessage{
-			Role:    m.Role,
-			Content: m.Content,
-		})
-	}
-
-	reqBody := anthropicRequest{
-		Model:       model,
-		MaxTokens:   maxTokens,
-		Messages:    messages,
-		System:      system,
-		Temperature: params.Temperature,
-		TopP:        params.TopP,
-		StopSeqs:    params.Stop,
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", anthropicBaseURL+"/messages", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("x-api-key", p.apiKey)
-	req.Header.Set("anthropic-version", anthropicVersion)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		var apiErr anthropicError
-		if err := json.Unmarshal(respBody, &apiErr); err == nil {
-			return nil, fmt.Errorf("Anthropic API error: %s", apiErr.Error.Message)
-		}
-		return nil, fmt.Errorf("Anthropic API error: status %d", resp.StatusCode)
-	}
-
-	var anthropicResp anthropicResponse
-	if err := json.Unmarshal(respBody, &anthropicResp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	var content string
-	for _, block := range anthropicResp.Content {
-		if block.Type == "text" {
-			content += block.Text
-		}
-	}
-
-	totalTokens := anthropicResp.Usage.InputTokens + anthropicResp.Usage.OutputTokens
-	cost := p.calculateCost(model, totalTokens)
-
-	return &CompletionResult{
-		ID:      anthropicResp.ID,
-		Content: content,
-		Message: Message{
-			Role:    anthropicResp.Role,
-			Content: content,
-		},
-		Provider: p.Name(),
-		Model:    anthropicResp.Model,
-		Usage: Usage{
-			PromptTokens:     anthropicResp.Usage.InputTokens,
-			CompletionTokens: anthropicResp.Usage.OutputTokens,
-			TotalTokens:      totalTokens,
-			CostUSD:          cost,
-		},
-	}, nil
-}
-
 func (p *AnthropicProvider) CompleteStream(ctx context.Context, params CompletionParams) (<-chan StreamChunk, error) {
-	model := params.Model
-	if model == "" {
-		model = "claude-3-5-sonnet-20241022"
-	}
-
-	maxTokens := params.MaxTokens
-	if maxTokens == 0 {
-		maxTokens = 4096
-	}
-
-	var system string
-	messages := make([]anthropicMessage, 0, len(params.Messages))
-	for _, m := range params.Messages {
-		if m.Role == "system" {
-			system = m.Content
-			continue
-		}
-		messages = append(messages, anthropicMessage{
-			Role:    m.Role,
-			Content: m.Content,
-		})
-	}
-
-	reqBody := anthropicRequest{
-		Model:       model,
-		MaxTokens:   maxTokens,
-		Messages:    messages,
-		System:      system,
-		Temperature: params.Temperature,
-		TopP:        params.TopP,
-		StopSeqs:    params.Stop,
-		Stream:      true,
-	}
-
-	body, err := json.Marshal(reqBody)
+	req, err := p.buildRequest(params, true)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", anthropicBaseURL+"/messages", bytes.NewReader(body))
+	resp, err := p.post(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("anthropic request failed: %w", err)
 	}
-
-	req.Header.Set("x-api-key", p.apiKey)
-	req.Header.Set("anthropic-version", anthropicVersion)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(resp.Body)
-		var apiErr anthropicError
-		if err := json.Unmarshal(respBody, &apiErr); err == nil {
-			return nil, fmt.Errorf("Anthropic API error: %s", apiErr.Error.Message)
-		}
-		return nil, fmt.Errorf("Anthropic API error: status %d", resp.StatusCode)
+		return nil, p.apiError(resp)
 	}
 
-	ch := make(chan StreamChunk, 100)
-	go p.streamResponse(ctx, resp, model, ch)
-	return ch, nil
-}
+	chunks := make(chan StreamChunk)
+	go func() {
+		defer close(chunks)
+		defer resp.Body.Close()
 
-// Anthropic streaming event types
-type anthropicMessageStart struct {
-	Type    string `json:"type"`
-	Message struct {
-		ID    string         `json:"id"`
-		Type  string         `json:"type"`
-		Role  string         `json:"role"`
-		Model string         `json:"model"`
-		Usage anthropicUsage `json:"usage"`
-	} `json:"message"`
-}
+		events := make(chan SSEEvent)
+		go ParseSSE(resp.Body, events)
 
-type anthropicContentBlockDelta struct {
-	Type  string `json:"type"`
-	Index int    `json:"index"`
-	Delta struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"delta"`
-}
+		id, model := "", params.Model
+		finish := FinishStop
+		var inputTokens, outputTokens int
+		// Map Anthropic block indexes to tool-call indexes; text blocks do
+		// not consume tool indexes.
+		toolIndexByBlock := map[int]int{}
+		nextToolIndex := 0
 
-type anthropicMessageDelta struct {
-	Type  string `json:"type"`
-	Usage struct {
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
-}
-
-func (p *AnthropicProvider) streamResponse(ctx context.Context, resp *http.Response, model string, ch chan<- StreamChunk) {
-	defer close(ch)
-	defer resp.Body.Close()
-
-	events := make(chan SSEEvent, 100)
-	go ParseSSE(resp.Body, events)
-
-	var fullContent strings.Builder
-	var id string
-	var inputTokens, outputTokens int
-
-	for event := range events {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		// Check for SSE parse/read errors
-		if event.Err != nil {
-			ch <- StreamChunk{
-				Err:      fmt.Errorf("stream read error: %w", event.Err),
-				Done:     true,
-				Provider: p.Name(),
-				Model:    model,
+		for event := range events {
+			if event.Err != nil {
+				chunks <- StreamChunk{Err: fmt.Errorf("anthropic stream error: %w", event.Err), Provider: "anthropic", Model: model}
+				return
 			}
-			return
-		}
-
-		switch event.Event {
-		case "message_start":
-			var msg anthropicMessageStart
-			if err := json.Unmarshal([]byte(event.Data), &msg); err != nil {
-				ch <- StreamChunk{
-					Err:      fmt.Errorf("failed to parse message_start: %w", err),
-					Provider: p.Name(),
-					Model:    model,
-				}
+			data := strings.TrimSpace(event.Data)
+			if data == "" {
 				continue
 			}
-			id = msg.Message.ID
-			inputTokens = msg.Message.Usage.InputTokens
-
-		case "content_block_delta":
-			var delta anthropicContentBlockDelta
-			if err := json.Unmarshal([]byte(event.Data), &delta); err != nil {
-				ch <- StreamChunk{
-					Err:      fmt.Errorf("failed to parse content_block_delta: %w", err),
-					Provider: p.Name(),
-					Model:    model,
-				}
-				continue
-			}
-			if delta.Delta.Text != "" {
-				fullContent.WriteString(delta.Delta.Text)
-				ch <- StreamChunk{
-					ID:       id,
-					Delta:    delta.Delta.Text,
-					Done:     false,
-					Provider: p.Name(),
-					Model:    model,
-				}
+			var ev anthStreamEvent
+			if err := json.Unmarshal([]byte(data), &ev); err != nil {
+				chunks <- StreamChunk{Err: fmt.Errorf("anthropic stream: invalid event: %w", err), Provider: "anthropic", Model: model}
+				return
 			}
 
-		case "message_delta":
-			var msg anthropicMessageDelta
-			if err := json.Unmarshal([]byte(event.Data), &msg); err != nil {
-				ch <- StreamChunk{
-					Err:      fmt.Errorf("failed to parse message_delta: %w", err),
-					Provider: p.Name(),
-					Model:    model,
+			switch ev.Type {
+			case "message_start":
+				if ev.Message != nil {
+					id = ev.Message.ID
+					if ev.Message.Model != "" {
+						model = ev.Message.Model
+					}
+					inputTokens = ev.Message.Usage.InputTokens
 				}
-				continue
+			case "content_block_start":
+				if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" {
+					toolIndexByBlock[ev.Index] = nextToolIndex
+					chunks <- StreamChunk{
+						ID: id,
+						ToolCall: &ToolCallDelta{
+							Index: nextToolIndex,
+							ID:    ev.ContentBlock.ID,
+							Name:  ev.ContentBlock.Name,
+						},
+						Provider: "anthropic",
+						Model:    model,
+					}
+					nextToolIndex++
+				}
+			case "content_block_delta":
+				if ev.Delta == nil {
+					continue
+				}
+				switch ev.Delta.Type {
+				case "text_delta":
+					if ev.Delta.Text != "" {
+						chunks <- StreamChunk{ID: id, Delta: ev.Delta.Text, Provider: "anthropic", Model: model}
+					}
+				case "input_json_delta":
+					if idx, ok := toolIndexByBlock[ev.Index]; ok && ev.Delta.PartialJSON != "" {
+						chunks <- StreamChunk{
+							ID:       id,
+							ToolCall: &ToolCallDelta{Index: idx, ArgumentsDelta: ev.Delta.PartialJSON},
+							Provider: "anthropic",
+							Model:    model,
+						}
+					}
+				}
+			case "message_delta":
+				if ev.Delta != nil && ev.Delta.StopReason != "" {
+					finish = anthFinishReason(ev.Delta.StopReason)
+				}
+				if ev.Usage != nil {
+					outputTokens = ev.Usage.OutputTokens
+				}
+			case "error":
+				msg := "unknown stream error"
+				if ev.Error != nil {
+					msg = ev.Error.Message
+				}
+				chunks <- StreamChunk{Err: &ProviderError{Provider: "anthropic", StatusCode: 500, Message: msg}, Provider: "anthropic", Model: model}
+				return
+			case "message_stop":
+				usage := &Usage{
+					PromptTokens:     inputTokens,
+					CompletionTokens: outputTokens,
+					TotalTokens:      inputTokens + outputTokens,
+					CostUSD:          p.cost(model, anthWireUsage{InputTokens: inputTokens, OutputTokens: outputTokens}),
+				}
+				chunks <- StreamChunk{ID: id, Done: true, FinishReason: finish, Usage: usage, Provider: "anthropic", Model: model}
+				return
 			}
-			outputTokens = msg.Usage.OutputTokens
-
-		case "message_stop":
-			// End of message - will exit loop
 		}
-	}
 
-	totalTokens := inputTokens + outputTokens
-	cost := p.calculateCost(model, totalTokens)
-
-	// Send final chunk
-	ch <- StreamChunk{
-		ID:       id,
-		Done:     true,
-		Provider: p.Name(),
-		Model:    model,
-		Message: &Message{
-			Role:    "assistant",
-			Content: fullContent.String(),
-		},
-		Usage: &Usage{
-			PromptTokens:     inputTokens,
-			CompletionTokens: outputTokens,
-			TotalTokens:      totalTokens,
-			CostUSD:          cost,
-		},
-	}
+		// Stream ended without message_stop: incomplete.
+		chunks <- StreamChunk{Err: &ProviderError{Provider: "anthropic", StatusCode: 502, Message: "stream ended before message_stop"}, Provider: "anthropic", Model: model}
+	}()
+	return chunks, nil
 }
 
 func (p *AnthropicProvider) Embed(ctx context.Context, params EmbedParams) (*EmbedResult, error) {
-	// Anthropic doesn't have an embeddings API
-	return nil, fmt.Errorf("Anthropic does not support embeddings")
-}
-
-func (p *AnthropicProvider) calculateCost(model string, totalTokens int) float64 {
-	costs := p.CostPer1KTokens()
-	costPer1K, ok := costs[model]
-	if !ok {
-		costPer1K = 0.003 // default
-	}
-	return float64(totalTokens) / 1000 * costPer1K
+	return nil, fmt.Errorf("anthropic does not provide an embeddings API")
 }

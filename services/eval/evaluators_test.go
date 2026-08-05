@@ -72,12 +72,12 @@ func TestEvaluateContains(t *testing.T) {
 	ctx := context.Background()
 
 	tests := []struct {
-		name          string
-		expected      map[string]interface{}
-		actual        map[string]interface{}
-		params        map[string]string
-		want          bool
-		score         float64
+		name     string
+		expected map[string]interface{}
+		actual   map[string]interface{}
+		params   map[string]string
+		want     bool
+		score    float64
 	}{
 		{
 			name:     "contains substring",
@@ -101,12 +101,12 @@ func TestEvaluateContains(t *testing.T) {
 			score:    1.0,
 		},
 		{
-			name:          "case sensitive when specified",
-			expected:      map[string]interface{}{"answer": "WORLD"},
-			actual:        map[string]interface{}{"answer": "hello world"},
-			params:        map[string]string{"case_sensitive": "true"},
-			want:          false,
-			score:         0.0,
+			name:     "case sensitive when specified",
+			expected: map[string]interface{}{"answer": "WORLD"},
+			actual:   map[string]interface{}{"answer": "hello world"},
+			params:   map[string]string{"case_sensitive": "true"},
+			want:     false,
+			score:    0.0,
 		},
 		{
 			name:     "empty string always contained",
@@ -137,12 +137,12 @@ func TestEvaluateRegex(t *testing.T) {
 	ctx := context.Background()
 
 	tests := []struct {
-		name     string
-		actual   map[string]interface{}
-		params   map[string]string
-		want     bool
-		score    float64
-		wantErr  bool
+		name    string
+		actual  map[string]interface{}
+		params  map[string]string
+		want    bool
+		score   float64
+		wantErr bool
 	}{
 		{
 			name:   "simple pattern match",

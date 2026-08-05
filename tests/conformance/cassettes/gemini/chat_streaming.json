@@ -1,0 +1,34 @@
+{
+  "name": "gemini: streaming chat completion",
+  "provider": "gemini",
+  "surface": "openai",
+  "request": {
+    "model": "gemini-2.5-flash",
+    "stream": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": ":streamGenerateContent",
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "text/event-stream",
+      "body": "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]},\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"cRUstream\"}\n\ndata: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\" world\"}]},\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"cRUstream\"}\n\ndata: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":6,\"candidatesTokenCount\":2,\"totalTokenCount\":8},\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"cRUstream\"}\n\n"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "body_contains": [
+      "chat.completion.chunk",
+      "\"finish_reason\":\"stop\""
+    ],
+    "sse": {
+      "deltas_join": "Hello world",
+      "done": true
+    }
+  }
+}

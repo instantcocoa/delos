@@ -1,69 +1,83 @@
 # Delos Documentation
 
-Delos is a unified infrastructure platform for LLM applications, providing prompt versioning, evaluation, safe deployment, and observability.
+Delos is infrastructure for LLM applications: an OpenAI/Anthropic-compatible
+gateway plus prompt versioning, evaluation, CI quality gates, and observability.
+It ships as two binaries and one PostgreSQL database.
+
+| Binary | Role | Port |
+|--------|------|------|
+| `delos-gateway` | Data plane - stateless LLM gateway | 8080 |
+| `delos` | Control plane (`delos serve`) + CLI | 8081 |
 
 ## Quick Links
 
 ### Getting Started
-- [Installation](getting-started/installation.md) - Setup and dependencies
-- [Quickstart](getting-started/quickstart.md) - 5-minute tutorial
-- [Configuration](getting-started/configuration.md) - Environment variables reference
+- [Installation](getting-started/installation.md) - `go install`, Docker, signed release binaries
+- [Quickstart](getting-started/quickstart.md) - 5-minute tutorial, starting with a single `docker run`
+- [Configuration](getting-started/configuration.md) - `delos.yaml` and every environment variable
+
+### Running it
+- [Providers](providers.md) - Per-provider setup and the feature matrix, including what does *not* work
+- [OpenTelemetry](otel.md) - Point exporters at Jaeger, Grafana Tempo or Datadog
+- [Deploying](deploy.md) - TLS, Postgres sizing, HA gateways behind a load balancer
+- [Troubleshooting](../TROUBLESHOOTING.md) - When something is wrong
 
 ### Architecture
-- [Overview](architecture/overview.md) - System design and components
-- [Services](architecture/services.md) - The 6 microservices explained
+- [Overview](architecture/overview.md) - Data plane vs control plane, request flow
 
 ### API Reference
-- [Runtime Service](api-reference/runtime.md) - LLM gateway (5 endpoints)
-- [Prompt Service](api-reference/prompt.md) - Prompt versioning (8 endpoints)
-- [Datasets Service](api-reference/datasets.md) - Test data management (10 endpoints)
-- [Eval Service](api-reference/eval.md) - Quality assurance (8 endpoints)
-- [Deploy Service](api-reference/deploy.md) - Deployment orchestration (10 endpoints)
-- [Observe Service](api-reference/observe.md) - Tracing and metrics (5 endpoints)
+- [Gateway API](api-reference/runtime.md) - OpenAI/Anthropic-compatible HTTP endpoints
+- [Prompt API](api-reference/prompt.md) - Prompt versioning (control plane gRPC)
 
-### Guides
-- [LLM Providers](guides/providers.md) - Configure OpenAI, Anthropic, Gemini, Ollama
-- [Prompt Management](guides/prompts.md) - Versioning workflow
-- [Running Evaluations](guides/evaluation.md) - Quality testing
-- [Safe Deployments](guides/deployment.md) - Rollout strategies
+### Clients
+There is no Delos-specific SDK. Point any OpenAI- or Anthropic-compatible client
+at the gateway's base URL. The `delos` CLI covers control-plane operations.
 
-### SDK
-- [Python SDK](sdk/python.md) - Client library reference
+## Ports
 
-## Service Ports
+| Component | Port | Purpose |
+|-----------|------|---------|
+| `delos-gateway` | 8080 | LLM gateway (HTTP) |
+| `delos serve` | 8081 | Control plane: observe, prompt, datasets, eval, quality gates (gRPC over h2c + `/healthz`) |
+| PostgreSQL | 5432 | Control-plane storage |
 
-| Service | Port | Purpose |
-|---------|------|---------|
-| observe | 9000 | Tracing and metrics |
-| runtime | 9001 | LLM gateway |
-| prompt | 9002 | Prompt versioning |
-| datasets | 9003 | Test data management |
-| eval | 9004 | Quality evaluation |
-| deploy | 9005 | Deployment orchestration |
+Optional Docker Compose profiles add Ollama (11434), Jaeger UI (16686), and
+LocalStack (4566); none are started by default.
 
 ## Quick Example
 
+Send traffic through the gateway with an unmodified OpenAI client:
+
 ```python
-from delos import DelosClient
+from openai import OpenAI
 
-async with DelosClient() as client:
-    # Create a versioned prompt
-    prompt = await client.prompts.create(
-        name="summarizer",
-        slug="summarizer",
-        messages=[{"role": "system", "content": "Summarize the text."}]
-    )
-
-    # Run an LLM completion
-    response = await client.runtime.complete(
-        prompt_ref=f"{prompt.slug}:v{prompt.version}",
-        variables={"text": "Long article here..."}
-    )
-
-    print(response.content)
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="delos-dev")
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "Summarize this article..."}],
+)
+print(response.choices[0].message.content)
 ```
+
+Manage prompts, datasets, evaluations, and quality gates with the CLI:
+
+```bash
+delos tail                    # live view of every request through the gateway
+delos config doctor           # is everything reachable and configured?
+delos prompt push ./prompts   # prompts are files; the repo is the source of truth
+delos eval evaluators
+delos gate check nightly      # exit 0/1 for CI
+delos gateway models
+```
+
+## Executable documentation
+
+Code blocks whose first line is `# docs-test` are extracted and run in CI by
+`make docs-test`. If a documented command stops working, the build fails. Blocks
+that need Docker, provider credentials or a running stack are intentionally left
+unmarked.
 
 ## Getting Help
 
-- [GitHub Issues](https://github.com/your-org/delos/issues) - Bug reports and feature requests
-- [Discussions](https://github.com/your-org/delos/discussions) - Questions and community
+- [GitHub Issues](https://github.com/instantcocoa/delos/issues) - Bug reports and feature requests
+- [Discussions](https://github.com/instantcocoa/delos/discussions) - Questions and community

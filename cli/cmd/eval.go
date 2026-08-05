@@ -9,8 +9,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	evalv1 "github.com/instantcocoa/delos/gen/go/eval/v1"
 	"github.com/instantcocoa/delos/cli/internal/output"
+	evalv1 "github.com/instantcocoa/delos/gen/go/eval/v1"
 )
 
 var evalCmd = &cobra.Command{
@@ -23,7 +23,7 @@ var evalRunCmd = &cobra.Command{
 	Use:   "run",
 	Short: "Create and start an evaluation run",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.EvalAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -38,9 +38,14 @@ var evalRunCmd = &cobra.Command{
 		promptVersion, _ := cmd.Flags().GetInt32("version")
 		datasetID, _ := cmd.Flags().GetString("dataset")
 		evaluators, _ := cmd.Flags().GetStringSlice("evaluators")
+		provider, _ := cmd.Flags().GetString("provider")
+		model, _ := cmd.Flags().GetString("model")
 
 		if name == "" {
 			name = fmt.Sprintf("eval-%s", time.Now().Format("20060102-150405"))
+		}
+		if model == "" {
+			return fmt.Errorf("--model is required (the model the eval runs completions against)")
 		}
 
 		evalConfigs := make([]*evalv1.EvaluatorConfig, len(evaluators))
@@ -57,6 +62,8 @@ var evalRunCmd = &cobra.Command{
 			PromptVersion: promptVersion,
 			DatasetId:     datasetID,
 			Config: &evalv1.EvalConfig{
+				Provider:    provider,
+				Model:       model,
 				Evaluators:  evalConfigs,
 				Concurrency: 5,
 			},
@@ -76,7 +83,7 @@ var evalListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List evaluation runs",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.EvalAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -137,7 +144,7 @@ var evalGetCmd = &cobra.Command{
 	Short: "Get evaluation run details",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.EvalAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -162,7 +169,7 @@ var evalCancelCmd = &cobra.Command{
 	Short: "Cancel an evaluation run",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.EvalAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -187,7 +194,7 @@ var evalResultsCmd = &cobra.Command{
 	Short: "Get evaluation results",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.EvalAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -221,7 +228,7 @@ var evalCompareCmd = &cobra.Command{
 	Short: "Compare two evaluation runs",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.EvalAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -248,7 +255,7 @@ var evalEvaluatorsCmd = &cobra.Command{
 	Use:   "evaluators",
 	Short: "List available evaluators",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.EvalAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -291,6 +298,8 @@ func init() {
 	evalRunCmd.Flags().String("prompt", "", "Prompt ID")
 	evalRunCmd.Flags().Int32("version", 0, "Prompt version (0 = latest)")
 	evalRunCmd.Flags().String("dataset", "", "Dataset ID")
+	evalRunCmd.Flags().String("model", "", "Model to run completions against (required, e.g. claude-haiku-4-5)")
+	evalRunCmd.Flags().String("provider", "", "Force a specific provider (optional)")
 	evalRunCmd.Flags().StringSlice("evaluators", []string{"exact_match"}, "Evaluator types")
 
 	// List flags

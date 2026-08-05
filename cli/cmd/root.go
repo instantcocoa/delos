@@ -56,10 +56,10 @@ func init() {
 	// Add subcommands
 	rootCmd.AddCommand(observeCmd)
 	rootCmd.AddCommand(promptCmd)
-	rootCmd.AddCommand(runtimeCmd)
+	rootCmd.AddCommand(gatewayCmd)
 	rootCmd.AddCommand(datasetsCmd)
 	rootCmd.AddCommand(evalCmd)
-	rootCmd.AddCommand(deployCmd)
+	rootCmd.AddCommand(gateCmd)
 	rootCmd.AddCommand(versionCmd)
 }
 

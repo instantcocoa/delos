@@ -1,0 +1,57 @@
+{
+  "name": "gemini: function call mapped to an OpenAI tool call",
+  "provider": "gemini",
+  "surface": "openai",
+  "request": {
+    "model": "gemini-2.5-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather in Paris?"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather in a city",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "location": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "location"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  },
+  "upstream_path_contains": ":generateContent",
+  "upstream_body_contains": [
+    "\"functionDeclarations\"",
+    "get_weather",
+    "\"mode\":\"AUTO\""
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"location\":\"Paris\"}}}]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":41,\"candidatesTokenCount\":9,\"totalTokenCount\":50},\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"cRUtools\"}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "choices.0.finish_reason": "tool_calls",
+      "choices.0.message.tool_calls.0.function.arguments": "{\"location\":\"Paris\"}",
+      "choices.0.message.tool_calls.0.function.name": "get_weather",
+      "choices.0.message.tool_calls.0.id": "call_1"
+    }
+  }
+}
