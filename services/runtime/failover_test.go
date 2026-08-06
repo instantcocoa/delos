@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // flakyProvider fails a configurable number of Complete calls before
@@ -179,12 +180,13 @@ func TestCircuitBreakerOpensAndRecovers(t *testing.T) {
 	}
 }
 
-func TestStreamChainMidStreamFailover(t *testing.T) {
-	// The acceptance test from the plan: kill the primary mid-stream; the
-	// client sees a valid completed stream from the fallback.
+func TestStreamChainFailoverBeforeContent(t *testing.T) {
+	// A stream that breaks before delivering any content can still fail over:
+	// nothing has reached the client, so the fallback's stream is the only one
+	// it ever sees.
 	primary := &flakyProvider{
 		mockProvider:  mockProvider{name: "primary"},
-		breakStreamAt: 2, // two deltas, then the connection dies
+		breakStreamAt: 0, // errors immediately, no deltas
 	}
 	fallback := &mockProvider{
 		name: "fallback",
@@ -204,15 +206,15 @@ func TestStreamChainMidStreamFailover(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Accumulate every delta the client would see, regardless of provider -
+	// an SSE client cannot filter by provider, so neither does this test.
+	var text string
 	var sawDone bool
-	var fallbackText string
 	for c := range chunks {
 		if c.Err != nil {
 			t.Fatalf("client must not see an error when a fallback can complete: %v", c.Err)
 		}
-		if c.Provider == "fallback" {
-			fallbackText += c.Delta
-		}
+		text += c.Delta
 		if c.Done {
 			sawDone = true
 			if c.Usage == nil || c.Usage.TotalTokens != 7 {
@@ -223,11 +225,98 @@ func TestStreamChainMidStreamFailover(t *testing.T) {
 	if !sawDone {
 		t.Fatal("stream did not complete")
 	}
-	if fallbackText != "complete answer" {
-		t.Errorf("fallback content = %q", fallbackText)
+	if text != "complete answer" {
+		t.Errorf("client-visible content = %q, want the fallback's stream alone", text)
 	}
-	if primary.streamCalls != 1 || len(fallback.streamChunks) == 0 {
-		t.Errorf("primary calls = %d", primary.streamCalls)
+}
+
+func TestStreamChainNoSpliceAfterContent(t *testing.T) {
+	// Once deltas are on the wire they cannot be retracted. Failing over at
+	// that point would splice two different completions into one response, so
+	// the break must surface as an error instead.
+	primary := &flakyProvider{
+		mockProvider:  mockProvider{name: "primary"},
+		breakStreamAt: 2, // two deltas, then the connection dies
+	}
+	fallback := &mockProvider{
+		name: "fallback",
+		streamChunks: []StreamChunk{
+			{Delta: "a completely different answer", Provider: "fallback"},
+			{Done: true, FinishReason: FinishStop, Provider: "fallback"},
+		},
+	}
+	svc := newTestService(primary, fallback)
+
+	chunks, err := svc.CompleteStreamChain(context.Background(), []RouteTarget{
+		{Provider: "primary", Model: "m1"},
+		{Provider: "fallback", Model: "m2"},
+	}, CompletionParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var text string
+	var sawErr, sawDone bool
+	for c := range chunks {
+		if c.Err != nil {
+			sawErr = true
+			continue
+		}
+		text += c.Delta
+		if c.Done {
+			sawDone = true
+		}
+	}
+
+	if !sawErr {
+		t.Error("a break after content was delivered must surface as an error")
+	}
+	if sawDone {
+		t.Error("a spliced stream must not be reported as complete")
+	}
+	if strings.Contains(text, "a completely different answer") {
+		t.Errorf("fallback content was spliced onto the primary's partial output: %q", text)
+	}
+	if fallback.lastParams != nil {
+		t.Error("fallback must not be started once the client has partial content")
+	}
+}
+
+func TestStreamChainClientDisconnect(t *testing.T) {
+	// A client that stops reading must not strand the producing goroutine:
+	// every send is guarded by the request context.
+	p := &mockProvider{
+		name: "primary",
+		streamChunks: []StreamChunk{
+			{Delta: "one", Provider: "primary"},
+			{Delta: "two", Provider: "primary"},
+			{Delta: "three", Provider: "primary"},
+			{Done: true, FinishReason: FinishStop, Provider: "primary"},
+		},
+	}
+	svc := newTestService(p)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	chunks, err := svc.CompleteStreamChain(ctx, []RouteTarget{{Provider: "primary", Model: "m1"}}, CompletionParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	<-chunks // read one chunk, then walk away
+	cancel()
+
+	// The producer must finish and close the channel rather than blocking
+	// forever on a send nobody is receiving.
+	done := make(chan struct{})
+	go func() {
+		for range chunks {
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream goroutine did not terminate after the client disconnected")
 	}
 }
 

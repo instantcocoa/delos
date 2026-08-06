@@ -335,6 +335,20 @@ func (s *RuntimeService) completeStreamChain(ctx context.Context, chain []RouteT
 	out := make(chan StreamChunk)
 	go func() {
 		defer close(out)
+
+		// send delivers a chunk unless the caller has gone away. Every send
+		// in this goroutine must go through it: an unguarded send blocks
+		// forever once the consumer stops reading, stranding this goroutine,
+		// the provider's reader, and its upstream connection.
+		send := func(chunk StreamChunk) bool {
+			select {
+			case out <- chunk:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
 		var lastErr error
 		for i, target := range chain {
 			p, ok := s.registry.Get(target.Provider)
@@ -357,7 +371,7 @@ func (s *RuntimeService) completeStreamChain(ctx context.Context, chain []RouteT
 				lastErr = err
 				if !retryable(err) {
 					b.success()
-					out <- StreamChunk{Err: err, Provider: target.Provider, Model: target.Model}
+					send(StreamChunk{Err: err, Provider: target.Provider, Model: target.Model})
 					return
 				}
 				b.failure(time.Now())
@@ -367,21 +381,35 @@ func (s *RuntimeService) completeStreamChain(ctx context.Context, chain []RouteT
 			}
 
 			failed := false
+			// Once any content is on the wire we are committed to this
+			// target: bytes already flushed to the client cannot be
+			// retracted, so restarting a different provider here would
+			// splice two different completions into one response. After
+			// that point a break is surfaced as an error, not failed over.
+			committed := false
 			for chunk := range chunks {
 				if chunk.Err != nil {
 					lastErr = chunk.Err
 					failed = true
 					b.failure(time.Now())
-					hasNext := i+1 < len(chain)
+					canFailover := i+1 < len(chain) && !committed
 					s.logger.WarnContext(ctx, "stream broke mid-flight",
-						"target", target.String(), "error", chunk.Err, "failover", hasNext)
-					if !hasNext {
-						out <- chunk
+						"target", target.String(), "error", chunk.Err,
+						"failover", canFailover, "committed", committed)
+					if !canFailover {
+						if !send(chunk) {
+							return
+						}
 						return
 					}
 					break
 				}
-				out <- chunk
+				if !send(chunk) {
+					return
+				}
+				if chunk.Delta != "" || chunk.ToolCall != nil {
+					committed = true
+				}
 				if chunk.Done {
 					b.success()
 					return
@@ -397,7 +425,7 @@ func (s *RuntimeService) completeStreamChain(ctx context.Context, chain []RouteT
 		if lastErr == nil {
 			lastErr = fmt.Errorf("no targets available")
 		}
-		out <- StreamChunk{Err: lastErr}
+		send(StreamChunk{Err: lastErr})
 	}()
 	return out, nil
 }
