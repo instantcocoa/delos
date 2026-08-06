@@ -146,12 +146,18 @@ func readOTLPBody(r *http.Request) ([]byte, error) {
 			return nil, fmt.Errorf("failed to open gzip stream: %w", err)
 		}
 		defer gz.Close()
-		reader = gz
+		// MaxBytesReader bounds the compressed stream; bound the inflated one
+		// too, or a small gzip bomb expands without limit. Read one byte past
+		// the cap so an over-limit body is rejected rather than silently cut.
+		reader = io.LimitReader(gz, maxOTLPBody+1)
 	}
 
 	body, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read body: %w", err)
+	}
+	if len(body) > maxOTLPBody {
+		return nil, fmt.Errorf("request body exceeds %d bytes after decompression", maxOTLPBody)
 	}
 	if len(body) == 0 {
 		return nil, errors.New("empty request body")

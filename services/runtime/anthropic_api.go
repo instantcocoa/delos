@@ -224,6 +224,12 @@ func anthBlocksFromResult(msg Message) []anthBlockOut {
 }
 
 func (s *HTTPServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.authenticate(w, r, true)
+	if !ok {
+		return
+	}
+	limitBody(w, r)
+
 	var req anthMessagesRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeAnthropicError(w, r, http.StatusBadRequest, "invalid_request_error", "could not parse request body: "+err.Error())
@@ -258,11 +264,6 @@ func (s *HTTPServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	messages = append(messages, converted...)
-
-	key, ok := s.authenticate(w, r, true)
-	if !ok {
-		return
-	}
 
 	chain, err := s.service.ResolveChain(r.Context(), req.Model)
 	if err != nil {

@@ -227,3 +227,40 @@ func TestDevModeNoAuth(t *testing.T) {
 		t.Fatalf("dev mode must not require a key, got %d", rec.Code)
 	}
 }
+
+// The gateway must not read an unbounded request body: an oversized payload is
+// rejected rather than buffered into memory.
+func TestRequestBodyLimit(t *testing.T) {
+	srv := newTestHTTPServer(chatProvider())
+
+	huge := strings.Repeat("x", maxRequestBody+1024)
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"` + huge + `"}]}`
+	rec := doReq(srv, jsonReq(http.MethodPost, "/v1/chat/completions", body))
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("oversized body was accepted (status %d)", rec.Code)
+	}
+}
+
+// Authentication happens before the body is parsed, so an unauthenticated
+// client cannot make the gateway spend memory decoding a large payload.
+func TestAuthPrecedesBodyParsing(t *testing.T) {
+	store := NewMemoryKeyStore()
+	newStoredKey(t, store, "gate", 0, 0)
+	srv := authTestServer(t, store)
+
+	// Malformed JSON with no key: the 401 must win over the parse error.
+	rec := doReq(srv, jsonReq(http.MethodPost, "/v1/chat/completions", `{"model":`))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 before any body parsing", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "could not parse") {
+		t.Error("body was parsed before authentication")
+	}
+
+	// Same on the Anthropic surface.
+	rec = doReq(srv, jsonReq(http.MethodPost, "/v1/messages", `{"model":`))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("anthropic surface status = %d, want 401", rec.Code)
+	}
+}

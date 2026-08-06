@@ -508,10 +508,7 @@ func (s *PostgresStore) List(ctx context.Context, query ListQuery) ([]*Prompt, i
 		return nil, 0, fmt.Errorf("failed to count prompts: %w", err)
 	}
 
-	orderBy := "p.created_at"
-	if query.OrderBy != "" {
-		orderBy = "p." + query.OrderBy
-	}
+	orderBy := resolveOrderBy(query.OrderBy)
 	orderDir := "ASC"
 	if query.Descending {
 		orderDir = "DESC"
@@ -787,3 +784,20 @@ var (
 	_ Store = (*MemoryStore)(nil)
 	_ Store = (*PostgresStore)(nil)
 )
+
+// resolveOrderBy maps a client-supplied sort column to a literal column name.
+// The result is interpolated into the query string, so this allowlist - not
+// validation - is what keeps the statement safe: anything unrecognized falls
+// back to the default ordering.
+func resolveOrderBy(orderBy string) string {
+	switch orderBy {
+	case "name":
+		return "p.name"
+	case "slug":
+		return "p.slug"
+	case "updated_at":
+		return "p.updated_at"
+	default:
+		return "p.created_at"
+	}
+}

@@ -298,6 +298,13 @@ func buildCompletionParams(req chatCompletionRequest) (CompletionParams, error) 
 // ---- handlers ----
 
 func (s *HTTPServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	// Authenticate before spending memory on the body.
+	key, ok := s.authenticate(w, r, false)
+	if !ok {
+		return
+	}
+	limitBody(w, r)
+
 	var req chatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeOpenAIError(w, r, http.StatusBadRequest, "invalid_json", "could not parse request body: "+err.Error())
@@ -316,11 +323,6 @@ func (s *HTTPServer) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	s.tailModel(r.Context(), req.Model)
-
-	key, ok := s.authenticate(w, r, false)
-	if !ok {
-		return
-	}
 
 	chain, err := s.service.ResolveChain(r.Context(), req.Model)
 	if err != nil {
@@ -533,6 +535,12 @@ type embeddingItem struct {
 }
 
 func (s *HTTPServer) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.authenticate(w, r, false)
+	if !ok {
+		return
+	}
+	limitBody(w, r)
+
 	var req embeddingsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeOpenAIError(w, r, http.StatusBadRequest, "invalid_json", "could not parse request body: "+err.Error())
@@ -554,11 +562,6 @@ func (s *HTTPServer) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(texts) == 0 {
 		s.writeOpenAIError(w, r, http.StatusBadRequest, "invalid_input", "input must not be empty")
-		return
-	}
-
-	key, ok := s.authenticate(w, r, false)
-	if !ok {
 		return
 	}
 
