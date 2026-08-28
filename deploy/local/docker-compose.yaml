@@ -41,8 +41,22 @@ services:
       context: ../..
       dockerfile: Dockerfile.gateway
     container_name: delos-gateway
+    environment:
+      # A container has to bind every interface, so the gateway cannot fall
+      # back to its safe loopback-only default here. Without a virtual-key
+      # store (DELOS_STORAGE_BACKEND=postgres) every /v1 request is accepted,
+      # which makes this an open proxy in front of your provider keys - so the
+      # gateway refuses to start unless you say that is what you meant.
+      #
+      # This is a local development stack on your own machine, so we say it.
+      # DO NOT copy this line into a deployment that anything else can reach:
+      # there, set DELOS_STORAGE_BACKEND=postgres and create keys with
+      # `delos keys create`.
+      DELOS_ALLOW_UNAUTHENTICATED: "true"
     ports:
-      - "8080:8080"
+      # Publish on loopback only: even acknowledged, an open gateway has no
+      # business listening on your LAN. Change to "8080:8080" deliberately.
+      - "127.0.0.1:8080:8080"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://localhost:8080/healthz || exit 1"]
       interval: 10s
@@ -68,8 +82,19 @@ services:
       DELOS_DB_NAME: delos
       DELOS_DB_SSLMODE: disable
       DELOS_GATEWAY_URL: http://gateway:8080
+      # The control plane serves prompt CRUD (including DELETE), gate
+      # verdicts, eval/deploy writes and captured traces. With no
+      # DELOS_AUTH_TOKEN it binds loopback only - which inside a container
+      # means nothing can reach it - so the local stack uses a fixed
+      # development token. Export the same value for the CLI:
+      #
+      #   export DELOS_AUTH_TOKEN=delos-local-dev
+      #
+      # Set a real secret in .env.local for anything shared.
+      DELOS_AUTH_TOKEN: ${DELOS_AUTH_TOKEN:-delos-local-dev}
+      DELOS_BIND: 0.0.0.0
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
     depends_on:
       postgres:
         condition: service_healthy

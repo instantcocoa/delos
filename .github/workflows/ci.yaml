@@ -40,6 +40,11 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
+      # The integration suite is behind a build tag, so a plain vet never
+      # sees it. Without this it can rot uncompiled.
+      - name: Run go vet (integration build tag)
+        run: go vet -tags=integration ./...
+
       - name: Run staticcheck
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@latest
@@ -131,7 +136,7 @@ jobs:
           # else in this workflow builds with CGO_ENABLED=0.
           CGO_ENABLED: '1'
         run: |
-          go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+          go test -v -race -coverpkg=./... -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Upload coverage
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
@@ -154,6 +159,65 @@ jobs:
       # no buf step: it replays cassettes through services/runtime directly.
       - name: Replay provider cassettes
         run: go test ./tests/conformance/ -count=1 -v
+
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: delos
+          POSTGRES_PASSWORD: delos
+          POSTGRES_DB: delos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup Buf
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
+        with:
+          version: ${{ env.BUF_VERSION }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate proto code
+        run: buf generate
+
+      - name: Build binaries
+        run: make build
+
+      # The suite exercises both binaries over their real network surfaces,
+      # so they run as processes here rather than in-process fixtures.
+      - name: Start the stack
+        env:
+          DELOS_DB_PASSWORD: delos
+        run: |
+          ./bin/delos-gateway &>/tmp/gateway.log &
+          DELOS_STORAGE_BACKEND=postgres DELOS_GATEWAY_URL=http://localhost:8080 \
+            ./bin/delos serve &>/tmp/controlplane.log &
+          for i in $(seq 1 30); do
+            curl -sf localhost:8080/healthz >/dev/null \
+              && curl -sf localhost:8081/healthz >/dev/null && break
+            sleep 1
+          done
+          curl -sf localhost:8080/healthz || { echo "gateway did not start"; cat /tmp/gateway.log; exit 1; }
+          curl -sf localhost:8081/healthz || { echo "control plane did not start"; cat /tmp/controlplane.log; exit 1; }
+
+      - name: Run integration tests
+        run: go test -tags=integration ./tests/integration/... -count=1 -v
+
+      - name: Service logs on failure
+        if: failure()
+        run: tail -n 100 /tmp/gateway.log /tmp/controlplane.log
 
   compat:
     name: Client Compatibility

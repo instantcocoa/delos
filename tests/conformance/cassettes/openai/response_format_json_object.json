@@ -1,0 +1,36 @@
+{
+  "name": "openai: response_format json_object is forwarded verbatim",
+  "provider": "openai",
+  "surface": "openai",
+  "request": {
+    "model": "gpt-4o",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Give me the answer as JSON."
+      }
+    ],
+    "response_format": {
+      "type": "json_object"
+    }
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_body_contains": [
+    "\"response_format\":{\"type\":\"json_object\"}"
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"chatcmpl-RF1\",\"object\":\"chat.completion\",\"created\":1730000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"{\\\"answer\\\":42}\"},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":18,\"completion_tokens\":7,\"total_tokens\":25}}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "choices.0.finish_reason": "stop",
+      "choices.0.message.content": "{\"answer\":42}",
+      "usage.total_tokens": 25
+    }
+  }
+}

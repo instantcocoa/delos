@@ -4,9 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
@@ -36,7 +40,7 @@ func (h *Handler) Register(s *grpc.Server) {
 func (h *Handler) CreatePrompt(ctx context.Context, req *promptv1.CreatePromptRequest) (*promptv1.CreatePromptResponse, error) {
 	// Validate input
 	if req.Name == "" {
-		return nil, fmt.Errorf("name is required")
+		return nil, status.Error(codes.InvalidArgument, "name is required")
 	}
 
 	slug := req.Slug
@@ -44,31 +48,35 @@ func (h *Handler) CreatePrompt(ctx context.Context, req *promptv1.CreatePromptRe
 		slug = Slugify(req.Name)
 	}
 	if !IsValidSlug(slug) {
-		return nil, fmt.Errorf("invalid slug: %s", slug)
+		return nil, status.Errorf(codes.InvalidArgument, "invalid slug: %s", slug)
 	}
 
 	now := time.Now()
 	prompt := &Prompt{
-		ID:            GenerateID(),
-		Name:          req.Name,
-		Slug:          slug,
-		Version:       1,
-		Description:   req.Description,
-		Messages:      protoToMessages(req.Messages),
-		Variables:     protoToVariables(req.Variables),
-		DefaultConfig: protoToConfig(req.DefaultConfig),
-		Tags:          req.Tags,
-		Metadata:      req.Metadata,
-		Status:        PromptStatusActive,
-		CreatedBy:     "system", // TODO: Get from auth context
-		CreatedAt:     now,
-		UpdatedBy:     "system",
-		UpdatedAt:     now,
+		ID:                GenerateID(),
+		Name:              req.Name,
+		Slug:              slug,
+		Version:           1,
+		Description:       req.Description,
+		Messages:          protoToMessages(req.Messages),
+		Variables:         protoToVariables(req.Variables),
+		DefaultConfig:     protoToConfig(req.DefaultConfig),
+		Tags:              req.Tags,
+		Metadata:          req.Metadata,
+		Status:            PromptStatusActive,
+		ChangeDescription: "Initial version",
+		CreatedBy:         "system", // TODO: Get from auth context
+		CreatedAt:         now,
+		UpdatedBy:         "system",
+		UpdatedAt:         now,
 	}
 
 	if err := h.store.Create(ctx, prompt); err != nil {
 		h.logger.ErrorContext(ctx, "failed to create prompt", "error", err)
-		return nil, err
+		if strings.Contains(err.Error(), "already exists") {
+			return nil, status.Errorf(codes.AlreadyExists, "%v", err)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to create prompt: %v", err)
 	}
 
 	h.logger.InfoContext(ctx, "prompt created", "id", prompt.ID, "slug", prompt.Slug)
@@ -78,22 +86,90 @@ func (h *Handler) CreatePrompt(ctx context.Context, req *promptv1.CreatePromptRe
 	}, nil
 }
 
-// GetPrompt retrieves a prompt by ID or reference.
-func (h *Handler) GetPrompt(ctx context.Context, req *promptv1.GetPromptRequest) (*promptv1.GetPromptResponse, error) {
-	var prompt *Prompt
-	var err error
+// versionToken parses a bare version selector ("v2", "2", "latest").
+// It reports whether ref was such a selector; "latest" yields version 0.
+func versionToken(ref string) (int, bool) {
+	if ref == "latest" {
+		return 0, true
+	}
+	digits := strings.TrimPrefix(ref, "v")
+	if digits == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
 
-	if req.Id != "" {
-		prompt, err = h.store.Get(ctx, req.Id)
-	} else if req.Reference != "" {
-		slug, version := ParseReference(req.Reference)
-		prompt, err = h.store.GetBySlug(ctx, slug, version)
-	} else {
-		return nil, fmt.Errorf("id or reference required")
+// lookup resolves an identifier that may be either a prompt ID or a slug, at an
+// optional version (0 = latest). It returns (nil, nil) when nothing matches.
+func (h *Handler) lookup(ctx context.Context, idOrSlug string, version int) (*Prompt, error) {
+	if idOrSlug == "" {
+		return nil, nil
 	}
 
+	byID, err := h.store.Get(ctx, idOrSlug)
 	if err != nil {
 		return nil, err
+	}
+	if byID != nil {
+		if version > 0 && version != byID.Version {
+			return h.store.GetVersion(ctx, byID.ID, version)
+		}
+		return byID, nil
+	}
+
+	return h.store.GetBySlug(ctx, idOrSlug, version)
+}
+
+// resolveID returns the canonical prompt ID for an ID-or-slug argument. If the
+// prompt cannot be found the input is returned unchanged so callers can still
+// surface a store-level error.
+func (h *Handler) resolveID(ctx context.Context, idOrSlug string) string {
+	p, err := h.lookup(ctx, idOrSlug, 0)
+	if err != nil || p == nil {
+		return idOrSlug
+	}
+	return p.ID
+}
+
+// GetPrompt retrieves a prompt by ID, slug, or reference.
+//
+// The identifier in `id` may be either a prompt ID or a slug. `reference`
+// selects a version: "slug:v2", "slug:latest", or a bare "v2"/"latest" applied
+// to whatever `id` names.
+func (h *Handler) GetPrompt(ctx context.Context, req *promptv1.GetPromptRequest) (*promptv1.GetPromptResponse, error) {
+	target := req.Id
+	version := 0
+
+	if req.Reference != "" {
+		if v, ok := versionToken(req.Reference); ok {
+			if target == "" {
+				return nil, status.Errorf(codes.InvalidArgument, "reference %q selects a version but no id was given", req.Reference)
+			}
+			version = v
+		} else {
+			slug, v := ParseReference(req.Reference)
+			target, version = slug, v
+		}
+	}
+
+	if target == "" {
+		return nil, status.Error(codes.InvalidArgument, "id or reference required")
+	}
+
+	prompt, err := h.lookup(ctx, target, version)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "failed to get prompt", "error", err, "target", target)
+		return nil, status.Errorf(codes.Internal, "failed to get prompt: %v", err)
+	}
+	if prompt == nil {
+		if version > 0 {
+			return nil, status.Errorf(codes.NotFound, "prompt %s has no version %d", target, version)
+		}
+		return nil, status.Errorf(codes.NotFound, "prompt not found: %s", target)
 	}
 
 	return &promptv1.GetPromptResponse{
@@ -103,12 +179,12 @@ func (h *Handler) GetPrompt(ctx context.Context, req *promptv1.GetPromptRequest)
 
 // UpdatePrompt creates a new version of an existing prompt.
 func (h *Handler) UpdatePrompt(ctx context.Context, req *promptv1.UpdatePromptRequest) (*promptv1.UpdatePromptResponse, error) {
-	existing, err := h.store.Get(ctx, req.Id)
+	existing, err := h.lookup(ctx, req.Id, 0)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Internal, "failed to get prompt: %v", err)
 	}
 	if existing == nil {
-		return nil, fmt.Errorf("prompt not found: %s", req.Id)
+		return nil, status.Errorf(codes.NotFound, "prompt not found: %s", req.Id)
 	}
 
 	previousVersion := existing.Version
@@ -132,12 +208,13 @@ func (h *Handler) UpdatePrompt(ctx context.Context, req *promptv1.UpdatePromptRe
 	if len(req.Metadata) > 0 {
 		existing.Metadata = req.Metadata
 	}
+	existing.ChangeDescription = req.ChangeDescription
 	existing.UpdatedBy = "system" // TODO: Get from auth context
 	existing.UpdatedAt = time.Now()
 
 	if err := h.store.Update(ctx, existing); err != nil {
 		h.logger.ErrorContext(ctx, "failed to update prompt", "error", err)
-		return nil, err
+		return nil, status.Errorf(codes.Internal, "failed to update prompt: %v", err)
 	}
 
 	h.logger.InfoContext(ctx, "prompt updated",
@@ -182,7 +259,7 @@ func (h *Handler) ListPrompts(ctx context.Context, req *promptv1.ListPromptsRequ
 
 // DeletePrompt deletes a prompt (soft delete).
 func (h *Handler) DeletePrompt(ctx context.Context, req *promptv1.DeletePromptRequest) (*promptv1.DeletePromptResponse, error) {
-	if err := h.store.Delete(ctx, req.Id); err != nil {
+	if err := h.store.Delete(ctx, h.resolveID(ctx, req.Id)); err != nil {
 		h.logger.ErrorContext(ctx, "failed to delete prompt", "error", err)
 		return nil, err
 	}
@@ -196,9 +273,21 @@ func (h *Handler) DeletePrompt(ctx context.Context, req *promptv1.DeletePromptRe
 
 // GetPromptHistory returns version history for a prompt.
 func (h *Handler) GetPromptHistory(ctx context.Context, req *promptv1.GetPromptHistoryRequest) (*promptv1.GetPromptHistoryResponse, error) {
-	versions, err := h.store.GetHistory(ctx, req.Id, int(req.Limit))
+	if req.Id == "" {
+		return nil, status.Error(codes.InvalidArgument, "id is required")
+	}
+
+	// The argument may be an ID or a slug; resolve it so `prompt history <slug>`
+	// works the same way `prompt get <slug>` does.
+	promptID := h.resolveID(ctx, req.Id)
+
+	versions, err := h.store.GetHistory(ctx, promptID, int(req.Limit))
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Internal, "failed to get history: %v", err)
+	}
+	if len(versions) == 0 {
+		// No history at all means the prompt itself does not exist.
+		return nil, status.Errorf(codes.NotFound, "prompt not found: %s", req.Id)
 	}
 
 	protoVersions := make([]*promptv1.PromptVersion, len(versions))
@@ -212,27 +301,29 @@ func (h *Handler) GetPromptHistory(ctx context.Context, req *promptv1.GetPromptH
 	}
 
 	return &promptv1.GetPromptHistoryResponse{
-		PromptId: req.Id,
+		PromptId: promptID,
 		Versions: protoVersions,
 	}, nil
 }
 
 // CompareVersions performs semantic diff between versions.
 func (h *Handler) CompareVersions(ctx context.Context, req *promptv1.CompareVersionsRequest) (*promptv1.CompareVersionsResponse, error) {
-	promptA, err := h.store.GetVersion(ctx, req.PromptId, int(req.VersionA))
+	promptID := h.resolveID(ctx, req.PromptId)
+
+	promptA, err := h.store.GetVersion(ctx, promptID, int(req.VersionA))
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Internal, "failed to get version %d: %v", req.VersionA, err)
 	}
 	if promptA == nil {
-		return nil, fmt.Errorf("version %d not found", req.VersionA)
+		return nil, status.Errorf(codes.NotFound, "prompt %s has no version %d", req.PromptId, req.VersionA)
 	}
 
-	promptB, err := h.store.GetVersion(ctx, req.PromptId, int(req.VersionB))
+	promptB, err := h.store.GetVersion(ctx, promptID, int(req.VersionB))
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Internal, "failed to get version %d: %v", req.VersionB, err)
 	}
 	if promptB == nil {
-		return nil, fmt.Errorf("version %d not found", req.VersionB)
+		return nil, status.Errorf(codes.NotFound, "prompt %s has no version %d", req.PromptId, req.VersionB)
 	}
 
 	var diffs []VersionDiff

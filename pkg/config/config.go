@@ -67,6 +67,22 @@ type Base struct {
 	// Control plane
 	Port int // `delos serve` listen port (DELOS_PORT)
 
+	// Security. All three are environment-only: delos.yaml is meant to be
+	// commit-safe, so it has no schema for secrets (see file.go).
+	//
+	// AuthToken is the control plane's shared secret (DELOS_AUTH_TOKEN). When
+	// empty the control plane refuses to serve anything but loopback.
+	AuthToken string
+	// BindAddr is an explicit listen host (DELOS_BIND), e.g. 0.0.0.0 or
+	// 127.0.0.1. Empty means "decide from the security posture".
+	BindAddr string
+	// AllowUnauthenticated acknowledges an open gateway
+	// (DELOS_ALLOW_UNAUTHENTICATED=true) on a reachable address.
+	AllowUnauthenticated bool
+	// ObserveMemoryMaxSpans caps the in-memory span store
+	// (DELOS_OBSERVE_MEMORY_MAX_SPANS).
+	ObserveMemoryMaxSpans int
+
 	// Gateway (data plane)
 	GatewayPort    int           // DELOS_GATEWAY_PORT
 	GatewayURL     string        // DELOS_GATEWAY_URL - how clients reach the gateway
@@ -170,6 +186,11 @@ func loadWith(serviceName, path string, f *File) (*Base, error) {
 		DeployAddr:   getEnv("DELOS_DEPLOY_ENDPOINT", "localhost:9005"),
 
 		Port: fileInt("DELOS_PORT", f.Port, 8081),
+
+		AuthToken:             getEnv("DELOS_AUTH_TOKEN", ""),
+		BindAddr:              getEnv("DELOS_BIND", ""),
+		AllowUnauthenticated:  getEnvBool("DELOS_ALLOW_UNAUTHENTICATED", false),
+		ObserveMemoryMaxSpans: getEnvInt("DELOS_OBSERVE_MEMORY_MAX_SPANS", 50000),
 
 		GatewayPort:    fileInt("DELOS_GATEWAY_PORT", gw.Port, 8080),
 		GatewayURL:     fileStr("DELOS_GATEWAY_URL", gw.URL, "http://localhost:8080"),

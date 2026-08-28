@@ -51,8 +51,6 @@ func TestDatasetsService_CreateAndGet(t *testing.T) {
 	}
 
 	datasetID := createResp.Dataset.Id
-	t.Logf("Created dataset with ID: %s", datasetID)
-
 	defer func() {
 		client.DeleteDataset(ctx, &datasetsv1.DeleteDatasetRequest{Id: datasetID})
 	}()
@@ -63,8 +61,41 @@ func TestDatasetsService_CreateAndGet(t *testing.T) {
 		t.Fatalf("GetDataset failed: %v", err)
 	}
 
+	if getResp.Dataset.Id != datasetID {
+		t.Errorf("Expected id %s, got %s", datasetID, getResp.Dataset.Id)
+	}
 	if getResp.Dataset.Name != "Test Dataset" {
 		t.Errorf("Expected name 'Test Dataset', got '%s'", getResp.Dataset.Name)
+	}
+	if getResp.Dataset.Description != "A test dataset for integration testing" {
+		t.Errorf("Expected the description to round-trip, got '%s'", getResp.Dataset.Description)
+	}
+	if len(getResp.Dataset.Tags) != 2 {
+		t.Errorf("Expected the 2 tags to round-trip, got %v", getResp.Dataset.Tags)
+	}
+
+	// Update, then read back: the new description must stick and the name must
+	// not be clobbered by a partial update.
+	updateResp, err := client.UpdateDataset(ctx, &datasetsv1.UpdateDatasetRequest{
+		Id:          datasetID,
+		Description: "Updated description",
+	})
+	if err != nil {
+		t.Fatalf("UpdateDataset failed: %v", err)
+	}
+	if updateResp.Dataset.Description != "Updated description" {
+		t.Errorf("UpdateDataset returned description '%s', want 'Updated description'",
+			updateResp.Dataset.Description)
+	}
+	reread, err := client.GetDataset(ctx, &datasetsv1.GetDatasetRequest{Id: datasetID})
+	if err != nil {
+		t.Fatalf("GetDataset after update failed: %v", err)
+	}
+	if reread.Dataset.Description != "Updated description" {
+		t.Errorf("update did not persist: got description '%s'", reread.Dataset.Description)
+	}
+	if reread.Dataset.Name != "Test Dataset" {
+		t.Errorf("a description-only update clobbered the name: got '%s'", reread.Dataset.Name)
 	}
 }
 
@@ -123,7 +154,54 @@ func TestDatasetsService_AddExamples(t *testing.T) {
 	}
 
 	if len(getExamplesResp.Examples) != 2 {
-		t.Errorf("Expected 2 examples, got %d", len(getExamplesResp.Examples))
+		t.Fatalf("Expected 2 examples, got %d", len(getExamplesResp.Examples))
+	}
+	if getExamplesResp.TotalCount != 2 {
+		t.Errorf("Expected total_count 2, got %d", getExamplesResp.TotalCount)
+	}
+
+	// The metadata sent with each example must come back with it.
+	categories := map[string]bool{}
+	for _, ex := range getExamplesResp.Examples {
+		if ex.Id == "" {
+			t.Error("example stored without an id")
+		}
+		if ex.Input == nil {
+			t.Errorf("example %s stored without its input", ex.Id)
+		}
+		categories[ex.Metadata["category"]] = true
+	}
+	for _, want := range []string{"greeting", "math"} {
+		if !categories[want] {
+			t.Errorf("example metadata category %q did not round-trip, got %v", want, categories)
+		}
+	}
+
+	// Removing one example leaves exactly the other behind.
+	removed := getExamplesResp.Examples[0].Id
+	removeResp, err := client.RemoveExamples(ctx, &datasetsv1.RemoveExamplesRequest{
+		DatasetId:  datasetID,
+		ExampleIds: []string{removed},
+	})
+	if err != nil {
+		t.Fatalf("RemoveExamples failed: %v", err)
+	}
+	if removeResp.RemovedCount != 1 {
+		t.Errorf("Expected RemovedCount 1, got %d", removeResp.RemovedCount)
+	}
+
+	afterResp, err := client.GetExamples(ctx, &datasetsv1.GetExamplesRequest{
+		DatasetId: datasetID,
+		Limit:     10,
+	})
+	if err != nil {
+		t.Fatalf("GetExamples after remove failed: %v", err)
+	}
+	if len(afterResp.Examples) != 1 {
+		t.Fatalf("Expected 1 example left after removing one, got %d", len(afterResp.Examples))
+	}
+	if afterResp.Examples[0].Id == removed {
+		t.Errorf("RemoveExamples removed the wrong example: %s is still present", removed)
 	}
 }
 
@@ -212,4 +290,31 @@ func TestDatasetsService_List(t *testing.T) {
 	if len(listResp.Datasets) < 3 {
 		t.Errorf("Expected at least 3 datasets, got %d", len(listResp.Datasets))
 	}
+	// A tag filter that returns untagged datasets is not filtering.
+	want := map[string]bool{}
+	for _, id := range createdIDs {
+		want[id] = true
+	}
+	returned := map[string]bool{}
+	for _, d := range listResp.Datasets {
+		returned[d.Id] = true
+		if !contains(d.Tags, "list-test") {
+			t.Errorf("ListDatasets(tags=[list-test]) returned dataset %s with tags %v", d.Id, d.Tags)
+		}
+	}
+	for id := range want {
+		if !returned[id] {
+			t.Errorf("ListDatasets(tags=[list-test]) omitted dataset %s, which carries the tag", id)
+		}
+	}
+}
+
+// contains reports whether haystack holds needle.
+func contains(haystack []string, needle string) bool {
+	for _, v := range haystack {
+		if v == needle {
+			return true
+		}
+	}
+	return false
 }

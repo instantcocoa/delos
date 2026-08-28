@@ -33,6 +33,11 @@ type TailEvent struct {
 	CacheHit         bool      `json:"cache_hit"`
 	KeyName          string    `json:"key_name,omitempty"`
 	Error            string    `json:"error,omitempty"`
+
+	// KeyID identifies the virtual key that made the request. It is the
+	// tenant boundary for /v1/events and is deliberately never serialized:
+	// subscribers are filtered by it, they do not get to see it.
+	KeyID string `json:"-"`
 }
 
 // OK reports whether the request succeeded.
@@ -231,6 +236,7 @@ func (s *HTTPServer) tailComplete(r *http.Request, key *VirtualKey, model, provi
 	}
 	if key != nil {
 		ev.KeyName = key.Name
+		ev.KeyID = key.ID
 	}
 	s.tailEmit(r, ev)
 }
@@ -248,6 +254,7 @@ func (s *HTTPServer) tailFailure(r *http.Request, status int, code, msg string) 
 	ev := TailEvent{Status: status, Error: detail}
 	if key := AuthedKey(r.Context()); key != nil {
 		ev.KeyName = key.Name
+		ev.KeyID = key.ID
 	}
 	s.tailEmit(r, ev)
 }
@@ -256,14 +263,32 @@ func (s *HTTPServer) tailFailure(r *http.Request, status int, code, msg string) 
 
 // handleTailEvents streams TailEvents as Server-Sent Events. `delos tail`
 // consumes this; so does `curl -N localhost:8080/v1/events`.
+//
+// A subscriber sees its own key's requests and nothing else. The event
+// carries the model, the provider, the cost and the upstream error text of
+// every request it describes, so an unscoped stream handed any valid key a
+// live feed of every other tenant's traffic - what they build, who they buy
+// from, and what it costs them.
+//
+// There is no operator-wide view yet: an admin flag belongs on the key record
+// (keys.go, plus a migration), so this scopes to the caller's own key and an
+// admin view remains a follow-up. Dev mode (no key store configured) has no
+// tenants to separate and streams everything.
 func (s *HTTPServer) handleTailEvents(w http.ResponseWriter, r *http.Request) {
 	if s.tail == nil {
 		s.writeOpenAIError(w, r, http.StatusNotFound, "tail_disabled",
 			"live request streaming is disabled on this gateway")
 		return
 	}
-	if _, ok := s.authenticate(w, r, false); !ok {
+	key, ok := s.authenticate(w, r, false)
+	if !ok {
 		return
+	}
+	r = withKey(r, key)
+	// An event with no key (a request refused before authentication, or dev
+	// traffic) belongs to no tenant, so it reaches no scoped subscriber.
+	visible := func(ev TailEvent) bool {
+		return key == nil || ev.KeyID == key.ID
 	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -282,6 +307,9 @@ func (s *HTTPServer) handleTailEvents(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	write := func(ev TailEvent) {
+		if !visible(ev) {
+			return
+		}
 		data, err := json.Marshal(ev)
 		if err != nil {
 			return
@@ -290,7 +318,8 @@ func (s *HTTPServer) handleTailEvents(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	// ?replay=N sends the N most recent events before going live.
+	// ?replay=N sends the caller's own events from among the N most recent.
+	// N bounds the history scanned, not the number of events delivered.
 	if v := r.URL.Query().Get("replay"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			for _, ev := range s.tail.Recent(n) {

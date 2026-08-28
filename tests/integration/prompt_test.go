@@ -8,6 +8,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,8 +45,6 @@ func TestPromptService_CreateAndGet(t *testing.T) {
 	}
 
 	promptID := createResp.Prompt.Id
-	t.Logf("Created prompt with ID: %s", promptID)
-
 	defer func() {
 		client.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptID})
 	}()
@@ -66,66 +65,6 @@ func TestPromptService_CreateAndGet(t *testing.T) {
 
 	if getResp.Prompt.Id != promptID {
 		t.Errorf("Expected ID %s, got %s", promptID, getResp.Prompt.Id)
-	}
-}
-
-func TestPromptService_UpdateCreatesNewVersion(t *testing.T) {
-	client, cleanup := getPromptClient(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Create a prompt
-	createResp, err := client.CreatePrompt(ctx, &promptv1.CreatePromptRequest{
-		Name:        "Versioned Prompt",
-		Slug:        "versioned-prompt-" + time.Now().Format("150405"),
-		Description: "Version 1",
-		Messages: []*promptv1.PromptMessage{
-			{Role: "system", Content: "Original system prompt"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("CreatePrompt failed: %v", err)
-	}
-
-	promptID := createResp.Prompt.Id
-	defer func() {
-		client.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptID})
-	}()
-
-	if createResp.Prompt.Version != 1 {
-		t.Errorf("Expected initial version 1, got %d", createResp.Prompt.Version)
-	}
-
-	// Update the prompt
-	updateResp, err := client.UpdatePrompt(ctx, &promptv1.UpdatePromptRequest{
-		Id:          promptID,
-		Description: "Version 2 - updated",
-		Messages: []*promptv1.PromptMessage{
-			{Role: "system", Content: "Updated system prompt"},
-		},
-		ChangeDescription: "Updated system prompt content",
-	})
-	if err != nil {
-		t.Fatalf("UpdatePrompt failed: %v", err)
-	}
-
-	if updateResp.Prompt.Version != 2 {
-		t.Errorf("Expected version 2 after update, got %d", updateResp.Prompt.Version)
-	}
-
-	// Get history
-	historyResp, err := client.GetPromptHistory(ctx, &promptv1.GetPromptHistoryRequest{
-		Id:    promptID,
-		Limit: 10,
-	})
-	if err != nil {
-		t.Fatalf("GetPromptHistory failed: %v", err)
-	}
-
-	if len(historyResp.Versions) < 1 {
-		t.Errorf("Expected at least 1 version in history, got %d", len(historyResp.Versions))
 	}
 }
 
@@ -220,7 +159,8 @@ func TestPromptService_GetPromptHistory(t *testing.T) {
 		t.Fatalf("UpdatePrompt v3 failed: %v", err)
 	}
 
-	// Get history
+	// The history of a prompt edited twice is three versions: the original plus
+	// both edits, each carrying the change description it was saved with.
 	historyResp, err := client.GetPromptHistory(ctx, &promptv1.GetPromptHistoryRequest{
 		Id: promptID,
 	})
@@ -228,12 +168,28 @@ func TestPromptService_GetPromptHistory(t *testing.T) {
 		t.Fatalf("GetPromptHistory failed: %v", err)
 	}
 
-	// Service may return varying number of versions depending on implementation
-	if len(historyResp.Versions) < 1 {
-		t.Errorf("Expected at least 1 version, got %d", len(historyResp.Versions))
+	if len(historyResp.Versions) != 3 {
+		t.Fatalf("expected 3 versions in the history of a prompt updated twice, got %d: %+v",
+			len(historyResp.Versions), historyResp.Versions)
 	}
 
-	t.Logf("GetPromptHistory: got %d versions in history", len(historyResp.Versions))
+	wantChange := map[int32]string{2: "Updated to v2", 3: "Updated to v3"}
+	seen := map[int32]bool{}
+	for _, v := range historyResp.Versions {
+		if seen[v.Version] {
+			t.Errorf("version %d appears more than once in the history", v.Version)
+		}
+		seen[v.Version] = true
+		if want, ok := wantChange[v.Version]; ok && v.ChangeDescription != want {
+			t.Errorf("version %d: expected change description %q, got %q",
+				v.Version, want, v.ChangeDescription)
+		}
+	}
+	for _, want := range []int32{1, 2, 3} {
+		if !seen[want] {
+			t.Errorf("version %d missing from the history", want)
+		}
+	}
 }
 
 func TestPromptService_CompareVersions(t *testing.T) {
@@ -285,8 +241,22 @@ func TestPromptService_CompareVersions(t *testing.T) {
 	if compareResp.SemanticSimilarity < 0 || compareResp.SemanticSimilarity > 1 {
 		t.Errorf("Expected semantic similarity between 0 and 1, got %f", compareResp.SemanticSimilarity)
 	}
-
-	t.Logf("Semantic similarity: %f", compareResp.SemanticSimilarity)
+	// The two versions differ only in their messages, so the diff must say so.
+	if len(compareResp.Diffs) == 0 {
+		t.Fatal("expected CompareVersions to report at least one diff between v1 and v2")
+	}
+	foundMessages := false
+	for _, d := range compareResp.Diffs {
+		if d.Field == "" {
+			t.Error("diff entry with an empty field name")
+		}
+		if strings.Contains(strings.ToLower(d.Field), "message") {
+			foundMessages = true
+		}
+	}
+	if !foundMessages {
+		t.Errorf("expected a diff on the messages field, got %+v", compareResp.Diffs)
+	}
 }
 
 func TestPromptService_Delete(t *testing.T) {
@@ -313,15 +283,16 @@ func TestPromptService_Delete(t *testing.T) {
 		t.Fatalf("DeletePrompt failed: %v", err)
 	}
 
-	// Verify it's soft-deleted (archived)
+	// Delete is a soft delete: the record survives, marked archived, so history
+	// and past eval runs keep resolving. It must not come back as active.
 	getResp, err := client.GetPrompt(ctx, &promptv1.GetPromptRequest{Id: promptID})
 	if err != nil {
-		t.Logf("GetPrompt after delete returned error (may be expected): %v", err)
-		return
+		t.Fatalf("GetPrompt after a soft delete failed: %v", err)
 	}
-
-	// If we can still get it, it should be archived
-	if getResp.Prompt != nil {
-		t.Logf("Prompt status after delete: %v", getResp.Prompt.Status)
+	if getResp.Prompt == nil {
+		t.Fatal("expected the soft-deleted prompt to still be retrievable by id")
+	}
+	if got := getResp.Prompt.Status; got != promptv1.PromptStatus_PROMPT_STATUS_ARCHIVED {
+		t.Errorf("expected a deleted prompt to be ARCHIVED, got %s", got)
 	}
 }

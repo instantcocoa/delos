@@ -264,3 +264,85 @@ func TestTailDisabledWithoutOption(t *testing.T) {
 		t.Fatal("expected an error envelope")
 	}
 }
+
+func TestTailEventsAreScopedToTheAuthenticatedKey(t *testing.T) {
+	// A tail event names the model, the provider, the cost, the key and the
+	// full upstream error text. Unscoped, any key holder got a live feed of
+	// every other tenant's traffic - what they build, who they buy from,
+	// and what it costs them.
+	store := NewMemoryKeyStore()
+	_, keyA := newStoredKey(t, store, "tenant-a", 0, 0)
+	secretB, keyB := newStoredKey(t, store, "tenant-b", 0, 0)
+
+	b := NewTailBroadcaster(50)
+	srv := NewHTTPServer(newTestService(chatProvider()), newTestLogger(),
+		WithKeyStore(store), WithTailBroadcast(b))
+	b.Publish(TailEvent{RequestID: "req_a", Model: "gpt-4o", Status: 200,
+		KeyName: keyA.Name, KeyID: keyA.ID, CostUSD: 1.23})
+	b.Publish(TailEvent{RequestID: "req_b", Model: "gpt-4o", Status: 200,
+		KeyName: keyB.Name, KeyID: keyB.ID})
+	b.Publish(TailEvent{RequestID: "req_anon", Model: "gpt-4o", Status: 401})
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/events?replay=10", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+secretB)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/events: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+
+	seen := make(chan TailEvent, 8)
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			data, ok := strings.CutPrefix(scanner.Text(), "data: ")
+			if !ok {
+				continue
+			}
+			var ev TailEvent
+			if err := json.Unmarshal([]byte(data), &ev); err == nil {
+				seen <- ev
+			}
+		}
+	}()
+
+	select {
+	case ev := <-seen:
+		if ev.RequestID != "req_b" {
+			t.Fatalf("subscriber saw %q; a key may only see its own requests", ev.RequestID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the subscriber's own replayed event never arrived")
+	}
+
+	// Nothing else may follow: neither the other tenant's event nor the
+	// unattributed one.
+	select {
+	case ev := <-seen:
+		t.Errorf("subscriber also saw %q (key %q)", ev.RequestID, ev.KeyName)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestTailEventKeyIDIsNotSerialized(t *testing.T) {
+	// Scoping is done on an internal identifier; subscribers are filtered by
+	// it, they do not get to see it.
+	data, err := json.Marshal(TailEvent{KeyID: "key-secret-internal", KeyName: "team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "key-secret-internal") {
+		t.Errorf("TailEvent JSON leaks the key ID: %s", data)
+	}
+}

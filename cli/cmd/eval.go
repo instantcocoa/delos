@@ -7,11 +7,30 @@ import (
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	cpclient "github.com/instantcocoa/delos/cli/internal/client"
 	"github.com/instantcocoa/delos/cli/internal/output"
 	evalv1 "github.com/instantcocoa/delos/gen/go/eval/v1"
+	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
 )
+
+// resolvePromptID turns a prompt ID or slug into the prompt ID the eval runner
+// needs. It fails fast with a readable message when the prompt does not exist.
+func resolvePromptID(ctx context.Context, conn *grpc.ClientConn, ref string) (string, error) {
+	resp, err := promptv1.NewPromptServiceClient(conn).GetPrompt(ctx, &promptv1.GetPromptRequest{Id: ref})
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return "", fmt.Errorf("prompt %q not found (pass a prompt ID or slug; see `delos prompt list`)", ref)
+		}
+		return "", fmt.Errorf("failed to resolve prompt %q: %w", ref, err)
+	}
+	if resp.Prompt == nil || resp.Prompt.Id == "" {
+		return "", fmt.Errorf("prompt %q not found (pass a prompt ID or slug; see `delos prompt list`)", ref)
+	}
+	return resp.Prompt.Id, nil
+}
 
 var evalCmd = &cobra.Command{
 	Use:   "eval",
@@ -22,8 +41,33 @@ var evalCmd = &cobra.Command{
 var evalRunCmd = &cobra.Command{
 	Use:   "run",
 	Short: "Create and start an evaluation run",
+	Long: `Create and start an evaluation run.
+
+--prompt accepts a prompt ID or a slug; a slug is resolved to its ID before
+the run is created, because the runner looks prompts up by ID.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		name, _ := cmd.Flags().GetString("name")
+		promptRef, _ := cmd.Flags().GetString("prompt")
+		promptVersion, _ := cmd.Flags().GetInt32("version")
+		datasetID, _ := cmd.Flags().GetString("dataset")
+		evaluators, _ := cmd.Flags().GetStringSlice("evaluators")
+		provider, _ := cmd.Flags().GetString("provider")
+		model, _ := cmd.Flags().GetString("model")
+
+		if promptRef == "" {
+			return fmt.Errorf("--prompt is required (a prompt ID or slug; see `delos prompt list`)")
+		}
+		if datasetID == "" {
+			return fmt.Errorf("--dataset is required (a dataset ID; see `delos datasets list`)")
+		}
+		if model == "" {
+			return fmt.Errorf("--model is required (the model the eval runs completions against)")
+		}
+		if name == "" {
+			name = fmt.Sprintf("eval-%s", time.Now().Format("20060102-150405"))
+		}
+
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -33,19 +77,11 @@ var evalRunCmd = &cobra.Command{
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
-		name, _ := cmd.Flags().GetString("name")
-		promptID, _ := cmd.Flags().GetString("prompt")
-		promptVersion, _ := cmd.Flags().GetInt32("version")
-		datasetID, _ := cmd.Flags().GetString("dataset")
-		evaluators, _ := cmd.Flags().GetStringSlice("evaluators")
-		provider, _ := cmd.Flags().GetString("provider")
-		model, _ := cmd.Flags().GetString("model")
-
-		if name == "" {
-			name = fmt.Sprintf("eval-%s", time.Now().Format("20060102-150405"))
-		}
-		if model == "" {
-			return fmt.Errorf("--model is required (the model the eval runs completions against)")
+		// Resolve the prompt up front: the eval runner fetches prompts by ID
+		// only, so a slug that is not resolved here fails later, mid-run.
+		promptID, err := resolvePromptID(ctx, conn, promptRef)
+		if err != nil {
+			return err
 		}
 
 		evalConfigs := make([]*evalv1.EvaluatorConfig, len(evaluators))
@@ -83,7 +119,7 @@ var evalListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List evaluation runs",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -125,7 +161,7 @@ var evalListCmd = &cobra.Command{
 				score = fmt.Sprintf("%.2f", r.Summary.OverallScore)
 			}
 			table.Rows[i] = []string{
-				r.Id[:8],
+				shortID(r.Id, 8),
 				r.Name,
 				r.Status.String(),
 				progress,
@@ -144,7 +180,7 @@ var evalGetCmd = &cobra.Command{
 	Short: "Get evaluation run details",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -169,7 +205,7 @@ var evalCancelCmd = &cobra.Command{
 	Short: "Cancel an evaluation run",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -194,7 +230,7 @@ var evalResultsCmd = &cobra.Command{
 	Short: "Get evaluation results",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -228,7 +264,7 @@ var evalCompareCmd = &cobra.Command{
 	Short: "Compare two evaluation runs",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -255,7 +291,7 @@ var evalEvaluatorsCmd = &cobra.Command{
 	Use:   "evaluators",
 	Short: "List available evaluators",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -295,9 +331,9 @@ var evalEvaluatorsCmd = &cobra.Command{
 func init() {
 	// Run flags
 	evalRunCmd.Flags().String("name", "", "Run name")
-	evalRunCmd.Flags().String("prompt", "", "Prompt ID")
+	evalRunCmd.Flags().String("prompt", "", "Prompt ID or slug (required)")
 	evalRunCmd.Flags().Int32("version", 0, "Prompt version (0 = latest)")
-	evalRunCmd.Flags().String("dataset", "", "Dataset ID")
+	evalRunCmd.Flags().String("dataset", "", "Dataset ID (required)")
 	evalRunCmd.Flags().String("model", "", "Model to run completions against (required, e.g. claude-haiku-4-5)")
 	evalRunCmd.Flags().String("provider", "", "Force a specific provider (optional)")
 	evalRunCmd.Flags().StringSlice("evaluators", []string{"exact_match"}, "Evaluator types")

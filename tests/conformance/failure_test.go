@@ -239,16 +239,21 @@ func TestFailoverOnUpstream500(t *testing.T) {
 	}
 }
 
-// TestMidStreamKillFailsOverToCompleteStream is the Phase 1 acceptance
-// criterion: kill the primary mid-stream and the client still receives a
-// valid, completed stream from the fallback.
-func TestMidStreamKillFailsOverToCompleteStream(t *testing.T) {
+// TestMidStreamKillDoesNotSpliceCompletions covers the hard half of the
+// Phase 1 mid-stream failover criterion. Failing over after bytes have
+// reached the client would splice two different completions into one
+// response, so once content is committed the break is surfaced as an error
+// instead. The recoverable case - a break before any content - is covered by
+// TestStreamStartFailureFailsOver and by the unit-level chain tests.
+func TestMidStreamKillDoesNotSpliceCompletions(t *testing.T) {
 	primaryURL := compatUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		write := sseWriter(w)
 		write(chunkFrame("Par"))
 		panic(http.ErrAbortHandler)
 	})
+	var fallbackCalled bool
 	fallbackURL := compatUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalled = true
 		write := sseWriter(w)
 		write(chunkFrame("Hello"))
 		write(chunkFrame(" world"))
@@ -266,20 +271,21 @@ func TestMidStreamKillFailsOverToCompleteStream(t *testing.T) {
 		t.Fatalf("gateway call failed: %v", err)
 	}
 	if resp.Status != http.StatusOK {
-		t.Fatalf("status = %d, want 200\nbody: %s", resp.Status, resp.Body)
+		t.Fatalf("status = %d, want 200 (headers were already sent)\nbody: %s", resp.Status, resp.Body)
 	}
+
 	view := ReadStream("openai", resp.Body)
-	if !view.Done {
-		t.Errorf("stream did not terminate with [DONE] after failover\nbody: %s", resp.Body)
+	if strings.Contains(view.Text(), "Hello world") {
+		t.Errorf("the fallback's completion was spliced onto the primary's partial output: %q", view.Text())
 	}
-	if !strings.Contains(view.Text(), "Hello world") {
-		t.Errorf("client never received the fallback's completion, got %q", view.Text())
+	if fallbackCalled {
+		t.Error("the fallback must not be started once the client holds partial content")
 	}
-	if !strings.Contains(resp.Body, `"finish_reason":"stop"`) {
-		t.Errorf("stream is missing a terminal finish_reason\nbody: %s", resp.Body)
+	if view.Done {
+		t.Errorf("a broken stream must not be terminated with [DONE]\nbody: %s", resp.Body)
 	}
-	if strings.Contains(resp.Body, "provider_stream_error") {
-		t.Errorf("a recovered failover must not surface a stream error to the client\nbody: %s", resp.Body)
+	if !strings.Contains(resp.Body, "provider_stream_error") {
+		t.Errorf("the client must be told the stream broke\nbody: %s", resp.Body)
 	}
 }
 

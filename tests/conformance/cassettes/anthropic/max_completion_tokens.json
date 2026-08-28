@@ -1,0 +1,33 @@
+{
+  "name": "anthropic: max_completion_tokens from the OpenAI surface caps the Anthropic request",
+  "provider": "anthropic",
+  "surface": "openai",
+  "request": {
+    "model": "claude-sonnet-4-5",
+    "max_completion_tokens": 16,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/messages",
+  "upstream_body_contains": [
+    "\"max_tokens\":16"
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"msg_mct1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5-20250929\",\"content\":[{\"type\":\"text\",\"text\":\"Hello there!\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":11,\"output_tokens\":16}}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "choices.0.finish_reason": "length",
+      "usage.completion_tokens": 16
+    }
+  }
+}

@@ -73,13 +73,18 @@ func (s *MemoryStore) Create(ctx context.Context, prompt *Prompt) error {
 		return fmt.Errorf("slug already exists: %s", prompt.Slug)
 	}
 
+	changeDesc := prompt.ChangeDescription
+	if changeDesc == "" {
+		changeDesc = "Initial version"
+	}
+
 	s.prompts[prompt.ID] = prompt
 	s.versions[prompt.ID] = []*Prompt{CopyPrompt(prompt)}
 	s.slugs[prompt.Slug] = prompt.ID
 	s.history[prompt.ID] = []PromptVersion{
 		{
 			Version:           prompt.Version,
-			ChangeDescription: "Initial version",
+			ChangeDescription: changeDesc,
 			UpdatedBy:         prompt.CreatedBy,
 			UpdatedAt:         prompt.CreatedAt,
 		},
@@ -139,8 +144,20 @@ func (s *MemoryStore) Update(ctx context.Context, prompt *Prompt) error {
 	prompt.Version = existing.Version + 1
 	prompt.UpdatedAt = time.Now()
 
-	s.prompts[prompt.ID] = prompt
+	changeDesc := prompt.ChangeDescription
+	if changeDesc == "" {
+		changeDesc = fmt.Sprintf("Version %d", prompt.Version)
+	}
+
+	s.prompts[prompt.ID] = CopyPrompt(prompt)
 	s.versions[prompt.ID] = append(s.versions[prompt.ID], CopyPrompt(prompt))
+	// Record the new version in the history so `prompt history` sees it.
+	s.history[prompt.ID] = append(s.history[prompt.ID], PromptVersion{
+		Version:           prompt.Version,
+		ChangeDescription: changeDesc,
+		UpdatedBy:         prompt.UpdatedBy,
+		UpdatedAt:         prompt.UpdatedAt,
+	})
 
 	return nil
 }
@@ -309,7 +326,12 @@ func (s *PostgresStore) Create(ctx context.Context, prompt *Prompt) error {
 		return fmt.Errorf("failed to insert prompt: %w", err)
 	}
 
-	versionID, err := s.insertVersion(ctx, tx, prompt.ID, prompt.Version, "", prompt.UpdatedBy)
+	changeDesc := prompt.ChangeDescription
+	if changeDesc == "" {
+		changeDesc = "Initial version"
+	}
+
+	versionID, err := s.insertVersion(ctx, tx, prompt.ID, prompt.Version, changeDesc, prompt.UpdatedBy)
 	if err != nil {
 		return err
 	}
@@ -443,7 +465,23 @@ func (s *PostgresStore) Update(ctx context.Context, prompt *Prompt) error {
 		return fmt.Errorf("failed to update prompt: %w", err)
 	}
 
-	versionID, err := s.insertVersion(ctx, tx, prompt.ID, prompt.Version, "", prompt.UpdatedBy)
+	// The store owns version numbering (as MemoryStore does): every update
+	// appends the next version rather than overwriting the current one.
+	var currentVersion int
+	err = tx.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(version), 0) FROM prompt_versions WHERE prompt_id = $1
+	`, prompt.ID).Scan(&currentVersion)
+	if err != nil {
+		return fmt.Errorf("failed to read current version: %w", err)
+	}
+	prompt.Version = currentVersion + 1
+
+	changeDesc := prompt.ChangeDescription
+	if changeDesc == "" {
+		changeDesc = fmt.Sprintf("Version %d", prompt.Version)
+	}
+
+	versionID, err := s.insertVersion(ctx, tx, prompt.ID, prompt.Version, changeDesc, prompt.UpdatedBy)
 	if err != nil {
 		return err
 	}
@@ -508,10 +546,7 @@ func (s *PostgresStore) List(ctx context.Context, query ListQuery) ([]*Prompt, i
 		return nil, 0, fmt.Errorf("failed to count prompts: %w", err)
 	}
 
-	orderBy := "p.created_at"
-	if query.OrderBy != "" {
-		orderBy = "p." + query.OrderBy
-	}
+	orderBy := resolveOrderBy(query.OrderBy)
 	orderDir := "ASC"
 	if query.Descending {
 		orderDir = "DESC"
@@ -787,3 +822,20 @@ var (
 	_ Store = (*MemoryStore)(nil)
 	_ Store = (*PostgresStore)(nil)
 )
+
+// resolveOrderBy maps a client-supplied sort column to a literal column name.
+// The result is interpolated into the query string, so this allowlist - not
+// validation - is what keeps the statement safe: anything unrecognized falls
+// back to the default ordering.
+func resolveOrderBy(orderBy string) string {
+	switch orderBy {
+	case "name":
+		return "p.name"
+	case "slug":
+		return "p.slug"
+	case "updated_at":
+		return "p.updated_at"
+	default:
+		return "p.created_at"
+	}
+}

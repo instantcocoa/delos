@@ -17,6 +17,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	datasetsv1 "github.com/instantcocoa/delos/gen/go/datasets/v1"
@@ -30,64 +31,202 @@ import (
 // the gateway HTTP helper live in clients_test.go.
 
 // ============================================================================
-// OBSERVE SERVICE TESTS (5 endpoints)
+// CONTROL PLANE HEALTH (all five modules, one address)
 // ============================================================================
 
-func TestObserveService_Health(t *testing.T) {
-	client, cleanup := getObserveClient(t)
+// TestControlPlane_Health asserts every module hosted by `delos serve` reports
+// itself healthy. All five share one gRPC address, so this is one table rather
+// than five near-identical tests that only checked err == nil.
+func TestControlPlane_Health(t *testing.T) {
+	conn, cleanup := dialControlPlane(t)
 	defer cleanup()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	type health struct{ status, version string }
 
-	resp, err := client.Health(ctx, &observev1.HealthRequest{})
-	if err != nil {
-		t.Fatalf("Health failed: %v", err)
+	modules := []struct {
+		name string
+		call func(context.Context) (health, error)
+	}{
+		{"observe", func(ctx context.Context) (health, error) {
+			r, err := observev1.NewObserveServiceClient(conn).Health(ctx, &observev1.HealthRequest{})
+			if err != nil {
+				return health{}, err
+			}
+			return health{r.GetStatus(), r.GetVersion()}, nil
+		}},
+		{"prompt", func(ctx context.Context) (health, error) {
+			r, err := promptv1.NewPromptServiceClient(conn).Health(ctx, &promptv1.HealthRequest{})
+			if err != nil {
+				return health{}, err
+			}
+			return health{r.GetStatus(), r.GetVersion()}, nil
+		}},
+		{"datasets", func(ctx context.Context) (health, error) {
+			r, err := datasetsv1.NewDatasetsServiceClient(conn).Health(ctx, &datasetsv1.HealthRequest{})
+			if err != nil {
+				return health{}, err
+			}
+			return health{r.GetStatus(), r.GetVersion()}, nil
+		}},
+		{"eval", func(ctx context.Context) (health, error) {
+			r, err := evalv1.NewEvalServiceClient(conn).Health(ctx, &evalv1.HealthRequest{})
+			if err != nil {
+				return health{}, err
+			}
+			return health{r.GetStatus(), r.GetVersion()}, nil
+		}},
+		{"deploy", func(ctx context.Context) (health, error) {
+			r, err := deployv1.NewDeployServiceClient(conn).Health(ctx, &deployv1.HealthRequest{})
+			if err != nil {
+				return health{}, err
+			}
+			return health{r.GetStatus(), r.GetVersion()}, nil
+		}},
 	}
-	t.Logf("Observe health: %s", resp.Status)
+
+	for _, m := range modules {
+		t.Run(m.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			got, err := m.call(ctx)
+			if err != nil {
+				t.Fatalf("%s Health failed: %v", m.name, err)
+			}
+			if got.status != "healthy" {
+				t.Errorf("%s: expected status \"healthy\", got %q", m.name, got.status)
+			}
+			if got.version == "" {
+				t.Errorf("%s: expected Health to report a version", m.name)
+			}
+		})
+	}
 }
 
-func TestObserveService_IngestTraces(t *testing.T) {
-	client, cleanup := getObserveClient(t)
-	defer cleanup()
-
+// TestControlPlane_Healthz asserts the plain-HTTP liveness probe that
+// orchestrators use, served on the same address as gRPC.
+func TestControlPlane_Healthz(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	now := timestamppb.Now()
-	resp, err := client.IngestTraces(ctx, &observev1.IngestTracesRequest{
-		Spans: []*observev1.Span{
-			{
-				TraceId:   "test-trace-123",
-				SpanId:    "span-1",
-				Name:      "test-operation",
-				StartTime: now,
-			},
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	code, body := getJSON(t, ctx, httpClient, controlPlaneHTTPURL("/healthz"))
+	if code != http.StatusOK {
+		t.Fatalf("GET /healthz: expected 200, got %d: %s", code, body)
+	}
+	var health struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &health); err != nil {
+		t.Fatalf("GET /healthz: invalid JSON: %v (body: %s)", err, body)
+	}
+	if health.Status == "" {
+		t.Errorf("GET /healthz: expected a status field, got: %s", body)
+	}
+}
+
+// ============================================================================
+// OBSERVE SERVICE TESTS
+// ============================================================================
+
+// TestObserveService_IngestQueryAndGetTrace is a round trip: spans go in, and
+// the same spans must come back out by trace id and through the service-name
+// filter. Ingest, QueryTraces and GetTrace used to be three tests that only
+// logged whatever the server returned.
+func TestObserveService_IngestQueryAndGetTrace(t *testing.T) {
+	client, cleanup := getObserveClient(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	traceID := fmt.Sprintf("itest-trace-%d", time.Now().UnixNano())
+	service := fmt.Sprintf("itest-svc-%d", time.Now().UnixNano())
+	start := timestamppb.Now()
+
+	spans := []*observev1.Span{
+		{
+			TraceId:     traceID,
+			SpanId:      "span-root",
+			Name:        "itest-root",
+			ServiceName: service,
+			StartTime:   start,
+			Duration:    durationpb.New(50 * time.Millisecond),
 		},
-	})
+		{
+			TraceId:      traceID,
+			SpanId:       "span-child",
+			ParentSpanId: "span-root",
+			Name:         "itest-child",
+			ServiceName:  service,
+			StartTime:    start,
+			Duration:     durationpb.New(20 * time.Millisecond),
+		},
+	}
+
+	ingestResp, err := client.IngestTraces(ctx, &observev1.IngestTracesRequest{Spans: spans})
 	if err != nil {
 		t.Fatalf("IngestTraces failed: %v", err)
 	}
-	t.Logf("Ingested %d spans", resp.AcceptedCount)
-}
+	if got := ingestResp.AcceptedCount; got != int32(len(spans)) {
+		t.Fatalf("IngestTraces accepted %d spans, sent %d", got, len(spans))
+	}
 
-func TestObserveService_QueryTraces(t *testing.T) {
-	client, cleanup := getObserveClient(t)
-	defer cleanup()
+	// GetTrace must return exactly what was ingested, assembled into one trace.
+	getResp, err := client.GetTrace(ctx, &observev1.GetTraceRequest{TraceId: traceID})
+	if err != nil {
+		t.Fatalf("GetTrace(%s) failed after ingesting it: %v", traceID, err)
+	}
+	if getResp.Trace == nil {
+		t.Fatalf("GetTrace(%s) returned no trace after ingesting 2 spans", traceID)
+	}
+	if getResp.Trace.TraceId != traceID {
+		t.Errorf("GetTrace returned trace %q, want %q", getResp.Trace.TraceId, traceID)
+	}
+	if got := len(getResp.Trace.Spans); got != len(spans) {
+		t.Errorf("GetTrace returned %d spans, want %d", got, len(spans))
+	}
+	names := map[string]bool{}
+	for _, s := range getResp.Trace.Spans {
+		names[s.Name] = true
+		if s.TraceId != traceID {
+			t.Errorf("span %s carries trace id %q, want %q", s.SpanId, s.TraceId, traceID)
+		}
+	}
+	for _, want := range []string{"itest-root", "itest-child"} {
+		if !names[want] {
+			t.Errorf("GetTrace did not return the %q span", want)
+		}
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	resp, err := client.QueryTraces(ctx, &observev1.QueryTracesRequest{
-		Limit: 10,
+	// The service-name filter must be honoured, not ignored.
+	queryResp, err := client.QueryTraces(ctx, &observev1.QueryTracesRequest{
+		ServiceName: service,
+		Limit:       50,
 	})
 	if err != nil {
 		t.Fatalf("QueryTraces failed: %v", err)
 	}
-	t.Logf("Found %d traces", len(resp.Traces))
+	found := false
+	for _, tr := range queryResp.Traces {
+		if tr.TraceId == traceID {
+			found = true
+		}
+		for _, s := range tr.Spans {
+			if s.ServiceName != "" && s.ServiceName != service {
+				t.Errorf("QueryTraces(service=%q) returned a span from service %q",
+					service, s.ServiceName)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("QueryTraces(service=%q) did not return the trace just ingested (%s); got %d traces",
+			service, traceID, len(queryResp.Traces))
+	}
 }
 
-func TestObserveService_GetTrace(t *testing.T) {
+// TestObserveService_GetTrace_NotFound pins the error for an unknown trace id.
+func TestObserveService_GetTrace_NotFound(t *testing.T) {
 	client, cleanup := getObserveClient(t)
 	defer cleanup()
 
@@ -95,17 +234,25 @@ func TestObserveService_GetTrace(t *testing.T) {
 	defer cancel()
 
 	resp, err := client.GetTrace(ctx, &observev1.GetTraceRequest{
-		TraceId: "test-trace-123",
+		TraceId: fmt.Sprintf("no-such-trace-%d", time.Now().UnixNano()),
 	})
-	if err != nil {
-		t.Logf("GetTrace: %v (trace may not exist)", err)
+	if err == nil {
+		if resp.GetTrace() != nil {
+			t.Fatalf("expected no trace for an unknown id, got %+v", resp.GetTrace())
+		}
 		return
 	}
-	if resp.Trace != nil {
-		t.Logf("Got trace: %s with %d spans", resp.Trace.TraceId, len(resp.Trace.Spans))
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected a gRPC status error, got %v", err)
+	}
+	if st.Code() != codes.NotFound {
+		t.Errorf("expected NOT_FOUND for an unknown trace id, got %s: %s", st.Code(), st.Message())
 	}
 }
 
+// TestObserveService_QueryMetrics asserts the returned series respects the
+// requested time window, rather than just that the call did not error.
 func TestObserveService_QueryMetrics(t *testing.T) {
 	client, cleanup := getObserveClient(t)
 	defer cleanup()
@@ -113,16 +260,28 @@ func TestObserveService_QueryMetrics(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	start := time.Now().Add(-time.Hour)
+	end := time.Now()
+
 	resp, err := client.QueryMetrics(ctx, &observev1.QueryMetricsRequest{
 		MetricName: "request_count",
-		StartTime:  timestamppb.New(time.Now().Add(-time.Hour)),
-		EndTime:    timestamppb.Now(),
+		StartTime:  timestamppb.New(start),
+		EndTime:    timestamppb.New(end),
 	})
 	if err != nil {
 		t.Fatalf("QueryMetrics failed: %v", err)
 	}
-	t.Logf("QueryMetrics returned successfully")
-	_ = resp
+	for i, dp := range resp.DataPoints {
+		if dp.Timestamp == nil {
+			t.Errorf("data point %d has no timestamp", i)
+			continue
+		}
+		ts := dp.Timestamp.AsTime()
+		if ts.Before(start.Add(-time.Minute)) || ts.After(end.Add(time.Minute)) {
+			t.Errorf("data point %d at %s falls outside the requested window [%s, %s]",
+				i, ts, start, end)
+		}
+	}
 }
 
 // ============================================================================
@@ -149,7 +308,14 @@ func TestGateway_Healthz(t *testing.T) {
 	if health.Status == "" {
 		t.Errorf("expected a status field, got: %s", body)
 	}
-	t.Logf("Gateway health: status=%s providers=%d", health.Status, health.Providers)
+
+	// The provider count must agree with what /v1/models advertises: zero
+	// providers means zero models, and vice versa.
+	list := listGatewayModels(t, ctx)
+	if (health.Providers == 0) != (len(list.Data) == 0) {
+		t.Errorf("/healthz reports %d providers but /v1/models returns %d models",
+			health.Providers, len(list.Data))
+	}
 }
 
 func TestGateway_ListModels(t *testing.T) {
@@ -160,8 +326,15 @@ func TestGateway_ListModels(t *testing.T) {
 	if list.Object != "list" {
 		t.Errorf("expected object=list, got %q", list.Object)
 	}
-	t.Logf("Gateway serves %d models", len(list.Data))
+	seen := map[string]bool{}
 	for _, m := range list.Data {
+		if m.ID == "" {
+			t.Error("model entry with an empty id")
+		}
+		if seen[m.ID] {
+			t.Errorf("model %s advertised more than once", m.ID)
+		}
+		seen[m.ID] = true
 		if m.Object != "model" {
 			t.Errorf("model %s: expected object=model, got %q", m.ID, m.Object)
 		}
@@ -171,46 +344,65 @@ func TestGateway_ListModels(t *testing.T) {
 	}
 }
 
+// TestGateway_GetModel asserts the single-model endpoint's own contract: a
+// known id round-trips with a complete model object, and an unknown id is a 404
+// carrying the OpenAI-style model_not_found envelope.
 func TestGateway_GetModel(t *testing.T) {
 	g := newGatewayClient(15 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	list := listGatewayModels(t, ctx)
-	if len(list.Data) == 0 {
-		t.Skip("gateway has no models configured - skipping model lookup")
+	if len(list.Data) > 0 {
+		want := list.Data[0]
+		code, body, err := g.get(ctx, "/v1/models/"+want.ID)
+		if err != nil {
+			t.Fatalf("GET /v1/models/%s failed: %v", want.ID, err)
+		}
+		if code != http.StatusOK {
+			t.Fatalf("GET /v1/models/%s: expected 200, got %d: %s", want.ID, code, body)
+		}
+		var got gwModel
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("invalid JSON: %v (body: %s)", err, body)
+		}
+		if got.ID != want.ID {
+			t.Errorf("expected model id %q, got %q", want.ID, got.ID)
+		}
+		if got.Object != "model" {
+			t.Errorf("expected object=model, got %q", got.Object)
+		}
+		if got.OwnedBy == "" {
+			t.Errorf("expected owned_by to name the provider, got an empty string")
+		}
+		if got.Created <= 0 {
+			t.Errorf("expected a positive created timestamp, got %d", got.Created)
+		}
 	}
 
-	want := list.Data[0]
-	status, body, err := g.get(ctx, "/v1/models/"+want.ID)
+	// Unknown model: 404 with the OpenAI error envelope. This holds whether or
+	// not any provider is configured.
+	unknown := fmt.Sprintf("no-such-model-%d", time.Now().UnixNano())
+	code, body, err := g.get(ctx, "/v1/models/"+unknown)
 	if err != nil {
-		t.Fatalf("GET /v1/models/%s failed: %v", want.ID, err)
+		t.Fatalf("GET /v1/models/%s failed: %v", unknown, err)
 	}
-	if status != http.StatusOK {
-		t.Fatalf("GET /v1/models/%s: expected 200, got %d: %s", want.ID, status, body)
+	if code != http.StatusNotFound {
+		t.Fatalf("GET /v1/models/%s: expected 404, got %d: %s", unknown, code, body)
 	}
-
-	var got gwModel
-	if err := json.Unmarshal(body, &got); err != nil {
-		t.Fatalf("invalid JSON: %v (body: %s)", err, body)
+	if env := decodeGatewayError(t, body); env.Error.Code != "model_not_found" {
+		t.Errorf("expected code model_not_found, got %q", env.Error.Code)
 	}
-	if got.ID != want.ID {
-		t.Errorf("expected model id %q, got %q", want.ID, got.ID)
-	}
-	t.Logf("Model %s owned by %s", got.ID, got.OwnedBy)
 }
 
 func TestGateway_ChatCompletions(t *testing.T) {
-	model := anyGatewayModel(t)
-	if model == "" {
-		t.Skip("gateway has no models configured - skipping chat completion")
-	}
+	model := requireGatewayModel(t)
 
 	g := newGatewayClient(90 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	status, body, err := g.postJSON(ctx, "/v1/chat/completions", gwChatRequest{
+	code, body, err := g.postJSON(ctx, "/v1/chat/completions", gwChatRequest{
 		Model:     model,
 		Messages:  []gwChatMessage{{Role: "user", Content: "Say hello"}},
 		MaxTokens: 10,
@@ -218,16 +410,17 @@ func TestGateway_ChatCompletions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /v1/chat/completions failed: %v", err)
 	}
-	if status != http.StatusOK {
-		// A provider-side failure (missing credentials, model not pulled) is
-		// not a gateway contract violation - report it and move on.
-		t.Logf("chat completion returned %d: %s (expected without provider credentials)", status, body)
-		return
+	if code != http.StatusOK {
+		t.Fatalf("POST /v1/chat/completions with configured model %q: expected 200, got %d: %s",
+			model, code, body)
 	}
 
 	var resp gwChatResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		t.Fatalf("invalid JSON: %v (body: %s)", err, body)
+	}
+	if resp.ID == "" {
+		t.Error("expected a completion id")
 	}
 	if resp.Object != "chat.completion" {
 		t.Errorf("expected object=chat.completion, got %q", resp.Object)
@@ -236,21 +429,28 @@ func TestGateway_ChatCompletions(t *testing.T) {
 		t.Fatalf("expected at least one choice, got: %s", body)
 	}
 	if resp.Choices[0].Message == nil || resp.Choices[0].Message.Role != "assistant" {
-		t.Errorf("expected an assistant message, got: %s", body)
+		t.Fatalf("expected an assistant message, got: %s", body)
 	}
-	t.Logf("Chat completion (%s): %s", resp.Model, resp.content())
-	if resp.Usage != nil {
-		t.Logf("Usage: prompt=%d completion=%d total=%d cost_usd=%f",
-			resp.Usage.PromptTokens, resp.Usage.CompletionTokens,
-			resp.Usage.TotalTokens, resp.Usage.CostUSD)
+	if strings.TrimSpace(resp.content()) == "" {
+		t.Error("expected non-empty assistant content")
+	}
+	if resp.Choices[0].FinishReason == nil || *resp.Choices[0].FinishReason == "" {
+		t.Error("expected a finish_reason on the completed choice")
+	}
+	if resp.Usage == nil {
+		t.Fatal("expected usage accounting on a non-streaming completion")
+	}
+	if resp.Usage.PromptTokens <= 0 || resp.Usage.CompletionTokens <= 0 {
+		t.Errorf("expected non-zero prompt and completion tokens, got prompt=%d completion=%d",
+			resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	}
+	if want := resp.Usage.PromptTokens + resp.Usage.CompletionTokens; resp.Usage.TotalTokens != want {
+		t.Errorf("total_tokens=%d does not equal prompt+completion=%d", resp.Usage.TotalTokens, want)
 	}
 }
 
 func TestGateway_ChatCompletions_Stream(t *testing.T) {
-	model := anyGatewayModel(t)
-	if model == "" {
-		t.Skip("gateway has no models configured - skipping streaming chat completion")
-	}
+	model := requireGatewayModel(t)
 
 	g := newGatewayClient(90 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -268,40 +468,47 @@ func TestGateway_ChatCompletions_Stream(t *testing.T) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Logf("streaming chat completion returned %d (expected without provider credentials)", resp.StatusCode)
-		return
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("streaming completion with configured model %q: expected 200, got %d: %s",
+			model, resp.StatusCode, body)
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		t.Errorf("expected text/event-stream, got %q", ct)
 	}
 
 	content, chunks, done := readSSEChatStream(t, resp)
-	t.Logf("Received %d SSE chunks, done=%v, content=%q", chunks, done, content)
 	if chunks == 0 {
 		t.Error("expected at least one SSE chunk")
+	}
+	if !done {
+		t.Error("expected the stream to terminate with the [DONE] sentinel")
+	}
+	if strings.TrimSpace(content) == "" {
+		t.Errorf("expected the streamed deltas to carry content, got %q", content)
 	}
 }
 
 func TestGateway_Embeddings(t *testing.T) {
 	model := gatewayEmbeddingModel(t)
 	if model == "" {
-		t.Skip("no embedding-capable model advertised by the gateway")
+		t.Skip("no embedding-capable model advertised by the gateway - " +
+			"configure an embedding provider to exercise /v1/embeddings")
 	}
 
 	g := newGatewayClient(60 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	status, body, err := g.postJSON(ctx, "/v1/embeddings", gwEmbeddingsRequest{
+	code, body, err := g.postJSON(ctx, "/v1/embeddings", gwEmbeddingsRequest{
 		Model: model,
 		Input: "hello world",
 	})
 	if err != nil {
 		t.Fatalf("POST /v1/embeddings failed: %v", err)
 	}
-	if status != http.StatusOK {
-		t.Logf("embeddings returned %d: %s (expected without provider credentials)", status, body)
-		return
+	if code != http.StatusOK {
+		t.Fatalf("POST /v1/embeddings with advertised model %q: expected 200, got %d: %s",
+			model, code, body)
 	}
 
 	var resp gwEmbeddingsResponse
@@ -317,29 +524,15 @@ func TestGateway_Embeddings(t *testing.T) {
 	if len(resp.Data[0].Embedding) == 0 {
 		t.Error("expected a non-empty embedding vector")
 	}
-	t.Logf("Embedding (%s): %d dimensions", resp.Model, len(resp.Data[0].Embedding))
+	if resp.Data[0].Object != "embedding" {
+		t.Errorf("expected object=embedding on the data entry, got %q", resp.Data[0].Object)
+	}
+	if resp.Usage.PromptTokens <= 0 {
+		t.Errorf("expected prompt token accounting, got %d", resp.Usage.PromptTokens)
+	}
 }
 
 // ---- gateway test helpers ----
-
-// anyGatewayModel returns a model the gateway can serve, preferring a local
-// Ollama model so the test does not depend on cloud credentials.
-func anyGatewayModel(t *testing.T) string {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	list := listGatewayModels(t, ctx)
-	for _, m := range list.Data {
-		if m.OwnedBy == ollamaProvider {
-			return m.ID
-		}
-	}
-	if len(list.Data) > 0 {
-		return list.Data[0].ID
-	}
-	return ""
-}
 
 // gatewayEmbeddingModel returns a model that looks like an embedding model.
 func gatewayEmbeddingModel(t *testing.T) string {
@@ -349,8 +542,7 @@ func gatewayEmbeddingModel(t *testing.T) string {
 
 	list := listGatewayModels(t, ctx)
 	for _, m := range list.Data {
-		id := strings.ToLower(m.ID)
-		if strings.Contains(id, "embed") {
+		if strings.Contains(strings.ToLower(m.ID), "embed") {
 			return m.ID
 		}
 	}
@@ -394,320 +586,9 @@ func readSSEChatStream(t *testing.T, resp *http.Response) (string, int, bool) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		t.Logf("SSE read stopped: %v", err)
+		t.Errorf("SSE stream ended with a read error: %v", err)
 	}
 	return content.String(), chunks, done
-}
-
-// ============================================================================
-// PROMPT SERVICE TESTS (8 endpoints) - Health test
-// ============================================================================
-
-func TestPromptService_Health(t *testing.T) {
-	client, cleanup := getPromptClient(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	resp, err := client.Health(ctx, &promptv1.HealthRequest{})
-	if err != nil {
-		t.Fatalf("Health failed: %v", err)
-	}
-	t.Logf("Prompt health: %s", resp.Status)
-}
-
-// ============================================================================
-// DATASETS SERVICE TESTS (10 endpoints)
-// ============================================================================
-
-func TestDatasetsService_Health(t *testing.T) {
-	client, cleanup := getDatasetsClient(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	resp, err := client.Health(ctx, &datasetsv1.HealthRequest{})
-	if err != nil {
-		t.Fatalf("Health failed: %v", err)
-	}
-	t.Logf("Datasets health: %s", resp.Status)
-}
-
-func TestDatasetsService_FullCRUD(t *testing.T) {
-	client, cleanup := getDatasetsClient(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// 1. CreateDataset
-	createResp, err := client.CreateDataset(ctx, &datasetsv1.CreateDatasetRequest{
-		Name:        "CRUD Test Dataset",
-		Description: "Testing all CRUD operations",
-		Tags:        []string{"crud-test"},
-	})
-	if err != nil {
-		t.Fatalf("CreateDataset failed: %v", err)
-	}
-	datasetID := createResp.Dataset.Id
-	t.Logf("1. Created dataset: %s", datasetID)
-
-	defer func() {
-		client.DeleteDataset(ctx, &datasetsv1.DeleteDatasetRequest{Id: datasetID})
-	}()
-
-	// 2. GetDataset
-	getResp, err := client.GetDataset(ctx, &datasetsv1.GetDatasetRequest{Id: datasetID})
-	if err != nil {
-		t.Fatalf("GetDataset failed: %v", err)
-	}
-	t.Logf("2. Got dataset: %s", getResp.Dataset.Name)
-
-	// 3. UpdateDataset
-	updateResp, err := client.UpdateDataset(ctx, &datasetsv1.UpdateDatasetRequest{
-		Id:          datasetID,
-		Description: "Updated description",
-	})
-	if err != nil {
-		t.Fatalf("UpdateDataset failed: %v", err)
-	}
-	t.Logf("3. Updated dataset: %s", updateResp.Dataset.Description)
-
-	// 4. ListDatasets
-	listResp, err := client.ListDatasets(ctx, &datasetsv1.ListDatasetsRequest{
-		Tags:  []string{"crud-test"},
-		Limit: 10,
-	})
-	if err != nil {
-		t.Fatalf("ListDatasets failed: %v", err)
-	}
-	t.Logf("4. Listed %d datasets", len(listResp.Datasets))
-
-	// 5. AddExamples
-	addResp, err := client.AddExamples(ctx, &datasetsv1.AddExamplesRequest{
-		DatasetId: datasetID,
-		Examples: []*datasetsv1.ExampleInput{
-			{
-				Input:          toStruct(t, map[string]interface{}{"q": "What is 2+2?"}),
-				ExpectedOutput: toStruct(t, map[string]interface{}{"a": "4"}),
-			},
-			{
-				Input:          toStruct(t, map[string]interface{}{"q": "What is 3+3?"}),
-				ExpectedOutput: toStruct(t, map[string]interface{}{"a": "6"}),
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("AddExamples failed: %v", err)
-	}
-	t.Logf("5. Added %d examples", addResp.AddedCount)
-
-	// 6. GetExamples
-	getExResp, err := client.GetExamples(ctx, &datasetsv1.GetExamplesRequest{
-		DatasetId: datasetID,
-		Limit:     10,
-	})
-	if err != nil {
-		t.Fatalf("GetExamples failed: %v", err)
-	}
-	t.Logf("6. Got %d examples (total: %d)", len(getExResp.Examples), getExResp.TotalCount)
-
-	// 7. RemoveExamples
-	if len(getExResp.Examples) > 0 {
-		removeResp, err := client.RemoveExamples(ctx, &datasetsv1.RemoveExamplesRequest{
-			DatasetId:  datasetID,
-			ExampleIds: []string{getExResp.Examples[0].Id},
-		})
-		if err != nil {
-			t.Fatalf("RemoveExamples failed: %v", err)
-		}
-		t.Logf("7. Removed %d examples", removeResp.RemovedCount)
-	}
-
-	// 8. GenerateExamples (may require LLM)
-	genResp, err := client.GenerateExamples(ctx, &datasetsv1.GenerateExamplesRequest{
-		DatasetId: datasetID,
-		Count:     2,
-	})
-	if err != nil {
-		t.Logf("8. GenerateExamples: %v (may require LLM)", err)
-	} else {
-		t.Logf("8. Generated %d examples", genResp.GeneratedCount)
-	}
-
-	// 9. DeleteDataset (in defer)
-	t.Logf("9. DeleteDataset will run in defer")
-}
-
-// ============================================================================
-// EVAL SERVICE TESTS (8 endpoints)
-// ============================================================================
-
-func TestEvalService_Health(t *testing.T) {
-	client, cleanup := getEvalClient(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	resp, err := client.Health(ctx, &evalv1.HealthRequest{})
-	if err != nil {
-		t.Fatalf("Health failed: %v", err)
-	}
-	t.Logf("Eval health: %s", resp.Status)
-}
-
-func TestEvalService_ListEvaluators(t *testing.T) {
-	client, cleanup := getEvalClient(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	resp, err := client.ListEvaluators(ctx, &evalv1.ListEvaluatorsRequest{})
-	if err != nil {
-		t.Fatalf("ListEvaluators failed: %v", err)
-	}
-	t.Logf("Found %d evaluators:", len(resp.Evaluators))
-	for _, e := range resp.Evaluators {
-		t.Logf("  %s: %s", e.Type, e.Name)
-	}
-}
-
-func TestEvalService_FullWorkflow(t *testing.T) {
-	evalClient, evalCleanup := getEvalClient(t)
-	defer evalCleanup()
-
-	promptClient, promptCleanup := getPromptClient(t)
-	defer promptCleanup()
-
-	datasetsClient, datasetsCleanup := getDatasetsClient(t)
-	defer datasetsCleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	// Create a prompt
-	promptResp, err := promptClient.CreatePrompt(ctx, &promptv1.CreatePromptRequest{
-		Name: "Eval Test Prompt",
-		Slug: "eval-test-" + time.Now().Format("150405"),
-		Messages: []*promptv1.PromptMessage{
-			{Role: "system", Content: "Echo back the input"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("CreatePrompt failed: %v", err)
-	}
-	promptID := promptResp.Prompt.Id
-	defer promptClient.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptID})
-	t.Logf("Created prompt: %s", promptID)
-
-	// Create a dataset
-	datasetResp, err := datasetsClient.CreateDataset(ctx, &datasetsv1.CreateDatasetRequest{
-		Name:     "Eval Test Dataset",
-		PromptId: promptID,
-	})
-	if err != nil {
-		t.Fatalf("CreateDataset failed: %v", err)
-	}
-	datasetID := datasetResp.Dataset.Id
-	defer datasetsClient.DeleteDataset(ctx, &datasetsv1.DeleteDatasetRequest{Id: datasetID})
-	t.Logf("Created dataset: %s", datasetID)
-
-	// Add examples
-	_, err = datasetsClient.AddExamples(ctx, &datasetsv1.AddExamplesRequest{
-		DatasetId: datasetID,
-		Examples: []*datasetsv1.ExampleInput{
-			{
-				Input:          toStruct(t, map[string]interface{}{"text": "hello"}),
-				ExpectedOutput: toStruct(t, map[string]interface{}{"text": "hello"}),
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("AddExamples failed: %v", err)
-	}
-
-	// 1. CreateEvalRun
-	createRunResp, err := evalClient.CreateEvalRun(ctx, &evalv1.CreateEvalRunRequest{
-		Name:          "Test Eval Run",
-		PromptId:      promptID,
-		PromptVersion: 1,
-		DatasetId:     datasetID,
-		Config: &evalv1.EvalConfig{
-			Evaluators: []*evalv1.EvaluatorConfig{
-				{Type: "exact_match", Weight: 1.0},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("CreateEvalRun failed: %v", err)
-	}
-	runID := createRunResp.EvalRun.Id
-	t.Logf("1. Created eval run: %s", runID)
-
-	// 2. GetEvalRun
-	getRunResp, err := evalClient.GetEvalRun(ctx, &evalv1.GetEvalRunRequest{Id: runID})
-	if err != nil {
-		t.Fatalf("GetEvalRun failed: %v", err)
-	}
-	t.Logf("2. Got eval run: status=%s", getRunResp.EvalRun.Status)
-
-	// 3. ListEvalRuns
-	listRunsResp, err := evalClient.ListEvalRuns(ctx, &evalv1.ListEvalRunsRequest{
-		PromptId: promptID,
-		Limit:    10,
-	})
-	if err != nil {
-		t.Fatalf("ListEvalRuns failed: %v", err)
-	}
-	t.Logf("3. Listed %d eval runs", len(listRunsResp.EvalRuns))
-
-	// 4. GetEvalResults
-	resultsResp, err := evalClient.GetEvalResults(ctx, &evalv1.GetEvalResultsRequest{
-		EvalRunId: runID,
-		Limit:     10,
-	})
-	if err != nil {
-		t.Fatalf("GetEvalResults failed: %v", err)
-	}
-	t.Logf("4. Got %d results", len(resultsResp.Results))
-
-	// 5. CancelEvalRun
-	_, err = evalClient.CancelEvalRun(ctx, &evalv1.CancelEvalRunRequest{Id: runID})
-	if err != nil {
-		t.Logf("5. CancelEvalRun: %v (may already be complete)", err)
-	} else {
-		t.Logf("5. Cancelled eval run")
-	}
-
-	// 6. CompareRuns - create another run first
-	createRun2Resp, err := evalClient.CreateEvalRun(ctx, &evalv1.CreateEvalRunRequest{
-		Name:          "Test Eval Run 2",
-		PromptId:      promptID,
-		PromptVersion: 1,
-		DatasetId:     datasetID,
-		Config: &evalv1.EvalConfig{
-			Evaluators: []*evalv1.EvaluatorConfig{
-				{Type: "exact_match", Weight: 1.0},
-			},
-		},
-	})
-	if err != nil {
-		t.Logf("6. CreateEvalRun 2: %v", err)
-	} else {
-		compareResp, err := evalClient.CompareRuns(ctx, &evalv1.CompareRunsRequest{
-			RunIdA: runID,
-			RunIdB: createRun2Resp.EvalRun.Id,
-		})
-		if err != nil {
-			t.Logf("6. CompareRuns: %v", err)
-		} else {
-			t.Logf("6. Compared runs: score_diff=%f, regressions=%d, improvements=%d", compareResp.ScoreDiff, compareResp.Regressions, compareResp.Improvements)
-		}
-	}
 }
 
 // ============================================================================
@@ -717,20 +598,6 @@ func TestEvalService_FullWorkflow(t *testing.T) {
 // Delos does not deploy anything. The deploy service holds quality gates and
 // answers one question: does the latest completed eval run for a prompt satisfy
 // this gate's conditions? CI systems act on the verdict.
-
-func TestDeployService_Health(t *testing.T) {
-	client, cleanup := getDeployClient(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	resp, err := client.Health(ctx, &deployv1.HealthRequest{})
-	if err != nil {
-		t.Fatalf("Health failed: %v", err)
-	}
-	t.Logf("Deploy health: %s", resp.Status)
-}
 
 // TestDeployService_GateLifecycle covers create -> list (unfiltered and
 // filtered) -> verdict for a prompt that has never been evaluated.
@@ -759,9 +626,8 @@ func TestDeployService_GateLifecycle(t *testing.T) {
 	}
 	promptID := promptResp.Prompt.Id
 	defer promptClient.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptID})
-	t.Logf("Created prompt: %s", promptID)
 
-	// 1. CreateQualityGate
+	// CreateQualityGate
 	gateName := fmt.Sprintf("gate-lifecycle-%d", timestamp)
 	createResp, err := deployClient.CreateQualityGate(ctx, &deployv1.CreateQualityGateRequest{
 		Name:        gateName,
@@ -793,9 +659,8 @@ func TestDeployService_GateLifecycle(t *testing.T) {
 	if got := len(gate.GetConditions()); got != 2 {
 		t.Errorf("expected 2 conditions on the created gate, got %d", got)
 	}
-	t.Logf("1. Created quality gate: %s (%s)", gate.GetName(), gate.GetId())
 
-	// 2. ListQualityGates filtered by prompt - must contain exactly our gate.
+	// ListQualityGates filtered by prompt - must contain exactly our gate.
 	filtered, err := deployClient.ListQualityGates(ctx, &deployv1.ListQualityGatesRequest{
 		PromptId: promptID,
 	})
@@ -814,9 +679,8 @@ func TestDeployService_GateLifecycle(t *testing.T) {
 	if !found {
 		t.Errorf("gate %q not returned by ListQualityGates(prompt_id=%s)", gateName, promptID)
 	}
-	t.Logf("2. Listed %d gate(s) for prompt %s", len(filtered.QualityGates), promptID)
 
-	// 3. ListQualityGates without a filter - must be a superset.
+	// ListQualityGates without a filter - must be a superset.
 	all, err := deployClient.ListQualityGates(ctx, &deployv1.ListQualityGatesRequest{})
 	if err != nil {
 		t.Fatalf("ListQualityGates (unfiltered) failed: %v", err)
@@ -835,9 +699,8 @@ func TestDeployService_GateLifecycle(t *testing.T) {
 	if !foundInAll {
 		t.Errorf("gate %q not returned by an unfiltered ListQualityGates", gateName)
 	}
-	t.Logf("3. Listed %d gate(s) overall", len(all.QualityGates))
 
-	// 4. GetGateVerdict with no eval runs: not a pass, and the reason says why.
+	// GetGateVerdict with no eval runs: not a pass, and the reason says why.
 	verdict, err := deployClient.GetGateVerdict(ctx, &deployv1.GetGateVerdictRequest{Name: gateName})
 	if err != nil {
 		t.Fatalf("GetGateVerdict failed: %v", err)
@@ -858,7 +721,6 @@ func TestDeployService_GateLifecycle(t *testing.T) {
 	if verdict.Gate.GetName() != gateName {
 		t.Errorf("verdict echoed gate %q, want %q", verdict.Gate.GetName(), gateName)
 	}
-	t.Logf("4. Verdict for a never-evaluated prompt: pass=%v reasons=%v", verdict.Pass, verdict.Reasons)
 }
 
 // TestDeployService_CreateQualityGate_Validation rejects gates that cannot be
@@ -1013,7 +875,6 @@ func TestDeployService_VerdictHTTP(t *testing.T) {
 	if verdict.EvaluatedAt == "" {
 		t.Error("expected evaluated_at in the verdict body")
 	}
-	t.Logf("HTTP verdict: pass=%v reasons=%v", verdict.Pass, verdict.Reasons)
 
 	// Unknown gate: 404 with a JSON error body.
 	code, body = getJSON(t, ctx, httpClient,
@@ -1043,6 +904,9 @@ func getJSON(t *testing.T, ctx context.Context, c *http.Client, url string) (int
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		t.Fatalf("failed to build request for %s: %v", url, err)
+	}
+	if token := controlPlaneToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := c.Do(req)
 	if err != nil {

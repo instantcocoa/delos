@@ -4,7 +4,9 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,6 +27,17 @@ var (
 func ensureCLIBinary(t *testing.T) string {
 	t.Helper()
 	cliBinaryOnce.Do(func() {
+		// An explicitly supplied binary wins, so CI can test exactly the
+		// artifact it built.
+		if b := os.Getenv("DELOS_CLI_BINARY"); b != "" {
+			if _, err := os.Stat(b); err != nil {
+				cliBuildErr = err
+				return
+			}
+			cliBinary = b
+			return
+		}
+
 		projectRoot := filepath.Join("..", "..")
 
 		// Look for existing binary in bin/ first
@@ -94,6 +107,32 @@ func mustRunCLI(t *testing.T, args ...string) string {
 	return stdout
 }
 
+// exitCode returns the process exit status behind a runCLI error. It reports
+// -1 when the command failed for a reason other than a non-zero exit (the
+// binary could not be started, for example), which no test should accept as a
+// stand-in for a clean failure.
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
+}
+
+// requireTableHeaders fails unless every header appears in the command output.
+// An empty result still prints its header row, so this holds against empty state.
+func requireTableHeaders(t *testing.T, what, output string, headers ...string) {
+	t.Helper()
+	for _, h := range headers {
+		if !strings.Contains(output, h) {
+			t.Errorf("%s: expected the %q column in the table output, got:\n%s", what, h, output)
+		}
+	}
+}
+
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -136,10 +175,14 @@ func TestCLI_Help(t *testing.T) {
 // ============================================================================
 
 func TestCLI_Prompt_List(t *testing.T) {
+	slug := fmt.Sprintf("cli-list-prompt-%d", time.Now().UnixNano())
+	mustRunCLI(t, "prompt", "create", "CLI List Prompt", "--slug", slug, "--system", "Test prompt")
+	defer runCLI(t, "prompt", "delete", slug)
+
 	stdout := mustRunCLI(t, "prompt", "list")
-	// Should output table headers or empty result
-	if !strings.Contains(stdout, "ID") && !strings.Contains(stdout, "NAME") && stdout != "" {
-		t.Logf("Prompt list output: %s", stdout)
+	requireTableHeaders(t, "prompt list", stdout, "ID", "NAME", "SLUG", "VERSION", "UPDATED")
+	if !strings.Contains(stdout, slug) {
+		t.Errorf("prompt list omitted the prompt just created (%s), got:\n%s", slug, stdout)
 	}
 }
 
@@ -186,7 +229,6 @@ func TestCLI_Prompt_CRUD(t *testing.T) {
 	if promptID == "" {
 		t.Fatal("Could not find created prompt")
 	}
-	t.Logf("Created prompt ID: %s", promptID)
 
 	// Get
 	getOut := mustRunCLI(t, "prompt", "get", promptID, "-o", "json")
@@ -206,10 +248,18 @@ func TestCLI_Prompt_CRUD(t *testing.T) {
 		t.Errorf("Expected 'Updated prompt' in output, got: %s", updateOut)
 	}
 
-	// History
+	// History: after one update the prompt has two versions, and both must be
+	// listed with the change description the update was saved under.
 	historyOut := mustRunCLI(t, "prompt", "history", promptID)
-	if !strings.Contains(historyOut, "VERSION") || !strings.Contains(historyOut, "v1") {
-		t.Logf("History output: %s", historyOut)
+	requireTableHeaders(t, "prompt history", historyOut,
+		"VERSION", "UPDATED BY", "UPDATED AT", "CHANGE DESCRIPTION")
+	for _, want := range []string{"v1", "v2"} {
+		if !strings.Contains(historyOut, want) {
+			t.Errorf("prompt history omitted %s, got:\n%s", want, historyOut)
+		}
+	}
+	if !strings.Contains(historyOut, "CLI test update") {
+		t.Errorf("prompt history omitted the change description of the update, got:\n%s", historyOut)
 	}
 
 	// Delete
@@ -218,18 +268,11 @@ func TestCLI_Prompt_CRUD(t *testing.T) {
 		t.Errorf("Expected 'Deleted prompt' in output, got: %s", deleteOut)
 	}
 
-	// Verify deleted - service uses soft delete, so prompt may still be retrievable
-	// but with a deleted status. Either null, error, or status=deleted is acceptable.
-	getStdout, _, _ := runCLI(t, "prompt", "get", promptID, "-o", "json")
-	if strings.TrimSpace(getStdout) != "null" && strings.TrimSpace(getStdout) != "" {
-		// Parse to check if it has deleted status
-		var deletedPrompt map[string]interface{}
-		if err := json.Unmarshal([]byte(getStdout), &deletedPrompt); err == nil {
-			// Status 4 = deleted (soft delete)
-			if status, ok := deletedPrompt["status"].(float64); ok && status == 4 {
-				t.Logf("Prompt soft-deleted with status=%v", status)
-			}
-		}
+	// Delete is a soft delete, so the prompt is still retrievable - but it must
+	// no longer show up in the default listing.
+	listAfter := mustRunCLI(t, "prompt", "list")
+	if strings.Contains(listAfter, slug) {
+		t.Errorf("a deleted prompt is still listed by `prompt list`: %s\n%s", slug, listAfter)
 	}
 }
 
@@ -239,7 +282,7 @@ func TestCLI_Prompt_CRUD(t *testing.T) {
 
 func TestCLI_Datasets_List(t *testing.T) {
 	stdout := mustRunCLI(t, "datasets", "list")
-	t.Logf("Datasets list output: %s", stdout)
+	requireTableHeaders(t, "datasets list", stdout, "ID", "NAME", "PROMPT", "EXAMPLES", "UPDATED")
 }
 
 func TestCLI_Datasets_List_JSON(t *testing.T) {
@@ -279,7 +322,6 @@ func TestCLI_Datasets_CRUD(t *testing.T) {
 	if datasetID == "" {
 		t.Fatal("Could not find created dataset")
 	}
-	t.Logf("Created dataset ID: %s", datasetID)
 
 	// Get
 	getOut := mustRunCLI(t, "datasets", "get", datasetID, "-o", "json")
@@ -304,7 +346,7 @@ func TestCLI_Datasets_CRUD(t *testing.T) {
 
 func TestCLI_Eval_List(t *testing.T) {
 	stdout := mustRunCLI(t, "eval", "list")
-	t.Logf("Eval list output: %s", stdout)
+	requireTableHeaders(t, "eval list", stdout, "ID", "NAME", "STATUS", "PROGRESS", "SCORE", "CREATED")
 }
 
 func TestCLI_Eval_Evaluators(t *testing.T) {
@@ -347,15 +389,23 @@ func TestCLI_Eval_Evaluators_JSON(t *testing.T) {
 // otherwise.
 
 func TestCLI_Gate_List(t *testing.T) {
-	// Works against empty state - an empty gate list is not an error.
+	// Works against empty state - an empty gate list is not an error, but it
+	// still prints its columns.
 	stdout := mustRunCLI(t, "gate", "list")
-	t.Logf("Gate list output: %s", stdout)
+	requireTableHeaders(t, "gate list", stdout, "NAME", "PROMPT", "CONDITIONS", "DESCRIPTION")
 }
 
+// TestCLI_Gate_List_DeployAlias pins the pre-refocus command name: `deploy list`
+// must still produce what `gate list` produces, not merely exit 0.
 func TestCLI_Gate_List_DeployAlias(t *testing.T) {
-	// The pre-refocus command name must keep working.
-	stdout := mustRunCLI(t, "deploy", "list")
-	t.Logf("Gate list via deploy alias: %s", stdout)
+	canonical := mustRunCLI(t, "gate", "list")
+	alias := mustRunCLI(t, "deploy", "list")
+
+	requireTableHeaders(t, "deploy list", alias, "NAME", "PROMPT", "CONDITIONS", "DESCRIPTION")
+	if alias != canonical {
+		t.Errorf("`deploy list` and `gate list` disagree:\ngate:\n%s\ndeploy:\n%s",
+			canonical, alias)
+	}
 }
 
 func TestCLI_Gate_Create_Validation(t *testing.T) {
@@ -427,16 +477,21 @@ func TestCLI_Gate_Create_And_List(t *testing.T) {
 	defer runCLI(t, "prompt", "delete", promptID)
 
 	gateName := fmt.Sprintf("cli-gate-%d", timestamp)
-	stdout := mustRunCLI(t, "gate", "create", gateName,
+	mustRunCLI(t, "gate", "create", gateName,
 		"--prompt", promptID,
 		"--condition", "overall_score>=0.8",
 		"--condition", "avg_latency_ms<=5000")
-	t.Logf("Gate create output: %s", stdout)
 
-	// The new gate shows up in a prompt-filtered listing.
-	stdout = mustRunCLI(t, "gate", "list", "--prompt", promptID)
+	// The new gate shows up in a prompt-filtered listing, with the conditions
+	// it was created with.
+	stdout := mustRunCLI(t, "gate", "list", "--prompt", promptID)
 	if !strings.Contains(stdout, gateName) {
 		t.Errorf("expected gate %q in `gate list --prompt %s`, got: %s", gateName, promptID, stdout)
+	}
+	for _, want := range []string{"overall_score", "avg_latency_ms"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("expected condition %q in the gate listing, got: %s", want, stdout)
+		}
 	}
 }
 
@@ -448,9 +503,20 @@ func TestCLI_Gate_Check_NotFound(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected a non-zero exit for a missing gate, got stdout: %s", stdout)
 	}
-	// Either a NOT_FOUND from the control plane or a failing verdict exit(1)
-	// is acceptable here; what matters is that CI sees a non-zero status.
-	t.Logf("gate check for a missing gate exited non-zero: %v (stderr: %s)", err, stderr)
+	// Exit 1 specifically: a crash or a signal death also produces "an error",
+	// and CI must not read those as a clean gate failure.
+	if code := exitCode(err); code != 1 {
+		t.Errorf("expected exit status 1 for a missing gate, got %d (%v)", code, err)
+	}
+	// The operator has to be able to tell which gate CI was looking for.
+	if !strings.Contains(stdout+stderr, name) {
+		t.Errorf("expected the failure to name the gate %q, got stdout:%s stderr:%s",
+			name, stdout, stderr)
+	}
+	if !strings.Contains(strings.ToLower(stdout+stderr), "not found") {
+		t.Errorf("expected the failure to say the gate was not found, got stdout:%s stderr:%s",
+			stdout, stderr)
+	}
 }
 
 // ============================================================================
@@ -459,9 +525,17 @@ func TestCLI_Gate_Check_NotFound(t *testing.T) {
 
 func TestCLI_Gateway_Models(t *testing.T) {
 	stdout := mustRunCLI(t, "gateway", "models")
-	// Should list models (may be empty without provider keys)
-	if !strings.Contains(stdout, "ID") && !strings.Contains(stdout, "OWNED BY") {
-		t.Logf("Gateway models output: %s", stdout)
+	// The columns print even when no provider is configured.
+	requireTableHeaders(t, "gateway models", stdout, "ID", "OWNED BY")
+
+	// Whatever the CLI shows must match what the gateway serves.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, m := range listGatewayModels(t, ctx).Data {
+		if !strings.Contains(stdout, m.ID) {
+			t.Errorf("`gateway models` omitted %q, which GET /v1/models advertises:\n%s",
+				m.ID, stdout)
+		}
 	}
 }
 
@@ -478,23 +552,61 @@ func TestCLI_Gateway_Models_JSON(t *testing.T) {
 
 func TestCLI_Gateway_Health(t *testing.T) {
 	stdout := mustRunCLI(t, "gateway", "health")
-	t.Logf("Gateway health output: %s", stdout)
+
+	// The command reports the gateway it reached, its status, and how many
+	// providers are configured.
+	if !strings.Contains(stdout, getEnv("DELOS_GATEWAY_URL", "http://localhost:8080")) {
+		t.Errorf("expected the health output to name the gateway URL it probed, got: %s", stdout)
+	}
+	if strings.Contains(stdout, "unknown") {
+		t.Errorf("gateway health could not read a status from /healthz: %s", stdout)
+	}
+	if !strings.Contains(stdout, "Providers configured:") {
+		t.Errorf("expected the provider count in the health output, got: %s", stdout)
+	}
 }
 
+// TestCLI_Gateway_RuntimeAlias pins the pre-refocus command name: `runtime
+// health` must do what `gateway health` does, not merely exit 0.
 func TestCLI_Gateway_RuntimeAlias(t *testing.T) {
-	// The old `runtime` command name must keep working as an alias.
-	stdout := mustRunCLI(t, "runtime", "health")
-	t.Logf("Gateway health via runtime alias: %s", stdout)
+	canonical := mustRunCLI(t, "gateway", "health")
+	alias := mustRunCLI(t, "runtime", "health")
+	if alias != canonical {
+		t.Errorf("`runtime health` and `gateway health` disagree:\ngateway:\n%s\nruntime:\n%s",
+			canonical, alias)
+	}
 }
 
 func TestCLI_Gateway_Complete(t *testing.T) {
-	// This may fail if no providers are configured - that's expected
-	stdout, stderr, err := runCLI(t, "gateway", "complete", "Say hello", "--model", "gpt-4o-mini")
+	// Skips visibly when no provider is configured; otherwise the completion
+	// must actually succeed against a model the gateway really serves.
+	model := requireGatewayModel(t)
+
+	stdout, stderr, err := runCLI(t, "gateway", "complete", "Say hello", "--model", model)
 	if err != nil {
-		// Expected without API keys
-		t.Logf("Gateway complete (expected to fail without provider keys): %s %s", stdout, stderr)
-	} else {
-		t.Logf("Gateway complete output: %s", stdout)
+		t.Fatalf("`gateway complete --model %s` failed with exit %d: stdout:%s stderr:%s",
+			model, exitCode(err), stdout, stderr)
+	}
+	if strings.TrimSpace(stdout) == "" {
+		t.Errorf("expected the completion to print the model's reply, got empty stdout (stderr: %s)",
+			stderr)
+	}
+}
+
+// TestCLI_Gateway_Complete_UnknownModel pins the failure path: an unroutable
+// model is a non-zero exit that names the model.
+func TestCLI_Gateway_Complete_UnknownModel(t *testing.T) {
+	model := fmt.Sprintf("no-such-provider/no-such-model-%d", time.Now().UnixNano())
+	stdout, stderr, err := runCLI(t, "gateway", "complete", "Say hello", "--model", model)
+	if err == nil {
+		t.Fatalf("expected a non-zero exit for an unknown model, got stdout: %s", stdout)
+	}
+	if code := exitCode(err); code != 1 {
+		t.Errorf("expected exit status 1 for an unknown model, got %d (%v)", code, err)
+	}
+	if !strings.Contains(stdout+stderr, model) {
+		t.Errorf("expected the error to name the model %q, got stdout:%s stderr:%s",
+			model, stdout, stderr)
 	}
 }
 
@@ -504,7 +616,8 @@ func TestCLI_Gateway_Complete(t *testing.T) {
 
 func TestCLI_Observe_Traces(t *testing.T) {
 	stdout := mustRunCLI(t, "observe", "traces", "--limit", "5")
-	t.Logf("Observe traces output: %s", stdout)
+	requireTableHeaders(t, "observe traces", stdout,
+		"TRACE ID", "SERVICE", "OPERATION", "DURATION", "TIME")
 }
 
 func TestCLI_Observe_Traces_JSON(t *testing.T) {
@@ -571,29 +684,50 @@ func TestCLI_OutputFormats(t *testing.T) {
 // ============================================================================
 
 func TestCLI_InvalidCommand(t *testing.T) {
-	_, _, err := runCLI(t, "nonexistent")
+	stdout, stderr, err := runCLI(t, "nonexistent")
 	if err == nil {
-		t.Error("Expected error for invalid command")
+		t.Fatalf("Expected an error for an invalid command, got stdout: %s", stdout)
+	}
+	if code := exitCode(err); code != 1 {
+		t.Errorf("expected exit status 1 for an unknown command, got %d (%v)", code, err)
+	}
+	if !strings.Contains(stdout+stderr, "nonexistent") {
+		t.Errorf("expected the error to name the unknown command, got stdout:%s stderr:%s",
+			stdout, stderr)
 	}
 }
 
+// TestCLI_Prompt_Get_NotFound pins the scripting contract: asking for a prompt
+// that does not exist is a non-zero exit naming it, not a successful "null".
 func TestCLI_Prompt_Get_NotFound(t *testing.T) {
-	stdout, _, err := runCLI(t, "prompt", "get", "nonexistent-id-12345")
-	// CLI returns null for non-existent prompts (not an error)
-	if err != nil {
-		t.Logf("Got error (expected): %v", err)
-		return
+	ref := fmt.Sprintf("nonexistent-prompt-%d", time.Now().UnixNano())
+	stdout, stderr, err := runCLI(t, "prompt", "get", ref)
+	if err == nil {
+		t.Fatalf("expected a non-zero exit for a nonexistent prompt, got stdout: %s", stdout)
 	}
-	// If no error, should return null/empty
-	if strings.TrimSpace(stdout) != "null" && strings.TrimSpace(stdout) != "" {
-		t.Errorf("Expected null or empty for nonexistent prompt, got: %s", stdout)
+	if code := exitCode(err); code != 1 {
+		t.Errorf("expected exit status 1, got %d (%v)", code, err)
+	}
+	if !strings.Contains(strings.ToLower(stdout+stderr), "not found") {
+		t.Errorf("expected the error to say the prompt was not found, got stdout:%s stderr:%s",
+			stdout, stderr)
+	}
+	if !strings.Contains(stdout+stderr, ref) {
+		t.Errorf("expected the error to name %q, got stdout:%s stderr:%s", ref, stdout, stderr)
 	}
 }
 
 func TestCLI_Datasets_Get_NotFound(t *testing.T) {
-	_, stderr, err := runCLI(t, "datasets", "get", "nonexistent-id-12345")
+	id := fmt.Sprintf("nonexistent-dataset-%d", time.Now().UnixNano())
+	stdout, stderr, err := runCLI(t, "datasets", "get", id)
 	if err == nil {
-		t.Error("Expected error for nonexistent dataset")
+		t.Fatalf("expected a non-zero exit for a nonexistent dataset, got stdout: %s", stdout)
 	}
-	t.Logf("Error output: %s", stderr)
+	if code := exitCode(err); code != 1 {
+		t.Errorf("expected exit status 1, got %d (%v)", code, err)
+	}
+	if !strings.Contains(strings.ToLower(stdout+stderr), "not found") {
+		t.Errorf("expected the error to say the dataset was not found, got stdout:%s stderr:%s",
+			stdout, stderr)
+	}
 }

@@ -20,7 +20,7 @@ func bedrockTestProvider() *BedrockProvider {
 	return &BedrockProvider{
 		region:  "us-east-1",
 		models:  bedrockModels,
-		pricing: bedrockPricing,
+		pricing: bedrockPriceTable(),
 	}
 }
 
@@ -48,35 +48,94 @@ func TestBedrockProviderIdentity(t *testing.T) {
 }
 
 func TestBedrockPricingCoversEveryModel(t *testing.T) {
+	table := bedrockPriceTable()
 	for _, m := range bedrockModels {
-		if _, ok := bedrockPricing[m]; !ok {
+		if _, ok := table.Rate(m); !ok {
 			t.Errorf("model %q has no pricing entry", m)
 		}
-	}
-	if len(bedrockPricing) != len(bedrockModels) {
-		t.Errorf("pricing has %d entries, models has %d", len(bedrockPricing), len(bedrockModels))
+		// Cross-region inference profiles must price identically to the base
+		// model; in most regions they are the only way to reach it.
+		if _, ok := table.Rate("us." + m); !ok {
+			t.Errorf("cross-region profile us.%s has no pricing entry", m)
+		}
 	}
 }
 
 func TestBedrockCost(t *testing.T) {
 	p := bedrockTestProvider()
 	tests := []struct {
-		model  string
-		tokens int
-		want   float64
+		name  string
+		model string
+		usage Usage
+		want  float64
 	}{
-		{"anthropic.claude-sonnet-4-5-20250929-v1:0", 1000, 0.003},
-		{"anthropic.claude-haiku-4-5-20251001-v1:0", 2000, 0.002},
-		{"amazon.nova-lite-v1:0", 1000, 0.00006},
-		{"meta.llama3-3-70b-instruct-v1:0", 500, 0.00036},
-		{"amazon.titan-embed-text-v2:0", 1000, 0.00002},
-		{"totally-unknown-model", 1000, 0},
+		{
+			name:  "sonnet input and output priced separately",
+			model: "anthropic.claude-sonnet-4-5-20250929-v1:0",
+			usage: Usage{PromptTokens: 1000, CompletionTokens: 1000},
+			want:  (1000*3.00 + 1000*15.00) / 1e6,
+		},
+		{
+			name:  "cross-region inference profile prices as the base model",
+			model: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+			usage: Usage{PromptTokens: 1000, CompletionTokens: 1000},
+			want:  (1000*3.00 + 1000*15.00) / 1e6,
+		},
+		{
+			name:  "nova lite",
+			model: "amazon.nova-lite-v1:0",
+			usage: Usage{PromptTokens: 1000},
+			want:  0.06 / 1e3,
+		},
+		{
+			name:  "llama has a flat rate both directions",
+			model: "meta.llama3-3-70b-instruct-v1:0",
+			usage: Usage{PromptTokens: 250, CompletionTokens: 250},
+			want:  500 * 0.72 / 1e6,
+		},
+		{
+			name:  "titan embeddings",
+			model: "amazon.titan-embed-text-v2:0",
+			usage: Usage{PromptTokens: 1000},
+			want:  0.02 / 1e3,
+		},
+		{
+			name:  "unknown model bills zero",
+			model: "totally-unknown-model",
+			usage: Usage{PromptTokens: 1000, CompletionTokens: 1000},
+			want:  0,
+		},
 	}
 	for _, tc := range tests {
-		got := p.cost(tc.model, tc.tokens)
-		if math.Abs(got-tc.want) > 1e-9 {
-			t.Errorf("cost(%q, %d) = %v, want %v", tc.model, tc.tokens, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			got := p.pricing.Cost(tc.model, tc.usage)
+			if math.Abs(got-tc.want) > 1e-9 {
+				t.Errorf("Cost(%q) = %v, want %v", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
+// tool_choice "none" is legal on both gateway surfaces and the Converse API
+// has no equivalent, so it must suppress the tool configuration rather than
+// fail the request — previously it errored, and errored before the "no tools
+// declared" check, so even a request with no tools at all failed the whole
+// failover chain and surfaced as a 502.
+func TestBedrockToolChoiceNone(t *testing.T) {
+	cfg, err := bedrockToolConfig(nil, &ToolChoice{Mode: "none"})
+	if err != nil {
+		t.Fatalf("no tools + none: %v", err)
+	}
+	if cfg != nil {
+		t.Errorf("no tools + none produced %+v, want nil", cfg)
+	}
+
+	cfg, err = bedrockToolConfig([]Tool{{Name: "t"}}, &ToolChoice{Mode: "none"})
+	if err != nil {
+		t.Fatalf("tools + none: %v", err)
+	}
+	if cfg != nil {
+		t.Errorf("tools + none produced %+v, want nil (tools suppressed)", cfg)
 	}
 }
 
@@ -95,8 +154,9 @@ func TestBedrockUsage(t *testing.T) {
 	if got.PromptTokens != 400 || got.CompletionTokens != 600 || got.TotalTokens != 1000 {
 		t.Errorf("usage tokens = %+v", got)
 	}
-	if math.Abs(got.CostUSD-0.00006) > 1e-9 {
-		t.Errorf("usage cost = %v, want 0.00006", got.CostUSD)
+	// 400 input at $0.06/1M plus 600 output at $0.24/1M.
+	if want := (400*0.06 + 600*0.24) / 1e6; math.Abs(got.CostUSD-want) > 1e-12 {
+		t.Errorf("usage cost = %v, want %v", got.CostUSD, want)
 	}
 
 	// TotalTokens absent: derived from input + output.
@@ -396,9 +456,6 @@ func TestBedrockToolConfigChoiceModes(t *testing.T) {
 }
 
 func TestBedrockToolConfigUnsupported(t *testing.T) {
-	if _, err := bedrockToolConfig([]Tool{{Name: "t"}}, &ToolChoice{Mode: "none"}); err == nil {
-		t.Error(`expected unsupported error for tool_choice "none"`)
-	}
 	if _, err := bedrockToolConfig([]Tool{{Name: "t"}}, &ToolChoice{Mode: "tool"}); err == nil {
 		t.Error("expected error for tool choice without a name")
 	}

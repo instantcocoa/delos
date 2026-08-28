@@ -1,0 +1,54 @@
+{
+  "name": "openai: response_format json_schema keeps name, schema and strict",
+  "provider": "openai",
+  "surface": "openai",
+  "request": {
+    "model": "gpt-4o",
+    "messages": [
+      {
+        "role": "user",
+        "content": "How many moons does Mars have?"
+      }
+    ],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "moon_count",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "moons": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "moons"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_body_contains": [
+    "\"json_schema\"",
+    "\"name\":\"moon_count\"",
+    "\"strict\":true",
+    "\"additionalProperties\""
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"chatcmpl-RF2\",\"object\":\"chat.completion\",\"created\":1730000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"{\\\"moons\\\":2}\"},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":24,\"completion_tokens\":6,\"total_tokens\":30}}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "choices.0.message.content": "{\"moons\":2}",
+      "usage.total_tokens": 30
+    }
+  }
+}

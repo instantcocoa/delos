@@ -1,0 +1,33 @@
+{
+  "name": "openai: max_completion_tokens caps the request (still sent upstream as max_tokens - see the handover note)",
+  "provider": "openai",
+  "surface": "openai",
+  "request": {
+    "model": "gpt-4o",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ],
+    "max_completion_tokens": 16
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_body_contains": [
+    "\"max_tokens\":16"
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"chatcmpl-MCT1\",\"object\":\"chat.completion\",\"created\":1730000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello there!\"},\"logprobs\":null,\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":16,\"total_tokens\":27}}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "choices.0.finish_reason": "length",
+      "usage.completion_tokens": 16
+    }
+  }
+}

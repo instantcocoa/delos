@@ -21,7 +21,22 @@ type GeminiProvider struct {
 	baseURL    string
 	httpClient *http.Client
 	models     []string
-	pricing    map[string]float64 // model -> USD per 1K total tokens
+	pricing    *PriceTable
+}
+
+// geminiPricing is USD per 1M tokens from Google's published price list for
+// the Gemini API. Gemini 2.5 Pro is tiered by prompt length ($1.25/$10.00 up
+// to 200k tokens, $2.50/$15.00 above); the gateway bills the base tier, so
+// very long Pro prompts are under-billed and that is the one remaining known
+// gap in USD accounting.
+var geminiPricing = map[string]ModelRate{
+	"gemini-2.5-pro":        {Input: 1.25, Output: 10.00},
+	"gemini-2.5-flash":      {Input: 0.30, Output: 2.50},
+	"gemini-2.5-flash-lite": {Input: 0.10, Output: 0.40},
+	"gemini-2.0-flash":      {Input: 0.10, Output: 0.40},
+	"gemini-2.0-flash-lite": {Input: 0.075, Output: 0.30},
+	"gemini-embedding-001":  {Input: 0.15},
+	"text-embedding-004":    {Input: 0}, // free tier, priced explicitly so it is not "unpriced"
 }
 
 // GeminiOption configures the provider.
@@ -45,13 +60,8 @@ func NewGeminiProvider(apiKey string, opts ...GeminiOption) *GeminiProvider {
 			"gemini-2.0-flash",
 			"text-embedding-004",
 		},
-		pricing: map[string]float64{
-			"gemini-2.5-pro":        0.00125,
-			"gemini-2.5-flash":      0.0003,
-			"gemini-2.5-flash-lite": 0.0001,
-			"gemini-2.0-flash":      0.0001,
-			"text-embedding-004":    0.00001,
-		},
+		pricing: NewPriceTable("gemini", geminiPricing).
+			withNormalizer(func(model string) string { return strings.TrimPrefix(model, "models/") }),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -69,6 +79,23 @@ type geminiPart struct {
 	InlineData       *geminiInlineData       `json:"inline_data,omitempty"`
 	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
+}
+
+// MarshalJSON emits an empty text part as {"text":""} rather than {}.
+//
+// `{"role":"user","content":""}` is a legal message on both OpenAI and
+// Anthropic, and clients send it (a stub turn, a cleared textarea). With
+// `omitempty` alone the part serialized as `{"parts":[{}]}`, which Gemini
+// rejects with 400 INVALID_ARGUMENT. Parts that carry inline data or a
+// function call keep the omission, since "text" is not theirs to send.
+func (p geminiPart) MarshalJSON() ([]byte, error) {
+	type wire geminiPart // sheds this method
+	if p.InlineData != nil || p.FunctionCall != nil || p.FunctionResponse != nil {
+		return json.Marshal(wire(p))
+	}
+	return json.Marshal(struct {
+		Text string `json:"text"`
+	}{Text: p.Text})
 }
 
 type geminiInlineData struct {
@@ -147,43 +174,270 @@ type geminiResponse struct {
 
 // ---- schema scrubbing ----
 
-// geminiScrubSchema removes JSON Schema keywords the Gemini schema dialect
-// rejects outright ($schema, additionalProperties). Anything it cannot parse
-// is passed through untouched so the backend, not us, reports the problem.
+// Gemini's Schema type is a strict subset of OpenAPI 3.0, not JSON Schema.
+// These are the only keys it accepts; everything else is a 400.
+var geminiSchemaKeys = map[string]bool{
+	"type": true, "format": true, "title": true, "description": true,
+	"nullable": true, "enum": true, "maxItems": true, "minItems": true,
+	"properties": true, "required": true, "minProperties": true,
+	"maxProperties": true, "minLength": true, "maxLength": true,
+	"pattern": true, "example": true, "anyOf": true, "propertyOrdering": true,
+	"default": true, "items": true, "minimum": true, "maximum": true,
+}
+
+// geminiFormats lists the format values Gemini recognises per type. A format
+// it does not know (Pydantic emits "uuid", "email", "date") is rejected, so
+// unknown formats are dropped rather than forwarded.
+var geminiFormats = map[string]map[string]bool{
+	"string":  {"date-time": true, "enum": true},
+	"number":  {"float": true, "double": true},
+	"integer": {"int32": true, "int64": true},
+}
+
+// geminiMaxSchemaDepth bounds both nesting and $ref chasing, so a recursive
+// schema ($defs entry that references itself) terminates instead of hanging.
+const geminiMaxSchemaDepth = 32
+
+// geminiScrubSchema rewrites a JSON Schema into Gemini's dialect.
+//
+// The previous implementation deleted two keywords ($schema,
+// additionalProperties) and passed everything else through, so any
+// Pydantic-generated tool schema — which is $ref plus $defs, and typically
+// carries oneOf, const and exclusiveMinimum — was rejected with 400. It was
+// also position-blind: it matched map keys anywhere, so a schema with a
+// property genuinely named "additionalProperties" silently lost that field.
+//
+// This version works the other way round: resolve $ref against the document's
+// $defs, translate what has an equivalent (oneOf to anyOf, const to a
+// single-value enum, nullable unions to nullable), then keep only keys Gemini
+// documents. Keyword filtering happens at schema positions only; property
+// names are data and are never inspected. Anything that fails to parse as JSON
+// is returned untouched so the backend, not the gateway, reports the problem.
 func geminiScrubSchema(raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
 		return nil
 	}
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
+	var root any
+	if err := json.Unmarshal(raw, &root); err != nil {
 		return raw
 	}
-	out, err := json.Marshal(geminiScrubValue(v))
+	out, err := json.Marshal(geminiScrubNode(root, geminiCollectDefs(root), 0))
 	if err != nil {
 		return raw
 	}
 	return out
 }
 
-func geminiScrubValue(v any) any {
-	switch t := v.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(t))
-		for k, val := range t {
-			if k == "$schema" || k == "additionalProperties" {
-				continue
-			}
-			out[k] = geminiScrubValue(val)
+// geminiCollectDefs indexes the document's $defs/definitions by JSON-pointer
+// path ("$defs/Address"), which is how $ref names them.
+func geminiCollectDefs(root any) map[string]any {
+	obj, ok := root.(map[string]any)
+	if !ok {
+		return nil
+	}
+	defs := map[string]any{}
+	for _, container := range []string{"$defs", "definitions"} {
+		members, ok := obj[container].(map[string]any)
+		if !ok {
+			continue
 		}
-		return out
-	case []any:
-		for i := range t {
-			t[i] = geminiScrubValue(t[i])
+		for name, schema := range members {
+			defs[container+"/"+name] = schema
 		}
-		return t
-	default:
+	}
+	return defs
+}
+
+func geminiScrubNode(v any, defs map[string]any, depth int) any {
+	node, ok := v.(map[string]any)
+	if !ok {
 		return v
 	}
+	if depth > geminiMaxSchemaDepth {
+		return map[string]any{"type": "object"}
+	}
+	node = geminiNormalizeNode(node, defs, depth)
+
+	out := make(map[string]any, len(node))
+	for key, val := range node {
+		switch key {
+		case "properties":
+			props, ok := val.(map[string]any)
+			if !ok {
+				continue
+			}
+			scrubbed := make(map[string]any, len(props))
+			for name, sub := range props {
+				// Property names are data. A property called
+				// "additionalProperties" is a field, not a keyword.
+				scrubbed[name] = geminiScrubNode(sub, defs, depth+1)
+			}
+			out["properties"] = scrubbed
+		case "items":
+			out["items"] = geminiScrubNode(val, defs, depth+1)
+		case "anyOf":
+			members, ok := val.([]any)
+			if !ok {
+				continue
+			}
+			scrubbed := make([]any, 0, len(members))
+			for _, m := range members {
+				scrubbed = append(scrubbed, geminiScrubNode(m, defs, depth+1))
+			}
+			out["anyOf"] = scrubbed
+		case "format":
+			format, _ := val.(string)
+			typ, _ := node["type"].(string)
+			if geminiFormats[typ][format] {
+				out["format"] = val
+			}
+		default:
+			if geminiSchemaKeys[key] {
+				out[key] = val
+			}
+		}
+	}
+	return out
+}
+
+// geminiNormalizeNode returns a copy of node with $ref inlined and the
+// constructs Gemini lacks rewritten into ones it has. It never mutates node.
+func geminiNormalizeNode(node map[string]any, defs map[string]any, depth int) map[string]any {
+	out := make(map[string]any, len(node))
+	for k, v := range node {
+		out[k] = v
+	}
+
+	// $ref: inline the target, with sibling keys (description, default)
+	// overriding it. Chains are followed until they stop or hit the depth cap.
+	for hops := 0; hops <= geminiMaxSchemaDepth; hops++ {
+		ref, ok := out["$ref"].(string)
+		if !ok || !strings.HasPrefix(ref, "#/") {
+			break
+		}
+		target, ok := defs[strings.TrimPrefix(ref, "#/")].(map[string]any)
+		if !ok {
+			break
+		}
+		merged := make(map[string]any, len(target)+len(out))
+		for k, v := range target {
+			merged[k] = v
+		}
+		for k, v := range out {
+			if k != "$ref" {
+				merged[k] = v
+			}
+		}
+		out = merged
+	}
+	delete(out, "$ref")
+
+	// allOf: Gemini has no intersection type. Shallow-merge the members,
+	// letting the node's own keys win.
+	if members, ok := out["allOf"].([]any); ok {
+		merged := make(map[string]any)
+		for _, m := range members {
+			for k, v := range geminiNormalizeNode(asObject(m), defs, depth+1) {
+				merged[k] = v
+			}
+		}
+		for k, v := range out {
+			if k != "allOf" {
+				merged[k] = v
+			}
+		}
+		out = merged
+		delete(out, "allOf")
+	}
+
+	// oneOf is anyOf for schema-validation purposes here.
+	if _, has := out["anyOf"]; !has {
+		if members, ok := out["oneOf"].([]any); ok {
+			out["anyOf"] = members
+		}
+	}
+	delete(out, "oneOf")
+
+	// A nullable union — Pydantic's Optional[T] is anyOf:[T, {"type":"null"}]
+	// — becomes Gemini's nullable flag. {"type":"null"} on its own is not a
+	// type Gemini accepts.
+	if members, ok := out["anyOf"].([]any); ok {
+		kept := make([]any, 0, len(members))
+		nullable := false
+		for _, m := range members {
+			if typ, _ := asObject(m)["type"].(string); typ == "null" {
+				nullable = true
+				continue
+			}
+			kept = append(kept, m)
+		}
+		if nullable {
+			out["nullable"] = true
+		}
+		switch len(kept) {
+		case 0:
+			delete(out, "anyOf")
+		case 1:
+			// A single remaining branch is just that schema.
+			delete(out, "anyOf")
+			for k, v := range asObject(kept[0]) {
+				if _, taken := out[k]; !taken {
+					out[k] = v
+				}
+			}
+		default:
+			out["anyOf"] = kept
+		}
+	}
+
+	// type: ["string","null"] is the other spelling of the same thing.
+	if types, ok := out["type"].([]any); ok {
+		var concrete []string
+		for _, t := range types {
+			if name, _ := t.(string); name == "null" {
+				out["nullable"] = true
+			} else if name != "" {
+				concrete = append(concrete, name)
+			}
+		}
+		if len(concrete) == 1 {
+			out["type"] = concrete[0]
+		} else {
+			delete(out, "type")
+		}
+	}
+
+	// const X is an enum of one. Gemini enums are string-only, so a
+	// non-string const keeps its value as a default instead.
+	if v, ok := out["const"]; ok {
+		if str, isStr := v.(string); isStr {
+			if _, taken := out["enum"]; !taken {
+				out["enum"] = []any{str}
+			}
+			if _, taken := out["type"]; !taken {
+				out["type"] = "string"
+			}
+		} else if _, taken := out["default"]; !taken {
+			out["default"] = v
+		}
+		delete(out, "const")
+	}
+
+	// An object with properties but no declared type is an object.
+	if _, hasType := out["type"]; !hasType {
+		if _, hasProps := out["properties"]; hasProps {
+			out["type"] = "object"
+		}
+	}
+	return out
+}
+
+// asObject returns v as a JSON object, or an empty one.
+func asObject(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return map[string]any{}
 }
 
 // ---- request translation ----
@@ -314,6 +568,12 @@ func (p *GeminiProvider) buildRequest(params CompletionParams) (*geminiRequest, 
 	if err != nil {
 		return nil, err
 	}
+	// `"contents": null` is rejected outright, and a conversation that is
+	// nothing but system messages produces exactly that. Send an empty user
+	// turn instead, which is the closest legal request.
+	if len(contents) == 0 {
+		contents = []geminiContent{{Role: "user", Parts: []geminiPart{{Text: ""}}}}
+	}
 	req := &geminiRequest{Contents: contents, SystemInstruction: system}
 
 	if len(params.Tools) > 0 {
@@ -405,8 +665,16 @@ func (p *GeminiProvider) apiError(resp *http.Response) error {
 	return &ProviderError{Provider: "gemini", StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
 }
 
-func (p *GeminiProvider) cost(model string, totalTokens int) float64 {
-	return p.pricing[strings.TrimPrefix(model, "models/")] * float64(totalTokens) / 1000
+// usageFrom converts usage metadata, deriving the total when the backend
+// omits it and pricing input and output separately.
+func (p *GeminiProvider) usageFrom(model string, md geminiUsageMetadata) Usage {
+	u := Usage{
+		PromptTokens:     md.PromptTokenCount,
+		CompletionTokens: md.CandidatesTokenCount,
+		TotalTokens:      md.TotalTokenCount,
+	}.withDerivedTotals()
+	u.CostUSD = p.pricing.Cost(model, u)
+	return u
 }
 
 func geminiFinishReason(reason string) string {
@@ -486,12 +754,7 @@ func (p *GeminiProvider) Complete(ctx context.Context, params CompletionParams) 
 		Model:        model,
 	}
 	if out.UsageMetadata != nil {
-		result.Usage = Usage{
-			PromptTokens:     out.UsageMetadata.PromptTokenCount,
-			CompletionTokens: out.UsageMetadata.CandidatesTokenCount,
-			TotalTokens:      out.UsageMetadata.TotalTokenCount,
-			CostUSD:          p.cost(params.Model, out.UsageMetadata.TotalTokenCount),
-		}
+		result.Usage = p.usageFrom(params.Model, *out.UsageMetadata)
 	}
 	return result, nil
 }
@@ -545,12 +808,8 @@ func (p *GeminiProvider) CompleteStream(ctx context.Context, params CompletionPa
 				model = ev.ModelVersion
 			}
 			if ev.UsageMetadata != nil {
-				usage = &Usage{
-					PromptTokens:     ev.UsageMetadata.PromptTokenCount,
-					CompletionTokens: ev.UsageMetadata.CandidatesTokenCount,
-					TotalTokens:      ev.UsageMetadata.TotalTokenCount,
-					CostUSD:          p.cost(params.Model, ev.UsageMetadata.TotalTokenCount),
-				}
+				u := p.usageFrom(params.Model, *ev.UsageMetadata)
+				usage = &u
 			}
 			if len(ev.Candidates) == 0 {
 				continue

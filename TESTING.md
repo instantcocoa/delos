@@ -58,7 +58,13 @@ tests/integration/
 
 ### 1. Unit Tests (`make test-unit`)
 
-Fast tests that don't require external services. Run these for quick feedback during development. `make test` runs the same suite but starts Postgres and LocalStack first, so tests that need them don't self-skip.
+Fast tests that don't require external services. Run these for quick feedback during development.
+
+`make test` starts Postgres and LocalStack first. Note that database-backed
+tests target a `delos_test` database: if it does not exist they skip, and a
+skipped test still reports `ok`. To see what actually ran, use `go test -v`
+and look for `--- SKIP`. CI creates that database, so the database paths are
+exercised there even when they skip locally.
 
 ### 2. Integration Tests (`make test-integration`)
 

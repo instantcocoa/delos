@@ -112,9 +112,42 @@ func Run() error {
 		logger.Info("connected to postgres and applied migrations")
 	}
 
+	// ---- authentication and exposure ----
+	//
+	// The control plane serves prompt CRUD (including DELETE), gate verdicts,
+	// eval and deploy writes, and - when DELOS_TRACE_CONTENT is on - captured
+	// prompts and completions. None of that may be reachable without a token.
+	// The token is environment-only (DELOS_AUTH_TOKEN); delos.yaml is meant to
+	// be commit-safe and has no schema for secrets.
+	auth := grpcutil.NewTokenAuthenticator(cfg.AuthToken)
+
+	// With no token we bind loopback only, so an unauthenticated control
+	// plane can never be reached off-box by accident. DELOS_BIND overrides,
+	// and is the documented way to widen the bind once a token is set.
+	bind := config.ResolveBind(cfg.BindAddr, port, auth.Enabled())
+	switch {
+	case !auth.Enabled() && bind.Loopback && config.InContainer():
+		logger.Warn("NO CONTROL-PLANE AUTHENTICATION, AND THIS IS A CONTAINER: DELOS_AUTH_TOKEN is unset, "+
+			"so the control plane bound to loopback inside the container - nothing outside it, including a "+
+			"published port, can reach this process. Set DELOS_AUTH_TOKEN and DELOS_BIND=0.0.0.0.",
+			"bind", bind.String())
+	case !auth.Enabled() && bind.Loopback:
+		logger.Warn("NO CONTROL-PLANE AUTHENTICATION: DELOS_AUTH_TOKEN is unset, "+
+			"so the control plane is bound to loopback only and is not reachable from other hosts. "+
+			"Set DELOS_AUTH_TOKEN (and DELOS_BIND=0.0.0.0) to serve the network.",
+			"bind", bind.String())
+	case !auth.Enabled() && !bind.Loopback:
+		logger.Error("UNAUTHENTICATED CONTROL PLANE ON A REACHABLE ADDRESS: DELOS_BIND was set "+
+			"without DELOS_AUTH_TOKEN. Anyone who can reach this port can read and delete prompts, "+
+			"read captured traces, and flip quality gates. Set DELOS_AUTH_TOKEN.",
+			"bind", bind.String())
+	default:
+		logger.Info("control-plane authentication enabled (shared token)", "bind", bind.String())
+	}
+
 	// ---- module construction (direct wiring, no network) ----
 
-	var spanStore observe.SpanStore = observe.NewMemorySpanStore()
+	var spanStore observe.SpanStore = newBoundedMemorySpanStore(cfg.ObserveMemoryMaxSpans, logger)
 	var metricStore observe.MetricStore = observe.NewMemoryMetricStore()
 	if db != nil {
 		spanStore = observe.NewPostgresSpanStore(db.DB)
@@ -143,6 +176,15 @@ func Run() error {
 	deployService := deploy.NewDeployService(deployStore, evalResults{store: evalStore})
 	deployHandler := deploy.NewHandler(logger, deployService)
 
+	// Datasets, evals and gates have no Postgres store yet: they are in-memory
+	// regardless of DELOS_STORAGE_BACKEND. Say so out loud - operators who set
+	// storage=postgres reasonably assume everything is durable, and these
+	// stores also grow without bound.
+	logger.Warn("datasets, eval runs and quality gates are stored IN MEMORY regardless of "+
+		"DELOS_STORAGE_BACKEND: they are lost on restart and grow without bound. "+
+		"Only prompts and traces are persisted to postgres today.",
+		"storage_backend", string(cfg.StorageBackend))
+
 	// Eval runner: prompts and datasets are direct in-process calls; LLM
 	// traffic goes through delos-gateway over its public OpenAI surface.
 	gatewayURL := cfg.GatewayURL
@@ -162,17 +204,24 @@ func Run() error {
 
 	// ---- one port: gRPC (h2c) + HTTP on :8081 ----
 
+	unary := []grpc.UnaryServerInterceptor{
+		grpcutil.RecoveryUnaryInterceptor(logger),
+		grpcutil.LoggingUnaryInterceptor(logger),
+	}
+	stream := []grpc.StreamServerInterceptor{
+		grpcutil.RecoveryStreamInterceptor(logger),
+		grpcutil.LoggingStreamInterceptor(logger),
+	}
+	if auth.Enabled() {
+		unary = append(unary, grpcutil.AuthUnaryInterceptor(auth, logger))
+		stream = append(stream, grpcutil.AuthStreamInterceptor(auth, logger))
+	}
+
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(16*1024*1024),
 		grpc.MaxSendMsgSize(16*1024*1024),
-		grpc.ChainUnaryInterceptor(
-			grpcutil.RecoveryUnaryInterceptor(logger),
-			grpcutil.LoggingUnaryInterceptor(logger),
-		),
-		grpc.ChainStreamInterceptor(
-			grpcutil.RecoveryStreamInterceptor(logger),
-			grpcutil.LoggingStreamInterceptor(logger),
-		),
+		grpc.ChainUnaryInterceptor(unary...),
+		grpc.ChainStreamInterceptor(stream...),
 	)
 	observeHandler.Register(grpcServer)
 	promptHandler.Register(grpcServer)
@@ -185,18 +234,34 @@ func Run() error {
 	for _, name := range []string{"", "observe", "prompt", "datasets", "eval", "deploy"} {
 		healthServer.SetServingStatus(name, healthpb.HealthCheckResponse_SERVING)
 	}
-	reflection.Register(grpcServer)
+	// Reflection enumerates every service and method, which is a map for an
+	// attacker and a convenience for grpcurl. Development only.
+	if reflectionEnabled(cfg) {
+		reflection.Register(grpcServer)
+		logger.Info("gRPC reflection enabled (DELOS_ENV=development)")
+	}
 
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintln(w, `{"status":"ok"}`)
 	})
+	// The two HTTP data endpoints take the same shared secret as gRPC:
+	// unauthenticated OTLP writes let anyone forge or flood observability
+	// data, and unauthenticated verdict reads leak gate state. /healthz stays
+	// open for load balancers.
+	protect := func(h http.Handler) http.Handler {
+		if !auth.Enabled() {
+			return h
+		}
+		return grpcutil.HTTPAuthMiddleware(auth, logger, h)
+	}
 	// OTLP/HTTP trace ingest (protobuf and JSON) - accepts spans from any
 	// gen_ai.* source, not just delos-gateway.
-	httpMux.Handle("POST /v1/traces", observeHandler.OTLPHandler())
-	// Quality gate verdicts for CI: GET /v1/gates/{gate}/verdict.
-	httpMux.Handle("GET /v1/gates/{gate}/verdict", deployService.VerdictHandler())
+	httpMux.Handle("POST /v1/traces", protect(observeHandler.OTLPHandler()))
+	// Quality gate verdicts for CI: GET /v1/gates/{gate}/verdict. CI sends
+	// `Authorization: Bearer $DELOS_AUTH_TOKEN`.
+	httpMux.Handle("GET /v1/gates/{gate}/verdict", protect(deployService.VerdictHandler()))
 
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
@@ -212,18 +277,27 @@ func Run() error {
 	protocols.SetHTTP1(true)
 	protocols.SetUnencryptedHTTP2(true)
 	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           root,
-		Protocols:         protocols,
+		Addr:      bind.Addr(),
+		Handler:   root,
+		Protocols: protocols,
+		// ReadTimeout and WriteTimeout are deliberately 0. This port carries
+		// gRPC over h2c, where a long-lived stream *is* one request with one
+		// response body: any non-zero value here would kill streaming RPCs
+		// and the eval runner mid-flight. Slow-header attacks are covered by
+		// ReadHeaderTimeout, oversized bodies by the per-handler limits
+		// (OTLP ingest caps its own body), and dead connections by
+		// IdleTimeout.
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("starting delos control plane",
-			"port", port,
+			"bind", bind.String(),
 			"env", cfg.Environment,
 			"storage", storageName(cfg),
+			"auth", authMode(auth.Enabled()),
 			"gateway_url", gatewayURL,
 		)
 		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
@@ -250,6 +324,21 @@ func sqlDB(db *database.DB) *sql.DB {
 		return nil
 	}
 	return db.DB
+}
+
+// reflectionEnabled reports whether gRPC server reflection should be
+// registered. Reflection lists every service and method, so it is a
+// development convenience only - anywhere else it hands an attacker the map.
+func reflectionEnabled(cfg *config.Base) bool {
+	return cfg.IsDevelopment()
+}
+
+// authMode renders the control plane's authentication state for logs.
+func authMode(enabled bool) string {
+	if enabled {
+		return "token"
+	}
+	return "NONE (loopback only)"
 }
 
 func storageName(cfg *config.Base) string {

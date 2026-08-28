@@ -158,3 +158,14 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func timeNow() time.Time { return time.Now() }
+
+// maxRequestBody bounds a single gateway request. Completions with large
+// conversations and base64 images are legitimate, so this is generous; the
+// limit exists so an unauthenticated client cannot stream an unbounded body
+// into memory.
+const maxRequestBody = 32 << 20
+
+// limitBody caps the request body before any decoding happens.
+func limitBody(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+}

@@ -201,23 +201,29 @@ func FromProto(p *promptv1.Prompt) *PromptFile {
 		pf.Variables = append(pf.Variables, variable)
 	}
 
+	// promptv1.GenerationConfig is proto3 with non-optional scalars, so it has
+	// no way to say "unset": temperature 0 and an omitted temperature are the
+	// same value on the wire. Whenever the server sent a config at all we
+	// therefore take its scalars at face value, so that a meaningful
+	// "temperature: 0" survives push -> pull instead of being silently erased
+	// (which made SemanticDiff report "config added or removed" on every push,
+	// forever). SemanticDiff compensates for the residual ambiguity by treating
+	// an unset numeric field and a zero one as equal - see configView.
+	//
+	// max_tokens is the one exception: the file schema requires max_tokens >= 1,
+	// so 0 cannot be a value the file ever meant to express and can only mean
+	// "unset". Writing it back would produce a file that fails validation.
 	if c := p.DefaultConfig; c != nil {
 		cfg := &Config{Stop: c.Stop, OutputSchema: c.OutputSchema}
-		if c.Temperature != 0 {
-			t := c.Temperature
-			cfg.Temperature = &t
-		}
+		temperature := c.Temperature
+		cfg.Temperature = &temperature
+		topP := c.TopP
+		cfg.TopP = &topP
 		if c.MaxTokens != 0 {
-			m := c.MaxTokens
-			cfg.MaxTokens = &m
+			maxTokens := c.MaxTokens
+			cfg.MaxTokens = &maxTokens
 		}
-		if c.TopP != 0 {
-			t := c.TopP
-			cfg.TopP = &t
-		}
-		if !cfg.isZero() {
-			pf.Config = cfg
-		}
+		pf.Config = cfg
 	}
 
 	pf.Tags = p.Tags
@@ -231,6 +237,12 @@ func FromProto(p *promptv1.Prompt) *PromptFile {
 	return pf
 }
 
+// isZero reports whether the file set no generation parameter at all. It is a
+// presence test over the file's own optional fields, so an explicit
+// "temperature: 0" counts as set: protoConfig then sends a config message and
+// the server records the zero, rather than the value being dropped on the way
+// out. Note this is a stricter notion than configView.present, which asks what
+// the proto can still distinguish once the pointers are gone.
 func (c *Config) isZero() bool {
 	return c == nil ||
 		(c.Temperature == nil && c.MaxTokens == nil && c.TopP == nil &&

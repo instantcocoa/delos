@@ -21,7 +21,23 @@ type AnthropicProvider struct {
 	baseURL    string
 	httpClient *http.Client
 	models     []string
-	pricing    map[string]float64
+	pricing    *PriceTable
+}
+
+// anthropicPricing is USD per 1M tokens from Anthropic's published price list.
+// Prompt-cache writes bill at 1.25x input and cache reads at 0.1x input, so
+// caching is only a saving if the cached prefix is reused more than once.
+// Dated model IDs (claude-sonnet-4-5-20250929) resolve to the family key by
+// longest-prefix match.
+var anthropicPricing = map[string]ModelRate{
+	"claude-opus-4-5":   {Input: 5.00, Output: 25.00, CacheWrite: 6.25, CacheRead: 0.50},
+	"claude-opus-4-1":   {Input: 15.00, Output: 75.00, CacheWrite: 18.75, CacheRead: 1.50},
+	"claude-opus-4":     {Input: 15.00, Output: 75.00, CacheWrite: 18.75, CacheRead: 1.50},
+	"claude-sonnet-4-5": {Input: 3.00, Output: 15.00, CacheWrite: 3.75, CacheRead: 0.30},
+	"claude-sonnet-4":   {Input: 3.00, Output: 15.00, CacheWrite: 3.75, CacheRead: 0.30},
+	"claude-haiku-4-5":  {Input: 1.00, Output: 5.00, CacheWrite: 1.25, CacheRead: 0.10},
+	"claude-3-7-sonnet": {Input: 3.00, Output: 15.00, CacheWrite: 3.75, CacheRead: 0.30},
+	"claude-3-5-haiku":  {Input: 0.80, Output: 4.00, CacheWrite: 1.00, CacheRead: 0.08},
 }
 
 // AnthropicOption configures the provider.
@@ -45,13 +61,7 @@ func NewAnthropicProvider(apiKey string, opts ...AnthropicOption) *AnthropicProv
 			"claude-opus-4-1",
 			"claude-sonnet-4-20250514",
 		},
-		pricing: map[string]float64{
-			"claude-opus-4-5":          0.0125,
-			"claude-sonnet-4-5":        0.003,
-			"claude-haiku-4-5":         0.001,
-			"claude-opus-4-1":          0.015,
-			"claude-sonnet-4-20250514": 0.003,
-		},
+		pricing: NewPriceTable("anthropic", anthropicPricing),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -82,6 +92,10 @@ type anthBlock struct {
 	ToolUseID string `json:"tool_use_id,omitempty"`
 	Content   any    `json:"content,omitempty"`
 	IsError   bool   `json:"is_error,omitempty"`
+
+	// prompt caching: a breakpoint on this block caches everything up to and
+	// including it.
+	CacheControl *anthCacheControl `json:"cache_control,omitempty"`
 }
 
 type anthImageSource struct {
@@ -97,16 +111,17 @@ type anthWireMessage struct {
 }
 
 type anthTool struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema"`
+	Name         string            `json:"name"`
+	Description  string            `json:"description,omitempty"`
+	InputSchema  json.RawMessage   `json:"input_schema"`
+	CacheControl *anthCacheControl `json:"cache_control,omitempty"`
 }
 
 type anthRequest struct {
 	Model         string            `json:"model"`
 	MaxTokens     int               `json:"max_tokens"`
 	Messages      []anthWireMessage `json:"messages"`
-	System        string            `json:"system,omitempty"`
+	System        any               `json:"system,omitempty"` // string, or []anthBlock when a system part sets cache_control
 	Temperature   *float64          `json:"temperature,omitempty"`
 	TopP          *float64          `json:"top_p,omitempty"`
 	StopSequences []string          `json:"stop_sequences,omitempty"`
@@ -118,6 +133,25 @@ type anthRequest struct {
 type anthWireUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+
+	// Prompt-cache accounting. These are excluded from InputTokens and were
+	// previously not parsed at all, which billed every cached token at $0 and
+	// hid whether caching was working.
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+}
+
+// anthCacheControl marks a prompt-cache breakpoint.
+type anthCacheControl struct {
+	Type string `json:"type"` // "ephemeral"
+}
+
+// anthCacheControlFor renders a ContentPart/Tool cache-control marker.
+func anthCacheControlFor(v string) *anthCacheControl {
+	if v == "" {
+		return nil
+	}
+	return &anthCacheControl{Type: v}
 }
 
 type anthResponse struct {
@@ -132,16 +166,17 @@ type anthResponse struct {
 
 // anthPartToBlock converts one internal content part.
 func anthPartToBlock(part ContentPart) (anthBlock, error) {
+	cc := anthCacheControlFor(part.CacheControl)
 	switch part.Type {
 	case "text":
-		return anthBlock{Type: "text", Text: part.Text}, nil
+		return anthBlock{Type: "text", Text: part.Text, CacheControl: cc}, nil
 	case "image":
 		if part.ImageURL != "" {
-			return anthBlock{Type: "image", Source: &anthImageSource{Type: "url", URL: part.ImageURL}}, nil
+			return anthBlock{Type: "image", Source: &anthImageSource{Type: "url", URL: part.ImageURL}, CacheControl: cc}, nil
 		}
 		return anthBlock{Type: "image", Source: &anthImageSource{
 			Type: "base64", MediaType: part.MediaType, Data: part.ImageData,
-		}}, nil
+		}, CacheControl: cc}, nil
 	default:
 		return anthBlock{}, fmt.Errorf("unsupported content part type %q", part.Type)
 	}
@@ -151,8 +186,8 @@ func anthPartToBlock(part ContentPart) (anthBlock, error) {
 // System messages are extracted; tool results become tool_result blocks in
 // user messages; consecutive same-role messages are merged because the
 // Messages API requires alternating roles.
-func anthFromMessages(messages []Message) (string, []anthWireMessage, error) {
-	var system strings.Builder
+func anthFromMessages(messages []Message) (any, []anthWireMessage, error) {
+	var systemBlocks []anthBlock
 	var out []anthWireMessage
 
 	appendBlocks := func(role string, blocks []anthBlock) {
@@ -166,15 +201,24 @@ func anthFromMessages(messages []Message) (string, []anthWireMessage, error) {
 	for _, m := range messages {
 		switch m.Role {
 		case "system":
-			if system.Len() > 0 {
-				system.WriteString("\n\n")
+			for _, part := range m.Content {
+				if part.Type != "text" {
+					return nil, nil, fmt.Errorf("anthropic: system messages accept text only, got %q", part.Type)
+				}
+				systemBlocks = append(systemBlocks, anthBlock{
+					Type:         "text",
+					Text:         part.Text,
+					CacheControl: anthCacheControlFor(part.CacheControl),
+				})
 			}
-			system.WriteString(m.Text())
 
 		case "tool":
 			block := anthBlock{Type: "tool_result", ToolUseID: m.ToolCallID}
 			if text := m.Text(); text != "" {
 				block.Content = text
+			}
+			if len(m.Content) > 0 {
+				block.CacheControl = anthCacheControlFor(m.Content[0].CacheControl)
 			}
 			appendBlocks("user", []anthBlock{block})
 
@@ -214,7 +258,29 @@ func anthFromMessages(messages []Message) (string, []anthWireMessage, error) {
 			appendBlocks("user", blocks)
 		}
 	}
-	return system.String(), out, nil
+	return anthSystem(systemBlocks), out, nil
+}
+
+// anthSystem renders collected system blocks. The Messages API accepts either
+// a plain string or a block array; the block form is required to place a
+// prompt-cache breakpoint on the system prompt, so it is used only then and
+// the simpler string form is kept otherwise.
+func anthSystem(blocks []anthBlock) any {
+	if len(blocks) == 0 {
+		return nil
+	}
+	cached := false
+	texts := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		if b.CacheControl != nil {
+			cached = true
+		}
+		texts = append(texts, b.Text)
+	}
+	if cached {
+		return blocks
+	}
+	return strings.Join(texts, "\n\n")
 }
 
 func (p *AnthropicProvider) buildRequest(params CompletionParams, stream bool) (*anthRequest, error) {
@@ -244,7 +310,12 @@ func (p *AnthropicProvider) buildRequest(params CompletionParams, stream bool) (
 		if len(schema) == 0 {
 			schema = json.RawMessage(`{"type":"object"}`)
 		}
-		req.Tools = append(req.Tools, anthTool{Name: t.Name, Description: t.Description, InputSchema: schema})
+		req.Tools = append(req.Tools, anthTool{
+			Name:         t.Name,
+			Description:  t.Description,
+			InputSchema:  schema,
+			CacheControl: anthCacheControlFor(t.CacheControl),
+		})
 	}
 	if tc := params.ToolChoice; tc != nil {
 		switch tc.Mode {
@@ -289,18 +360,18 @@ func (p *AnthropicProvider) apiError(resp *http.Response) error {
 	return &ProviderError{Provider: "anthropic", StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
 }
 
-func (p *AnthropicProvider) cost(model string, usage anthWireUsage) float64 {
-	rate, ok := p.pricing[model]
-	if !ok {
-		// Model IDs may carry a date suffix (claude-sonnet-4-5-20250929).
-		for m, r := range p.pricing {
-			if strings.HasPrefix(model, m) {
-				rate = r
-				break
-			}
-		}
-	}
-	return rate * float64(usage.InputTokens+usage.OutputTokens) / 1000
+// usageFrom converts wire usage. Anthropic reports cache tokens separately
+// from input_tokens, so the token total is the sum of all four counters and
+// cached tokens bill at their own rates.
+func (p *AnthropicProvider) usageFrom(model string, wire anthWireUsage) Usage {
+	u := Usage{
+		PromptTokens:        wire.InputTokens,
+		CompletionTokens:    wire.OutputTokens,
+		CacheCreationTokens: wire.CacheCreationInputTokens,
+		CacheReadTokens:     wire.CacheReadInputTokens,
+	}.withDerivedTotals()
+	u.CostUSD = p.pricing.Cost(model, u)
+	return u
 }
 
 func anthFinishReason(stop string) string {
@@ -351,12 +422,7 @@ func (p *AnthropicProvider) Complete(ctx context.Context, params CompletionParam
 		}
 	}
 
-	usage := Usage{
-		PromptTokens:     out.Usage.InputTokens,
-		CompletionTokens: out.Usage.OutputTokens,
-		TotalTokens:      out.Usage.InputTokens + out.Usage.OutputTokens,
-		CostUSD:          p.cost(out.Model, out.Usage),
-	}
+	usage := p.usageFrom(out.Model, out.Usage)
 	return &CompletionResult{
 		ID:           out.ID,
 		Message:      msg,
@@ -414,7 +480,9 @@ func (p *AnthropicProvider) CompleteStream(ctx context.Context, params Completio
 
 		id, model := "", params.Model
 		finish := FinishStop
-		var inputTokens, outputTokens int
+		// Accumulated wire usage: message_start carries input and cache
+		// counters, message_delta carries output.
+		var wireUsage anthWireUsage
 		// Map Anthropic block indexes to tool-call indexes; text blocks do
 		// not consume tool indexes.
 		toolIndexByBlock := map[int]int{}
@@ -442,7 +510,9 @@ func (p *AnthropicProvider) CompleteStream(ctx context.Context, params Completio
 					if ev.Message.Model != "" {
 						model = ev.Message.Model
 					}
-					inputTokens = ev.Message.Usage.InputTokens
+					wireUsage.InputTokens = ev.Message.Usage.InputTokens
+					wireUsage.CacheCreationInputTokens = ev.Message.Usage.CacheCreationInputTokens
+					wireUsage.CacheReadInputTokens = ev.Message.Usage.CacheReadInputTokens
 				}
 			case "content_block_start":
 				if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" {
@@ -483,7 +553,13 @@ func (p *AnthropicProvider) CompleteStream(ctx context.Context, params Completio
 					finish = anthFinishReason(ev.Delta.StopReason)
 				}
 				if ev.Usage != nil {
-					outputTokens = ev.Usage.OutputTokens
+					wireUsage.OutputTokens = ev.Usage.OutputTokens
+					if ev.Usage.CacheCreationInputTokens > 0 {
+						wireUsage.CacheCreationInputTokens = ev.Usage.CacheCreationInputTokens
+					}
+					if ev.Usage.CacheReadInputTokens > 0 {
+						wireUsage.CacheReadInputTokens = ev.Usage.CacheReadInputTokens
+					}
 				}
 			case "error":
 				msg := "unknown stream error"
@@ -493,12 +569,8 @@ func (p *AnthropicProvider) CompleteStream(ctx context.Context, params Completio
 				chunks <- StreamChunk{Err: &ProviderError{Provider: "anthropic", StatusCode: 500, Message: msg}, Provider: "anthropic", Model: model}
 				return
 			case "message_stop":
-				usage := &Usage{
-					PromptTokens:     inputTokens,
-					CompletionTokens: outputTokens,
-					TotalTokens:      inputTokens + outputTokens,
-					CostUSD:          p.cost(model, anthWireUsage{InputTokens: inputTokens, OutputTokens: outputTokens}),
-				}
+				u := p.usageFrom(model, wireUsage)
+				usage := &u
 				chunks <- StreamChunk{ID: id, Done: true, FinishReason: finish, Usage: usage, Provider: "anthropic", Model: model}
 				return
 			}

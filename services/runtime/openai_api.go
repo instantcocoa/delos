@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -78,6 +80,15 @@ type contentPartIn struct {
 type stringOrSlice []string
 
 func (s *stringOrSlice) UnmarshalJSON(data []byte) error {
+	// An explicit null is "unset", not the empty string. Many client SDKs
+	// serialize unset optionals as null; unmarshalling null into a string
+	// succeeds with the zero value, so without this check `"stop": null`
+	// became stop: [""] and every provider rejected the request with a 400
+	// the caller could not explain.
+	if string(bytes.TrimSpace(data)) == "null" {
+		*s = nil
+		return nil
+	}
 	var single string
 	if err := json.Unmarshal(data, &single); err == nil {
 		*s = []string{single}
@@ -125,16 +136,38 @@ type usageOut struct {
 
 // parseImageURL splits an OpenAI image_url (remote URL or data: URI) into an
 // internal image part.
-func parseImageURL(url string) (ContentPart, error) {
-	if strings.HasPrefix(url, "data:") {
-		meta, data, ok := strings.Cut(strings.TrimPrefix(url, "data:"), ",")
-		if !ok {
-			return ContentPart{}, fmt.Errorf("malformed data: URI in image_url")
-		}
-		mediaType := strings.TrimSuffix(meta, ";base64")
-		return ContentPart{Type: "image", ImageData: data, MediaType: mediaType}, nil
+//
+// ContentPart.ImageData is defined as base64 - every provider payload is built
+// from it on that assumption - so a data: URI carrying percent-encoded bytes
+// (the ";base64" marker absent) is decoded and re-encoded rather than passed
+// through. Trimming the marker unconditionally, as this used to, relabelled
+// raw bytes as base64 and shipped a corrupt image upstream.
+func parseImageURL(raw string) (ContentPart, error) {
+	if !strings.HasPrefix(raw, "data:") {
+		return ContentPart{Type: "image", ImageURL: raw}, nil
 	}
-	return ContentPart{Type: "image", ImageURL: url}, nil
+	meta, data, ok := strings.Cut(strings.TrimPrefix(raw, "data:"), ",")
+	if !ok {
+		return ContentPart{}, fmt.Errorf("malformed data: URI in image_url: missing the comma separating metadata from data")
+	}
+	meta, isBase64 := strings.CutSuffix(meta, ";base64")
+
+	// The media type is the first token; RFC 2397 allows parameters after it
+	// (";charset=utf-8"), which providers do not accept.
+	mediaType, _, _ := strings.Cut(meta, ";")
+	mediaType = strings.TrimSpace(mediaType)
+	if mediaType == "" {
+		return ContentPart{}, fmt.Errorf("data: URI in image_url has no media type; an image needs one (e.g. data:image/png;base64,...)")
+	}
+
+	if !isBase64 {
+		decoded, err := url.PathUnescape(data)
+		if err != nil {
+			return ContentPart{}, fmt.Errorf("data: URI in image_url is neither base64 nor valid percent-encoding: %w", err)
+		}
+		data = base64.StdEncoding.EncodeToString([]byte(decoded))
+	}
+	return ContentPart{Type: "image", ImageData: data, MediaType: mediaType}, nil
 }
 
 // convertMessages maps surface messages to internal messages.
@@ -275,6 +308,13 @@ func buildCompletionParams(req chatCompletionRequest) (CompletionParams, error) 
 	}
 	if req.MaxComplete > 0 {
 		params.MaxTokens = req.MaxComplete
+		// FIXME(gateway): the cap is preserved but its *spelling* is not.
+		// gpt-5.x/o1/o3 reject "max_tokens" outright, so a client that
+		// correctly sends "max_completion_tokens" is currently worse off
+		// than one that sends no cap at all. Fixing it needs a
+		// CompletionParams field (runtime.go) that provider_openai.go
+		// reads when building the upstream request - both outside this
+		// file's ownership; see the handover note.
 	}
 	for _, t := range req.Tools {
 		if t.Type != "function" {
@@ -298,6 +338,14 @@ func buildCompletionParams(req chatCompletionRequest) (CompletionParams, error) 
 // ---- handlers ----
 
 func (s *HTTPServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	// Authenticate before spending memory on the body.
+	key, ok := s.authenticate(w, r, false)
+	if !ok {
+		return
+	}
+	r = withKey(r, key)
+	limitBody(w, r)
+
 	var req chatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeOpenAIError(w, r, http.StatusBadRequest, "invalid_json", "could not parse request body: "+err.Error())
@@ -316,11 +364,6 @@ func (s *HTTPServer) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	s.tailModel(r.Context(), req.Model)
-
-	key, ok := s.authenticate(w, r, false)
-	if !ok {
-		return
-	}
 
 	chain, err := s.service.ResolveChain(r.Context(), req.Model)
 	if err != nil {
@@ -350,7 +393,7 @@ func (s *HTTPServer) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 		s.writeProviderError(w, r, err)
 		return
 	}
-	s.recordUsage(context.WithoutCancel(r.Context()), key, result.Usage)
+	s.recordUsage(context.WithoutCancel(r.Context()), key, billableUsage(result))
 	s.tailComplete(r, key, result.Model, result.Provider, result.Usage, result.Cached)
 
 	if result.Cached {
@@ -374,6 +417,9 @@ func (s *HTTPServer) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 			Message:      msgOut,
 			FinishReason: &finish,
 		}},
+		// On a cache hit the token counts describe the payload the client
+		// received but cost_usd is zero: nothing was bought upstream. The
+		// X-Delos-Cache header says which of the two happened.
 		Usage: &usageOut{
 			PromptTokens:     result.Usage.PromptTokens,
 			CompletionTokens: result.Usage.CompletionTokens,
@@ -429,6 +475,19 @@ func (s *HTTPServer) streamChatCompletion(w http.ResponseWriter, r *http.Request
 	streamUsage := Usage{}
 	sentRole := false
 
+	// delivered accumulates everything the client received, so a stream can
+	// still be metered when the provider reports no usage of its own.
+	var delivered strings.Builder
+	metered := false
+	meter := func(usage Usage) {
+		if metered {
+			return
+		}
+		metered = true
+		streamUsage = usage
+		s.recordUsage(context.WithoutCancel(r.Context()), key, usage)
+	}
+
 	writeChunk := func(c chatCompletionResponse) {
 		data, _ := json.Marshal(c)
 		fmt.Fprintf(w, "data: %s\n\n", data)
@@ -439,7 +498,10 @@ func (s *HTTPServer) streamChatCompletion(w http.ResponseWriter, r *http.Request
 		if chunk.Err != nil {
 			// The stream broke mid-flight; SSE has no status code left to
 			// change, so emit an error event and stop without [DONE] so the
-			// client does not mistake this for a complete response.
+			// client does not mistake this for a complete response. What was
+			// already delivered was still generated upstream, so it is
+			// metered rather than written off.
+			meter(estimateStreamUsage(params, delivered.String()))
 			body, _ := json.Marshal(oaiErrorEnvelope{Error: oaiErrorBody{
 				Message: chunk.Err.Error(), Type: "api_error", Code: "provider_stream_error",
 			}})
@@ -455,10 +517,19 @@ func (s *HTTPServer) streamChatCompletion(w http.ResponseWriter, r *http.Request
 			model = chunk.Model
 		}
 		if chunk.Done {
-			if chunk.Usage != nil {
-				s.recordUsage(context.WithoutCancel(r.Context()), key, *chunk.Usage)
-				streamUsage = *chunk.Usage
+			// Every stream is metered. Providers are not required to report
+			// usage - several OpenAI-compatible servers never do, and a
+			// provider that drops the final usage frame is indistinguishable
+			// from one that has none - and metering only what arrives makes
+			// those requests free, which is a budget bypass rather than a
+			// rounding error. See estimateStreamUsage for what an estimate
+			// costs the caller.
+			usage := chunk.Usage
+			if usage == nil {
+				estimated := estimateStreamUsage(params, delivered.String())
+				usage = &estimated
 			}
+			meter(*usage)
 			finish := chunk.FinishReason
 			if finish == "" {
 				finish = FinishStop
@@ -467,15 +538,18 @@ func (s *HTTPServer) streamChatCompletion(w http.ResponseWriter, r *http.Request
 				ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 				Choices: []chatChoice{{Index: 0, Delta: &chatMessageOut{}, FinishReason: &finish}},
 			})
-			if req.StreamOptions != nil && req.StreamOptions.IncludeUsage && chunk.Usage != nil {
+			// stream_options.include_usage promises a final usage chunk. The
+			// promise is to the client, not to the provider, so it is kept
+			// even when the numbers had to be estimated.
+			if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 				writeChunk(chatCompletionResponse{
 					ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 					Choices: []chatChoice{},
 					Usage: &usageOut{
-						PromptTokens:     chunk.Usage.PromptTokens,
-						CompletionTokens: chunk.Usage.CompletionTokens,
-						TotalTokens:      chunk.Usage.TotalTokens,
-						CostUSD:          chunk.Usage.CostUSD,
+						PromptTokens:     usage.PromptTokens,
+						CompletionTokens: usage.CompletionTokens,
+						TotalTokens:      usage.TotalTokens,
+						CostUSD:          usage.CostUSD,
 					},
 				})
 			}
@@ -495,9 +569,12 @@ func (s *HTTPServer) streamChatCompletion(w http.ResponseWriter, r *http.Request
 			stc.Function.Name = chunk.ToolCall.Name
 			stc.Function.Arguments = chunk.ToolCall.ArgumentsDelta
 			delta.ToolCalls = []surfaceToolCall{stc}
+			delivered.WriteString(chunk.ToolCall.Name)
+			delivered.WriteString(chunk.ToolCall.ArgumentsDelta)
 		} else {
 			content := chunk.Delta
 			delta.Content = &content
+			delivered.WriteString(chunk.Delta)
 		}
 		writeChunk(chatCompletionResponse{
 			ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
@@ -505,9 +582,64 @@ func (s *HTTPServer) streamChatCompletion(w http.ResponseWriter, r *http.Request
 		})
 	}
 
+	// A stream that ends without a Done chunk still consumed whatever it
+	// delivered.
+	meter(estimateStreamUsage(params, delivered.String()))
+
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 	s.tailComplete(r, key, model, provider, streamUsage, false)
+}
+
+// ---- usage estimation ----
+
+// charsPerToken is the usual rule of thumb for BPE tokenizers on English
+// text. Vendor tokenizers differ, and running four of them in the gateway to
+// bill a request the provider declined to price is not worth the dependency.
+const charsPerToken = 4
+
+// perMessageOverhead approximates the role/delimiter tokens every chat
+// message carries in addition to its text.
+const perMessageOverhead = 4
+
+// estimateStreamUsage approximates the usage of a stream whose provider
+// reported none.
+//
+// The alternative is recording zero, which means a provider that omits usage
+// (or a stream that breaks before its final frame) serves traffic for free and
+// no budget ever stops it. An approximation that is occasionally off by a few
+// percent is a far smaller error than a hole every caller can drive through,
+// so token counts are estimated from the text on both sides of the exchange.
+//
+// Cost is deliberately left at zero: dollar cost needs the provider's per-model
+// pricing, which is not available here, and inventing a number would be worse
+// than reporting none. Dollar budgets therefore under-count these requests
+// even though token budgets do not - an honest limitation, not a design.
+func estimateStreamUsage(params CompletionParams, delivered string) Usage {
+	prompt := 0
+	for _, m := range params.Messages {
+		prompt += perMessageOverhead + estimateTokens(m.Text())
+		for _, tc := range m.ToolCalls {
+			prompt += estimateTokens(tc.Name) + estimateTokens(tc.Arguments)
+		}
+	}
+	for _, t := range params.Tools {
+		prompt += estimateTokens(t.Name) + estimateTokens(t.Description) + estimateTokens(string(t.Parameters))
+	}
+	completion := estimateTokens(delivered)
+	return Usage{
+		PromptTokens:     prompt,
+		CompletionTokens: completion,
+		TotalTokens:      prompt + completion,
+	}
+}
+
+// estimateTokens rounds up: a non-empty string is never zero tokens.
+func estimateTokens(s string) int {
+	if s == "" {
+		return 0
+	}
+	return (len(s) + charsPerToken - 1) / charsPerToken
 }
 
 // ---- embeddings ----
@@ -533,6 +665,13 @@ type embeddingItem struct {
 }
 
 func (s *HTTPServer) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.authenticate(w, r, false)
+	if !ok {
+		return
+	}
+	r = withKey(r, key)
+	limitBody(w, r)
+
 	var req embeddingsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeOpenAIError(w, r, http.StatusBadRequest, "invalid_json", "could not parse request body: "+err.Error())
@@ -554,11 +693,6 @@ func (s *HTTPServer) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(texts) == 0 {
 		s.writeOpenAIError(w, r, http.StatusBadRequest, "invalid_input", "input must not be empty")
-		return
-	}
-
-	key, ok := s.authenticate(w, r, false)
-	if !ok {
 		return
 	}
 
@@ -622,10 +756,27 @@ type modelObject struct {
 	OwnedBy string `json:"owned_by"`
 }
 
+// handleListModels serves GET /v1/models.
+//
+// Discovery is authenticated like every other /v1 endpoint: the listing names
+// every vendor the operator has configured (commercially sensitive on its
+// own), and for OpenAI-compatible backends Models() issues a live upstream
+// call, so an open endpoint is also an unauthenticated way to make the gateway
+// talk to a paid API. The listing is further scoped to what the presented key
+// is allowed to use - a key restricted to one provider has no business
+// enumerating the others.
 func (s *HTTPServer) handleListModels(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.authenticate(w, r, false)
+	if !ok {
+		return
+	}
+	r = withKey(r, key)
 	var models []modelObject
 	for _, p := range s.service.Registry().List() {
 		for _, m := range p.Models(r.Context()) {
+			if !keyAllowsModel(key, m) {
+				continue
+			}
 			models = append(models, modelObject{
 				ID: m, Object: "model", Created: 0, OwnedBy: p.Name(),
 			})
@@ -638,16 +789,39 @@ func (s *HTTPServer) handleListModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HTTPServer) handleGetModel(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.authenticate(w, r, false)
+	if !ok {
+		return
+	}
+	r = withKey(r, key)
 	want := r.PathValue("model")
 	for _, p := range s.service.Registry().List() {
 		for _, m := range p.Models(r.Context()) {
-			if m == want {
+			if m == want && keyAllowsModel(key, m) {
 				writeJSON(w, http.StatusOK, modelObject{ID: m, Object: "model", OwnedBy: p.Name()})
 				return
 			}
 		}
 	}
 	s.writeOpenAIError(w, r, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q does not exist", want))
+}
+
+// withKey attaches the authenticated virtual key to the request context.
+// Handlers receive the key as a value, but the error-envelope writers do not:
+// they recover it from the context to attribute the tail event to the tenant
+// that made the request. Without this, every failed request belongs to nobody
+// and is invisible to the one subscriber entitled to see it.
+func withKey(r *http.Request, key *VirtualKey) *http.Request {
+	if key == nil {
+		return r
+	}
+	return r.WithContext(WithAuthedKey(r.Context(), key))
+}
+
+// keyAllowsModel reports whether a key may see or use a model. A nil key is
+// dev mode (no virtual keys configured), which scopes nothing.
+func keyAllowsModel(key *VirtualKey, model string) bool {
+	return key == nil || key.AllowsModel(model)
 }
 
 func orDefault(v, fallback string) string {

@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
+	cpclient "github.com/instantcocoa/delos/cli/internal/client"
 	"github.com/instantcocoa/delos/cli/internal/output"
 	deployv1 "github.com/instantcocoa/delos/gen/go/deploy/v1"
 )
@@ -28,7 +28,7 @@ eval run and exits 0 (pass) or 1 (fail), so CI pipelines can block on it.`,
 }
 
 func getGateClient() (deployv1.DeployServiceClient, *grpc.ClientConn, error) {
-	conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := cpclient.Dial(cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to connect to control plane at %s: %w", cfg.ControlPlaneAddr, err)
 	}
@@ -54,7 +54,6 @@ var gateCreateCmd = &cobra.Command{
 		req := &deployv1.CreateQualityGateRequest{
 			Name:        args[0],
 			Description: description,
-			PromptId:    promptID,
 		}
 		for _, c := range conditions {
 			cond, err := parseConditionFlag(c)
@@ -72,6 +71,13 @@ var gateCreateCmd = &cobra.Command{
 
 		ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
 		defer cancel()
+
+		// Store the canonical prompt ID: eval runs record the ID, so a gate
+		// created with a slug would never match a run when checked.
+		req.PromptId, err = resolvePromptID(ctx, conn, promptID)
+		if err != nil {
+			return err
+		}
 		resp, err := client.CreateQualityGate(ctx, req)
 		if err != nil {
 			return fmt.Errorf("failed to create gate: %w", err)
@@ -110,7 +116,7 @@ var gateListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List quality gates",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		promptID, _ := cmd.Flags().GetString("prompt")
+		promptRef, _ := cmd.Flags().GetString("prompt")
 
 		client, conn, err := getGateClient()
 		if err != nil {
@@ -120,6 +126,16 @@ var gateListCmd = &cobra.Command{
 
 		ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
 		defer cancel()
+
+		promptID := ""
+		if promptRef != "" {
+			// Gates store prompt IDs, so a slug filter has to be resolved.
+			promptID, err = resolvePromptID(ctx, conn, promptRef)
+			if err != nil {
+				return err
+			}
+		}
+
 		resp, err := client.ListQualityGates(ctx, &deployv1.ListQualityGatesRequest{PromptId: promptID})
 		if err != nil {
 			return fmt.Errorf("failed to list gates: %w", err)
@@ -222,7 +238,7 @@ func init() {
 	gateCreateCmd.Flags().String("prompt", "", "Prompt ID or slug the gate evaluates (required)")
 	gateCreateCmd.Flags().String("description", "", "Gate description")
 	gateCreateCmd.Flags().StringArray("condition", nil, `Condition, repeatable (e.g. "overall_score>=0.8")`)
-	gateListCmd.Flags().String("prompt", "", "Filter by prompt")
+	gateListCmd.Flags().String("prompt", "", "Filter by prompt ID or slug")
 
 	gateCmd.AddCommand(gateCreateCmd)
 	gateCmd.AddCommand(gateListCmd)

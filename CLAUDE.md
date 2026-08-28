@@ -129,7 +129,7 @@ services/<name>/
 | **prompt** | control plane | Prompt versioning, collaboration, semantic diffing |
 | **datasets** | control plane | Test suite management, generation, versioning |
 | **eval** | control plane | Quality scoring, regression testing, evaluators |
-| **deploy** | control plane | Rollout orchestration, A/B testing, auto-rollback |
+| **deploy** | control plane | Quality gates: named thresholds over eval results, `gate check` exits 0/1 for CI |
 
 ## Coding Standards
 

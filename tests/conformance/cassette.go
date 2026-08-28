@@ -52,9 +52,19 @@ type Cassette struct {
 	// prompts) is pinned.
 	UpstreamBodyContains []string `json:"upstream_body_contains,omitempty"`
 
+	// UpstreamBodyExcludes asserts substrings that must NOT appear in the
+	// request the gateway sent upstream. Some translation bugs are things
+	// the gateway invents - a stop sequence the client never sent, a
+	// parameter the backend rejects - and those are only visible as an
+	// absence.
+	UpstreamBodyExcludes []string `json:"upstream_body_excludes,omitempty"`
+
 	// UpstreamResponses are replayed in order, one per upstream call. Every
 	// queued response must be consumed: retries and failovers are therefore
 	// visible in the cassette rather than hidden by the harness.
+	//
+	// An empty list is meaningful: it asserts the gateway refused the
+	// request without contacting the provider at all.
 	UpstreamResponses []UpstreamResponse `json:"upstream_responses"`
 
 	// Expect describes the gateway response the client must observe.

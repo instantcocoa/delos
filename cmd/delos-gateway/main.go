@@ -252,16 +252,70 @@ func run() error {
 
 	api := runtime.NewHTTPServer(svc, logger, apiOpts...)
 
+	// ---- exposure check: never front provider credentials anonymously ----
+	//
+	// With no key store every /v1 request is accepted, so a gateway holding
+	// an OPENAI_API_KEY on a reachable port is an open proxy that spends
+	// someone else's money. That is fine on a laptop and never fine on a
+	// network, so the bind decides: unauthenticated means loopback unless the
+	// operator says otherwise.
+	inContainer := config.InContainer()
+	keysEnforced := cfg.UsePostgresStorage()
+	hasProviders := len(registry.List()) > 0
+	// A container cannot use the loopback default - nothing outside could
+	// reach it, including `docker run -p`. So containers always bind wide and
+	// take the refusal below instead of silently serving nothing.
+	wideDefault := keysEnforced || cfg.AllowUnauthenticated || !hasProviders || inContainer
+	bind := config.ResolveBind(cfg.BindAddr, port, wideDefault)
+
+	mode, err := config.DecideGatewayAuth(config.GatewayExposure{
+		KeyStoreConfigured:   keysEnforced,
+		AllowUnauthenticated: cfg.AllowUnauthenticated,
+		ProviderCredentials:  hasProviders,
+		BindLoopback:         bind.Loopback,
+		InContainer:          inContainer,
+	})
+	if err != nil {
+		var exposure *config.ErrUnauthenticatedExposure
+		if errors.As(err, &exposure) {
+			exposure.Bind = bind.String()
+		}
+		return err
+	}
+	switch mode {
+	case config.GatewayAuthEnforced:
+		logger.Info("AUTH: virtual keys ENFORCED - every /v1 request needs a valid key", "bind", bind.String())
+	case config.GatewayAuthDevLoopback:
+		logger.Warn("AUTH: DEV MODE - virtual keys are NOT enforced, so any api_key is accepted. "+
+			"Bound to loopback only, so nothing off this machine can reach it. "+
+			"Set DELOS_STORAGE_BACKEND=postgres to enforce keys.", "bind", bind.String())
+	case config.GatewayAuthOpenAcknowledged:
+		logger.Warn("AUTH: OPEN GATEWAY - virtual keys are NOT enforced and DELOS_ALLOW_UNAUTHENTICATED=true "+
+			"was set, so anyone who can reach this port can spend your provider credits. "+
+			"Do not expose this to an untrusted network.", "bind", bind.String())
+	case config.GatewayAuthNoProviders:
+		logger.Warn("AUTH: no virtual keys and no provider credentials - the gateway will refuse every "+
+			"completion until a provider key is configured.", "bind", bind.String())
+	}
+
 	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           api,
+		Addr:    bind.Addr(),
+		Handler: api,
+		// WriteTimeout is 0 on purpose: it is a deadline on the whole
+		// response, and SSE completions legitimately stream for minutes.
+		// DELOS_REQUEST_TIMEOUT (default 5m) is the real per-request budget,
+		// applied per handler where it can distinguish streaming from not.
+		// The read side is bounded because request bodies are small JSON.
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("starting delos-gateway",
-			"port", port,
+			"bind", bind.String(),
+			"auth", mode,
 			"env", cfg.Environment,
 			"providers", len(registry.List()),
 			"config_file", orNone(cfg.ConfigPath),

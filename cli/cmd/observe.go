@@ -6,10 +6,9 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	cpclient "github.com/instantcocoa/delos/cli/internal/client"
 	"github.com/instantcocoa/delos/cli/internal/output"
 	observev1 "github.com/instantcocoa/delos/gen/go/observe/v1"
 )
@@ -24,7 +23,7 @@ var observeTracesCmd = &cobra.Command{
 	Use:   "traces",
 	Short: "Query traces",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -94,7 +93,7 @@ var observeTraceCmd = &cobra.Command{
 	Short: "Get a specific trace",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -152,7 +151,7 @@ var observeMetricsCmd = &cobra.Command{
 	Use:   "metrics",
 	Short: "Query metrics",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -204,7 +203,7 @@ var observeHealthCmd = &cobra.Command{
 	Use:   "health",
 	Short: "Check observe service health",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}

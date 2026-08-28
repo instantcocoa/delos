@@ -2,8 +2,10 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // flakyProvider fails a configurable number of Complete calls before
@@ -179,12 +181,13 @@ func TestCircuitBreakerOpensAndRecovers(t *testing.T) {
 	}
 }
 
-func TestStreamChainMidStreamFailover(t *testing.T) {
-	// The acceptance test from the plan: kill the primary mid-stream; the
-	// client sees a valid completed stream from the fallback.
+func TestStreamChainFailoverBeforeContent(t *testing.T) {
+	// A stream that breaks before delivering any content can still fail over:
+	// nothing has reached the client, so the fallback's stream is the only one
+	// it ever sees.
 	primary := &flakyProvider{
 		mockProvider:  mockProvider{name: "primary"},
-		breakStreamAt: 2, // two deltas, then the connection dies
+		breakStreamAt: 0, // errors immediately, no deltas
 	}
 	fallback := &mockProvider{
 		name: "fallback",
@@ -204,15 +207,15 @@ func TestStreamChainMidStreamFailover(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Accumulate every delta the client would see, regardless of provider -
+	// an SSE client cannot filter by provider, so neither does this test.
+	var text string
 	var sawDone bool
-	var fallbackText string
 	for c := range chunks {
 		if c.Err != nil {
 			t.Fatalf("client must not see an error when a fallback can complete: %v", c.Err)
 		}
-		if c.Provider == "fallback" {
-			fallbackText += c.Delta
-		}
+		text += c.Delta
 		if c.Done {
 			sawDone = true
 			if c.Usage == nil || c.Usage.TotalTokens != 7 {
@@ -223,11 +226,98 @@ func TestStreamChainMidStreamFailover(t *testing.T) {
 	if !sawDone {
 		t.Fatal("stream did not complete")
 	}
-	if fallbackText != "complete answer" {
-		t.Errorf("fallback content = %q", fallbackText)
+	if text != "complete answer" {
+		t.Errorf("client-visible content = %q, want the fallback's stream alone", text)
 	}
-	if primary.streamCalls != 1 || len(fallback.streamChunks) == 0 {
-		t.Errorf("primary calls = %d", primary.streamCalls)
+}
+
+func TestStreamChainNoSpliceAfterContent(t *testing.T) {
+	// Once deltas are on the wire they cannot be retracted. Failing over at
+	// that point would splice two different completions into one response, so
+	// the break must surface as an error instead.
+	primary := &flakyProvider{
+		mockProvider:  mockProvider{name: "primary"},
+		breakStreamAt: 2, // two deltas, then the connection dies
+	}
+	fallback := &mockProvider{
+		name: "fallback",
+		streamChunks: []StreamChunk{
+			{Delta: "a completely different answer", Provider: "fallback"},
+			{Done: true, FinishReason: FinishStop, Provider: "fallback"},
+		},
+	}
+	svc := newTestService(primary, fallback)
+
+	chunks, err := svc.CompleteStreamChain(context.Background(), []RouteTarget{
+		{Provider: "primary", Model: "m1"},
+		{Provider: "fallback", Model: "m2"},
+	}, CompletionParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var text string
+	var sawErr, sawDone bool
+	for c := range chunks {
+		if c.Err != nil {
+			sawErr = true
+			continue
+		}
+		text += c.Delta
+		if c.Done {
+			sawDone = true
+		}
+	}
+
+	if !sawErr {
+		t.Error("a break after content was delivered must surface as an error")
+	}
+	if sawDone {
+		t.Error("a spliced stream must not be reported as complete")
+	}
+	if strings.Contains(text, "a completely different answer") {
+		t.Errorf("fallback content was spliced onto the primary's partial output: %q", text)
+	}
+	if fallback.lastParams != nil {
+		t.Error("fallback must not be started once the client has partial content")
+	}
+}
+
+func TestStreamChainClientDisconnect(t *testing.T) {
+	// A client that stops reading must not strand the producing goroutine:
+	// every send is guarded by the request context.
+	p := &mockProvider{
+		name: "primary",
+		streamChunks: []StreamChunk{
+			{Delta: "one", Provider: "primary"},
+			{Delta: "two", Provider: "primary"},
+			{Delta: "three", Provider: "primary"},
+			{Done: true, FinishReason: FinishStop, Provider: "primary"},
+		},
+	}
+	svc := newTestService(p)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	chunks, err := svc.CompleteStreamChain(ctx, []RouteTarget{{Provider: "primary", Model: "m1"}}, CompletionParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	<-chunks // read one chunk, then walk away
+	cancel()
+
+	// The producer must finish and close the channel rather than blocking
+	// forever on a send nobody is receiving.
+	done := make(chan struct{})
+	go func() {
+		for range chunks {
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream goroutine did not terminate after the client disconnected")
 	}
 }
 
@@ -255,5 +345,114 @@ func TestStreamChainAllTargetsFail(t *testing.T) {
 	}
 	if !sawErr || sawDone {
 		t.Errorf("sawErr=%v sawDone=%v; when every target fails the client must see an error and no completion", sawErr, sawDone)
+	}
+}
+
+func TestCompleteChainDoesNotRetryTranslationFailures(t *testing.T) {
+	// A malformed client request fails identically on every attempt and
+	// every fallback. Retrying it produced a 502 describing a caller
+	// mistake, and - worse - three breaker failures per request, so one bad
+	// client could open the circuit for every tenant on that provider.
+	primary := &mockProvider{
+		name:        "primary",
+		completeErr: fmt.Errorf("messages[0]: unsupported content part type %q", "audio"),
+	}
+	fallback := &mockProvider{name: "fallback", completeResult: okResult("fallback", "x")}
+	svc := newTestService(primary, fallback)
+
+	_, err := svc.CompleteChain(context.Background(), []RouteTarget{
+		{Provider: "primary", Model: "m1"},
+		{Provider: "fallback", Model: "m2"},
+	}, CompletionParams{})
+	if err == nil {
+		t.Fatal("a translation failure must be reported, not retried into a fallback")
+	}
+	if fallback.lastParams != nil {
+		t.Error("a deterministic failure must not fail over to a paid fallback")
+	}
+	if state := svc.BreakerState("primary"); state != "closed" {
+		t.Errorf("breaker = %s; a caller's mistake is not the provider's unhealthiness", state)
+	}
+}
+
+func TestCompleteChainDoesNotRetryQuotaExhaustion(t *testing.T) {
+	// HTTP 429 covers both "slow down" and "you are out of credit". Only
+	// the first is worth retrying; the second is permanent, and retrying it
+	// trips the breaker so that every later request gets a generic "circuit
+	// breaker open" instead of the billing message the operator needs.
+	quota := &ProviderError{
+		Provider: "openai", StatusCode: 429, Code: "insufficient_quota",
+		Message: "You exceeded your current quota, please check your plan and billing details.",
+	}
+	p := &mockProvider{name: "openai", completeErr: quota}
+	svc := newTestService(p)
+	chain := []RouteTarget{{Provider: "openai", Model: "gpt-4o"}}
+
+	for i := 0; i < breakerThreshold+2; i++ {
+		_, err := svc.CompleteChain(context.Background(), chain, CompletionParams{})
+		if err == nil {
+			t.Fatal("expected the quota error to surface")
+		}
+		if !strings.Contains(err.Error(), "check your plan and billing details") {
+			t.Fatalf("the upstream billing message must reach the caller, got %v", err)
+		}
+	}
+	if state := svc.BreakerState("openai"); state != "closed" {
+		t.Errorf("breaker = %s; a permanent billing failure must not open the circuit", state)
+	}
+}
+
+func TestBreakerOpenErrorCarriesLastUpstreamError(t *testing.T) {
+	// "circuit breaker open" on its own erases the only useful thing the
+	// caller could learn. The last real failure travels with it, status and
+	// message intact.
+	p := &flakyProvider{
+		mockProvider:  mockProvider{name: "openai"},
+		failCompletes: 99,
+		breakStreamAt: -1,
+	}
+	svc := newTestService(p)
+	chain := []RouteTarget{{Provider: "openai", Model: "gpt-4o"}}
+
+	for i := 0; i < breakerThreshold; i++ {
+		svc.CompleteChain(context.Background(), chain, CompletionParams{})
+	}
+	if state := svc.BreakerState("openai"); state != "open" {
+		t.Fatalf("breaker state = %s, want open", state)
+	}
+
+	_, err := svc.CompleteChain(context.Background(), chain, CompletionParams{})
+	if err == nil {
+		t.Fatal("expected an error while the breaker is open")
+	}
+	if !strings.Contains(err.Error(), "circuit breaker open") {
+		t.Errorf("error = %v, want it to still say the breaker is open", err)
+	}
+	if !strings.Contains(err.Error(), "upstream exploded") {
+		t.Errorf("error = %v, want it to carry the last upstream failure", err)
+	}
+	pe, ok := errAs[*ProviderError](err)
+	if !ok {
+		t.Fatalf("error = %v (%T), want a ProviderError so surfaces map the upstream status", err, err)
+	}
+	if pe.StatusCode != 500 {
+		t.Errorf("status = %d, want the last upstream status", pe.StatusCode)
+	}
+}
+
+func TestCacheableRequiresExplicitZeroTemperature(t *testing.T) {
+	// An absent temperature is the API default of 1.0, not 0. Treating it
+	// as deterministic made almost all traffic cacheable, and two identical
+	// "tell me a joke" requests came back byte-identical.
+	if cacheable(CompletionParams{}) {
+		t.Error("an unset temperature is 1.0 by default and must not be cacheable")
+	}
+	zero := 0.0
+	if !cacheable(CompletionParams{Temperature: &zero}) {
+		t.Error("an explicit temperature of 0 is deterministic and must be cacheable")
+	}
+	hot := 0.7
+	if cacheable(CompletionParams{Temperature: &hot}) {
+		t.Error("a non-zero temperature must not be cacheable")
 	}
 }
