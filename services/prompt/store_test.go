@@ -3,11 +3,14 @@ package prompt
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
-	"github.com/instantcocoa/delos/pkg/database"
 	"os"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/instantcocoa/delos/pkg/database"
 
 	_ "github.com/lib/pq"
 
@@ -114,15 +117,20 @@ func TestMemoryStore_Update(t *testing.T) {
 	}
 }
 
+// TestMemoryStore_Delete pins the soft-delete semantic: the record survives for
+// audit and recovery, but the prompt is gone as far as readers are concerned.
+// MemoryStore used to keep serving a deleted prompt while PostgresStore stopped
+// (deleted_at), so the two backends answered the same call differently.
 func TestMemoryStore_Delete(t *testing.T) {
 	store := NewMemoryStore()
 	ctx := context.Background()
 
 	prompt := &Prompt{
-		ID:     "test-id",
-		Name:   "Test Prompt",
-		Slug:   "test-prompt",
-		Status: PromptStatusActive,
+		ID:      "test-id",
+		Name:    "Test Prompt",
+		Slug:    "test-prompt",
+		Version: 1,
+		Status:  PromptStatusActive,
 	}
 
 	if err := store.Create(ctx, prompt); err != nil {
@@ -137,12 +145,59 @@ func TestMemoryStore_Delete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
-
-	if got == nil {
-		t.Fatal("Get() returned nil, expected archived prompt")
+	if got != nil {
+		t.Errorf("Get() = %+v, want nil (soft deleted)", got)
 	}
-	if got.Status != PromptStatusArchived {
-		t.Errorf("Get().Status = %v, want %v (archived)", got.Status, PromptStatusArchived)
+
+	bySlug, err := store.GetBySlug(ctx, "test-prompt", 0)
+	if err != nil {
+		t.Fatalf("GetBySlug() error = %v", err)
+	}
+	if bySlug != nil {
+		t.Errorf("GetBySlug() = %+v, want nil (soft deleted)", bySlug)
+	}
+
+	version, err := store.GetVersion(ctx, "test-id", 1)
+	if err != nil {
+		t.Fatalf("GetVersion() error = %v", err)
+	}
+	if version != nil {
+		t.Errorf("GetVersion() = %+v, want nil (soft deleted)", version)
+	}
+
+	prompts, total, err := store.List(ctx, ListQuery{})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(prompts) != 0 || total != 0 {
+		t.Errorf("List() = %d prompts (total %d), want none", len(prompts), total)
+	}
+
+	// History survives: a completed eval run that referenced this prompt can
+	// still be explained after the fact.
+	history, err := store.GetHistory(ctx, "test-id", 10)
+	if err != nil {
+		t.Fatalf("GetHistory() error = %v", err)
+	}
+	if len(history) == 0 {
+		t.Error("GetHistory() = empty, want the version history to survive a soft delete")
+	}
+
+	// Deleting twice is NOT_FOUND, not a silent success.
+	if err := store.Delete(ctx, "test-id"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("second Delete() error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMemoryStore_Delete_NotFoundIsSentinel(t *testing.T) {
+	store := NewMemoryStore()
+
+	err := store.Delete(context.Background(), "nonexistent")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("Delete() error = %v, want ErrNotFound", err)
+	}
+	if !strings.Contains(err.Error(), "nonexistent") {
+		t.Errorf("Delete() error = %q, want it to name the id", err)
 	}
 }
 
@@ -282,6 +337,8 @@ func TestMemoryStore_Get_NotFound(t *testing.T) {
 	}
 }
 
+// TestMemoryStore_Create_DuplicateSlug pins that a slug clash is a typed domain
+// error, so handlers answer ALREADY_EXISTS without string-matching the error.
 func TestMemoryStore_Create_DuplicateSlug(t *testing.T) {
 	store := NewMemoryStore()
 	ctx := context.Background()
@@ -295,7 +352,14 @@ func TestMemoryStore_Create_DuplicateSlug(t *testing.T) {
 
 	err := store.Create(ctx, prompt2)
 	if err == nil {
-		t.Error("expected error for duplicate slug")
+		t.Fatal("expected error for duplicate slug")
+	}
+	conflict, ok := AsSlugConflict(err)
+	if !ok {
+		t.Fatalf("Create() error = %v, want a *SlugConflictError", err)
+	}
+	if conflict.Slug != "same-slug" {
+		t.Errorf("conflict.Slug = %q, want %q", conflict.Slug, "same-slug")
 	}
 }
 
@@ -306,8 +370,8 @@ func TestMemoryStore_Update_NotFound(t *testing.T) {
 	prompt := &Prompt{ID: "nonexistent", Name: "Test"}
 
 	err := store.Update(ctx, prompt)
-	if err == nil {
-		t.Error("expected error for updating nonexistent prompt")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("Update() error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -316,8 +380,8 @@ func TestMemoryStore_Delete_NotFound(t *testing.T) {
 	ctx := context.Background()
 
 	err := store.Delete(ctx, "nonexistent")
-	if err == nil {
-		t.Error("expected error for deleting nonexistent prompt")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("Delete() error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -758,6 +822,58 @@ func TestPostgresStore_Delete_Integration(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("Get() = %v, want nil (soft deleted)", got)
+	}
+}
+
+// TestPostgresStore_Create_DuplicateSlug_Integration pins the SQLSTATE 23505
+// mapping: a slug clash must surface as a domain error naming the slug, never
+// as the raw driver string 'pq: duplicate key value violates unique constraint
+// "prompts_slug_key"', which leaks the schema to an API caller.
+func TestPostgresStore_Create_DuplicateSlug_Integration(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewPostgresStore(db)
+	ctx := context.Background()
+
+	first := &Prompt{ID: GenerateID(), Name: "First", Slug: "dupe-slug", Version: 1}
+	if err := store.Create(ctx, first); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	err := store.Create(ctx, &Prompt{ID: GenerateID(), Name: "Second", Slug: "dupe-slug", Version: 1})
+	conflict, ok := AsSlugConflict(err)
+	if !ok {
+		t.Fatalf("Create() error = %v, want a *SlugConflictError", err)
+	}
+	if conflict.Slug != "dupe-slug" {
+		t.Errorf("conflict.Slug = %q, want %q", conflict.Slug, "dupe-slug")
+	}
+	for _, leak := range []string{"pq:", "constraint", "prompts_slug_key", "23505"} {
+		if strings.Contains(conflict.Error(), leak) {
+			t.Errorf("conflict error %q leaks %q", conflict.Error(), leak)
+		}
+	}
+}
+
+// TestPostgresStore_Delete_NotFound_Integration: deleting something that is not
+// there reported success, so the API answered OK for a no-op.
+func TestPostgresStore_Delete_NotFound_Integration(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewPostgresStore(db)
+	ctx := context.Background()
+
+	if err := store.Delete(ctx, GenerateID()); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Delete(nonexistent) error = %v, want ErrNotFound", err)
+	}
+
+	prompt := &Prompt{ID: GenerateID(), Name: "Test", Slug: "delete-twice", Version: 1}
+	if err := store.Create(ctx, prompt); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := store.Delete(ctx, prompt.ID); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if err := store.Delete(ctx, prompt.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("second Delete() error = %v, want ErrNotFound", err)
 	}
 }
 

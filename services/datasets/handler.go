@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -38,6 +39,18 @@ func NewHandler(logger *slog.Logger, svc *DatasetsService) *Handler {
 // Register registers the handler with a gRPC server.
 func (h *Handler) Register(s *grpc.Server) {
 	datasetsv1.RegisterDatasetsServiceServer(s, h)
+}
+
+// serviceError maps a service/store error onto a gRPC status. Domain errors
+// get the code a caller can act on; anything else is logged in full and
+// answered with a fixed message so internal detail does not leak.
+func (h *Handler) serviceError(ctx context.Context, op string, err error) error {
+	if errors.Is(err, ErrDatasetNotFound) {
+		// Wrapped not-found errors read "dataset not found: <id>".
+		return status.Error(codes.NotFound, err.Error())
+	}
+	h.logger.ErrorContext(ctx, op, "error", err)
+	return status.Error(codes.Internal, op)
 }
 
 // CreateDataset creates a new dataset.
@@ -96,8 +109,7 @@ func (h *Handler) UpdateDataset(ctx context.Context, req *datasetsv1.UpdateDatas
 
 	dataset, err := h.service.UpdateDataset(ctx, input)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "failed to update dataset", "error", err)
-		return nil, status.Errorf(codes.Internal, "failed to update dataset: %v", err)
+		return nil, h.serviceError(ctx, "failed to update dataset", err)
 	}
 
 	return &datasetsv1.UpdateDatasetResponse{
@@ -139,8 +151,7 @@ func (h *Handler) DeleteDataset(ctx context.Context, req *datasetsv1.DeleteDatas
 	h.logger.InfoContext(ctx, "deleting dataset", "id", req.Id)
 
 	if err := h.service.DeleteDataset(ctx, req.Id); err != nil {
-		h.logger.ErrorContext(ctx, "failed to delete dataset", "error", err)
-		return nil, status.Errorf(codes.Internal, "failed to delete dataset: %v", err)
+		return nil, h.serviceError(ctx, "failed to delete dataset", err)
 	}
 
 	return &datasetsv1.DeleteDatasetResponse{Success: true}, nil
@@ -167,11 +178,7 @@ func (h *Handler) AddExamples(ctx context.Context, req *datasetsv1.AddExamplesRe
 
 	examples, err := h.service.AddExamples(ctx, input)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "failed to add examples", "error", err)
-		if strings.Contains(err.Error(), "dataset not found") {
-			return nil, status.Errorf(codes.NotFound, "dataset not found: %s", req.DatasetId)
-		}
-		return nil, status.Errorf(codes.Internal, "failed to add examples: %v", err)
+		return nil, h.serviceError(ctx, "failed to add examples", err)
 	}
 
 	protoExamples := make([]*datasetsv1.Example, len(examples))
@@ -229,8 +236,7 @@ func (h *Handler) RemoveExamples(ctx context.Context, req *datasetsv1.RemoveExam
 
 	removed, err := h.service.RemoveExamples(ctx, req.DatasetId, req.ExampleIds)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "failed to remove examples", "error", err)
-		return nil, status.Errorf(codes.Internal, "failed to remove examples: %v", err)
+		return nil, h.serviceError(ctx, "failed to remove examples", err)
 	}
 
 	return &datasetsv1.RemoveExamplesResponse{RemovedCount: int32(removed)}, nil

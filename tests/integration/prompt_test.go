@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
 )
 
@@ -283,16 +286,32 @@ func TestPromptService_Delete(t *testing.T) {
 		t.Fatalf("DeletePrompt failed: %v", err)
 	}
 
-	// Delete is a soft delete: the record survives, marked archived, so history
-	// and past eval runs keep resolving. It must not come back as active.
+	// Delete is a soft delete in the storage layer only: the row survives for
+	// audit and recovery (and its version history still resolves), but the
+	// prompt is gone as far as the API is concerned. Get must report NOT_FOUND,
+	// the same answer List already gives by omitting it.
 	getResp, err := client.GetPrompt(ctx, &promptv1.GetPromptRequest{Id: promptID})
+	if err == nil {
+		t.Fatalf("expected NOT_FOUND fetching a deleted prompt, got %+v", getResp.GetPrompt())
+	}
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("GetPrompt after delete: expected NOT_FOUND, got %s: %s", got, status.Convert(err).Message())
+	}
+
+	// A second delete is NOT_FOUND too: an OK would tell the caller there was
+	// something there to delete.
+	if _, err := client.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptID}); status.Code(err) != codes.NotFound {
+		t.Errorf("second DeletePrompt: expected NOT_FOUND, got %s", status.Code(err))
+	}
+
+	// It must also be gone from List.
+	listResp, err := client.ListPrompts(ctx, &promptv1.ListPromptsRequest{Limit: 200})
 	if err != nil {
-		t.Fatalf("GetPrompt after a soft delete failed: %v", err)
+		t.Fatalf("ListPrompts failed: %v", err)
 	}
-	if getResp.Prompt == nil {
-		t.Fatal("expected the soft-deleted prompt to still be retrievable by id")
-	}
-	if got := getResp.Prompt.Status; got != promptv1.PromptStatus_PROMPT_STATUS_ARCHIVED {
-		t.Errorf("expected a deleted prompt to be ARCHIVED, got %s", got)
+	for _, p := range listResp.Prompts {
+		if p.Id == promptID {
+			t.Errorf("deleted prompt %s still listed", promptID)
+		}
 	}
 }

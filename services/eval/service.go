@@ -2,11 +2,30 @@ package eval
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// ErrEvalRunNotFound is returned when an operation names an eval run that does
+// not exist. Handlers map it to gRPC NOT_FOUND rather than swallowing it into
+// INTERNAL, which would tell a caller the server broke when in fact their id
+// was wrong.
+var ErrEvalRunNotFound = errors.New("eval run not found")
+
+// NotCancellableError reports that a run exists but is in a state that cannot
+// be cancelled (already completed, failed or cancelled). Handlers map it to
+// FAILED_PRECONDITION.
+type NotCancellableError struct {
+	ID     string
+	Status EvalRunStatus
+}
+
+func (e *NotCancellableError) Error() string {
+	return fmt.Sprintf("eval run %s cannot be cancelled: status is %s", e.ID, e.Status)
+}
 
 // EvalService handles evaluation business logic.
 type EvalService struct {
@@ -69,11 +88,11 @@ func (s *EvalService) CancelEvalRun(ctx context.Context, id string) (*EvalRun, e
 		return nil, fmt.Errorf("failed to get eval run: %w", err)
 	}
 	if run == nil {
-		return nil, fmt.Errorf("eval run not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrEvalRunNotFound, id)
 	}
 
 	if run.Status != EvalRunStatusPending && run.Status != EvalRunStatusRunning {
-		return nil, fmt.Errorf("cannot cancel eval run with status: %d", run.Status)
+		return nil, &NotCancellableError{ID: id, Status: run.Status}
 	}
 
 	run.Status = EvalRunStatusCancelled
@@ -103,7 +122,7 @@ func (s *EvalService) CompareRuns(ctx context.Context, runIDA, runIDB string) (*
 		return nil, fmt.Errorf("failed to get run A: %w", err)
 	}
 	if runA == nil {
-		return nil, fmt.Errorf("run not found: %s", runIDA)
+		return nil, fmt.Errorf("%w: %s", ErrEvalRunNotFound, runIDA)
 	}
 
 	runB, err := s.store.GetEvalRun(ctx, runIDB)
@@ -111,7 +130,7 @@ func (s *EvalService) CompareRuns(ctx context.Context, runIDA, runIDB string) (*
 		return nil, fmt.Errorf("failed to get run B: %w", err)
 	}
 	if runB == nil {
-		return nil, fmt.Errorf("run not found: %s", runIDB)
+		return nil, fmt.Errorf("%w: %s", ErrEvalRunNotFound, runIDB)
 	}
 
 	resultsA, err := s.store.GetEvalResultsByRunID(ctx, runIDA)

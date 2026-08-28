@@ -2,6 +2,7 @@ package prompt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -34,6 +35,25 @@ func NewHandler(store Store, logger *slog.Logger) *Handler {
 // Register registers the handler with a gRPC server.
 func (h *Handler) Register(s *grpc.Server) {
 	promptv1.RegisterPromptServiceServer(s, h)
+}
+
+// storeError maps a store error onto a gRPC status.
+//
+// Domain errors (ErrNotFound, SlugConflictError) become the codes callers can
+// act on. Anything else is logged in full and answered with a fixed message:
+// store errors can embed driver text and database constraint names, and those
+// belong in the server log, not in an API response.
+func (h *Handler) storeError(ctx context.Context, op string, err error) error {
+	if conflict, ok := AsSlugConflict(err); ok {
+		return status.Errorf(codes.AlreadyExists, "prompt slug already exists: %s", conflict.Slug)
+	}
+	if errors.Is(err, ErrNotFound) {
+		// Store not-found errors read "prompt not found: <id>", so the message
+		// already names the resource. It contains no driver text.
+		return status.Error(codes.NotFound, err.Error())
+	}
+	h.logger.ErrorContext(ctx, op, "error", err)
+	return status.Error(codes.Internal, op)
 }
 
 // CreatePrompt creates a new prompt.
@@ -72,11 +92,7 @@ func (h *Handler) CreatePrompt(ctx context.Context, req *promptv1.CreatePromptRe
 	}
 
 	if err := h.store.Create(ctx, prompt); err != nil {
-		h.logger.ErrorContext(ctx, "failed to create prompt", "error", err)
-		if strings.Contains(err.Error(), "already exists") {
-			return nil, status.Errorf(codes.AlreadyExists, "%v", err)
-		}
-		return nil, status.Errorf(codes.Internal, "failed to create prompt: %v", err)
+		return nil, h.storeError(ctx, "failed to create prompt", err)
 	}
 
 	h.logger.InfoContext(ctx, "prompt created", "id", prompt.ID, "slug", prompt.Slug)
@@ -162,8 +178,7 @@ func (h *Handler) GetPrompt(ctx context.Context, req *promptv1.GetPromptRequest)
 
 	prompt, err := h.lookup(ctx, target, version)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "failed to get prompt", "error", err, "target", target)
-		return nil, status.Errorf(codes.Internal, "failed to get prompt: %v", err)
+		return nil, h.storeError(ctx, "failed to get prompt", err)
 	}
 	if prompt == nil {
 		if version > 0 {
@@ -181,7 +196,7 @@ func (h *Handler) GetPrompt(ctx context.Context, req *promptv1.GetPromptRequest)
 func (h *Handler) UpdatePrompt(ctx context.Context, req *promptv1.UpdatePromptRequest) (*promptv1.UpdatePromptResponse, error) {
 	existing, err := h.lookup(ctx, req.Id, 0)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get prompt: %v", err)
+		return nil, h.storeError(ctx, "failed to get prompt", err)
 	}
 	if existing == nil {
 		return nil, status.Errorf(codes.NotFound, "prompt not found: %s", req.Id)
@@ -213,8 +228,7 @@ func (h *Handler) UpdatePrompt(ctx context.Context, req *promptv1.UpdatePromptRe
 	existing.UpdatedAt = time.Now()
 
 	if err := h.store.Update(ctx, existing); err != nil {
-		h.logger.ErrorContext(ctx, "failed to update prompt", "error", err)
-		return nil, status.Errorf(codes.Internal, "failed to update prompt: %v", err)
+		return nil, h.storeError(ctx, "failed to update prompt", err)
 	}
 
 	h.logger.InfoContext(ctx, "prompt updated",
@@ -243,7 +257,7 @@ func (h *Handler) ListPrompts(ctx context.Context, req *promptv1.ListPromptsRequ
 
 	prompts, total, err := h.store.List(ctx, query)
 	if err != nil {
-		return nil, err
+		return nil, h.storeError(ctx, "failed to list prompts", err)
 	}
 
 	protoPrompts := make([]*promptv1.Prompt, len(prompts))
@@ -257,11 +271,19 @@ func (h *Handler) ListPrompts(ctx context.Context, req *promptv1.ListPromptsRequ
 	}, nil
 }
 
-// DeletePrompt deletes a prompt (soft delete).
+// DeletePrompt soft-deletes a prompt. Deleting a prompt that does not exist
+// (or that was already deleted) is NOT_FOUND, not a silent success: a caller
+// that gets an OK is entitled to believe something was there to delete.
 func (h *Handler) DeletePrompt(ctx context.Context, req *promptv1.DeletePromptRequest) (*promptv1.DeletePromptResponse, error) {
+	if req.Id == "" {
+		return nil, status.Error(codes.InvalidArgument, "id is required")
+	}
+
 	if err := h.store.Delete(ctx, h.resolveID(ctx, req.Id)); err != nil {
-		h.logger.ErrorContext(ctx, "failed to delete prompt", "error", err)
-		return nil, err
+		if errors.Is(err, ErrNotFound) {
+			return nil, status.Errorf(codes.NotFound, "prompt not found: %s", req.Id)
+		}
+		return nil, h.storeError(ctx, "failed to delete prompt", err)
 	}
 
 	h.logger.InfoContext(ctx, "prompt deleted", "id", req.Id)
@@ -283,7 +305,7 @@ func (h *Handler) GetPromptHistory(ctx context.Context, req *promptv1.GetPromptH
 
 	versions, err := h.store.GetHistory(ctx, promptID, int(req.Limit))
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get history: %v", err)
+		return nil, h.storeError(ctx, "failed to get prompt history", err)
 	}
 	if len(versions) == 0 {
 		// No history at all means the prompt itself does not exist.
@@ -312,7 +334,7 @@ func (h *Handler) CompareVersions(ctx context.Context, req *promptv1.CompareVers
 
 	promptA, err := h.store.GetVersion(ctx, promptID, int(req.VersionA))
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get version %d: %v", req.VersionA, err)
+		return nil, h.storeError(ctx, "failed to get prompt version", err)
 	}
 	if promptA == nil {
 		return nil, status.Errorf(codes.NotFound, "prompt %s has no version %d", req.PromptId, req.VersionA)
@@ -320,7 +342,7 @@ func (h *Handler) CompareVersions(ctx context.Context, req *promptv1.CompareVers
 
 	promptB, err := h.store.GetVersion(ctx, promptID, int(req.VersionB))
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get version %d: %v", req.VersionB, err)
+		return nil, h.storeError(ctx, "failed to get prompt version", err)
 	}
 	if promptB == nil {
 		return nil, status.Errorf(codes.NotFound, "prompt %s has no version %d", req.PromptId, req.VersionB)

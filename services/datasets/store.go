@@ -89,7 +89,7 @@ func (s *MemoryStore) UpdateDataset(ctx context.Context, dataset *Dataset) error
 	defer s.mu.Unlock()
 
 	if _, exists := s.datasets[dataset.ID]; !exists {
-		return fmt.Errorf("dataset not found: %s", dataset.ID)
+		return fmt.Errorf("%w: %s", ErrDatasetNotFound, dataset.ID)
 	}
 
 	s.datasets[dataset.ID] = dataset
@@ -102,7 +102,7 @@ func (s *MemoryStore) DeleteDataset(ctx context.Context, id string) error {
 	defer s.mu.Unlock()
 
 	if _, exists := s.datasets[id]; !exists {
-		return fmt.Errorf("dataset not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrDatasetNotFound, id)
 	}
 
 	delete(s.datasets, id)
@@ -185,7 +185,7 @@ func (s *MemoryStore) AddExamples(ctx context.Context, datasetID string, example
 
 	dataset, exists := s.datasets[datasetID]
 	if !exists {
-		return fmt.Errorf("dataset not found: %s", datasetID)
+		return fmt.Errorf("%w: %s", ErrDatasetNotFound, datasetID)
 	}
 
 	s.examples[datasetID] = append(s.examples[datasetID], examples...)
@@ -244,7 +244,7 @@ func (s *MemoryStore) RemoveExamples(ctx context.Context, datasetID string, exam
 
 	dataset, exists := s.datasets[datasetID]
 	if !exists {
-		return 0, fmt.Errorf("dataset not found: %s", datasetID)
+		return 0, fmt.Errorf("%w: %s", ErrDatasetNotFound, datasetID)
 	}
 
 	examples := s.examples[datasetID]

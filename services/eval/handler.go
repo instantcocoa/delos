@@ -2,6 +2,7 @@ package eval
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"google.golang.org/grpc"
@@ -18,14 +19,39 @@ type Handler struct {
 	evalv1.UnimplementedEvalServiceServer
 	logger  *slog.Logger
 	service *EvalService
+
+	// Optional reference sources. When set, CreateEvalRun resolves the prompt
+	// and dataset it names before accepting the run.
+	prompts  PromptSource
+	datasets ExampleSource
+}
+
+// HandlerOption configures a Handler.
+type HandlerOption func(*Handler)
+
+// WithReferenceValidation makes CreateEvalRun resolve the prompt and dataset a
+// run names before accepting it. A run whose references cannot resolve can
+// never execute, so rejecting it at creation is both honest and better UX than
+// accepting it and failing asynchronously minutes later. When this option is
+// not supplied (unit tests, embedders with no prompt or dataset module) the
+// references are taken on trust and the runner fails the run instead.
+func WithReferenceValidation(prompts PromptSource, datasets ExampleSource) HandlerOption {
+	return func(h *Handler) {
+		h.prompts = prompts
+		h.datasets = datasets
+	}
 }
 
 // NewHandler creates a new eval service handler.
-func NewHandler(logger *slog.Logger, svc *EvalService) *Handler {
-	return &Handler{
+func NewHandler(logger *slog.Logger, svc *EvalService, opts ...HandlerOption) *Handler {
+	h := &Handler{
 		logger:  logger.With("component", "handler"),
 		service: svc,
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // Register registers the handler with a gRPC server.
@@ -33,9 +59,54 @@ func (h *Handler) Register(s *grpc.Server) {
 	evalv1.RegisterEvalServiceServer(s, h)
 }
 
+// serviceError maps a service error onto a gRPC status. Domain errors get the
+// code a caller can act on - a missing run is NOT_FOUND, an uncancellable one
+// is FAILED_PRECONDITION - instead of being swallowed into INTERNAL, which
+// would blame the server for the caller's bad id.
+func (h *Handler) serviceError(ctx context.Context, op string, err error) error {
+	if errors.Is(err, ErrEvalRunNotFound) {
+		// Wrapped not-found errors read "eval run not found: <id>".
+		return status.Error(codes.NotFound, err.Error())
+	}
+	var notCancellable *NotCancellableError
+	if errors.As(err, &notCancellable) {
+		return status.Error(codes.FailedPrecondition, notCancellable.Error())
+	}
+	h.logger.ErrorContext(ctx, op, "error", err)
+	return status.Error(codes.Internal, op)
+}
+
+// validateReferences resolves the prompt and dataset a new run names. It
+// returns a NOT_FOUND status for a reference that does not exist and nil when
+// validation is not configured.
+func (h *Handler) validateReferences(ctx context.Context, promptID, datasetID string) error {
+	if h.prompts != nil && promptID != "" {
+		if _, err := h.prompts.GetPrompt(ctx, promptID); err != nil {
+			if status.Code(err) == codes.NotFound {
+				return status.Errorf(codes.NotFound, "prompt not found: %s", promptID)
+			}
+			return h.serviceError(ctx, "failed to resolve prompt", err)
+		}
+	}
+	if h.datasets != nil && datasetID != "" {
+		// Limit 1: this is an existence check, not a fetch.
+		if _, err := h.datasets.GetExamples(ctx, datasetID, 1, false); err != nil {
+			if status.Code(err) == codes.NotFound {
+				return status.Errorf(codes.NotFound, "dataset not found: %s", datasetID)
+			}
+			return h.serviceError(ctx, "failed to resolve dataset", err)
+		}
+	}
+	return nil
+}
+
 // CreateEvalRun creates and starts an evaluation run.
 func (h *Handler) CreateEvalRun(ctx context.Context, req *evalv1.CreateEvalRunRequest) (*evalv1.CreateEvalRunResponse, error) {
 	h.logger.InfoContext(ctx, "creating eval run", "name", req.Name, "prompt_id", req.PromptId)
+
+	if err := h.validateReferences(ctx, req.PromptId, req.DatasetId); err != nil {
+		return nil, err
+	}
 
 	input := CreateEvalRunInput{
 		Name:          req.Name,
@@ -49,8 +120,7 @@ func (h *Handler) CreateEvalRun(ctx context.Context, req *evalv1.CreateEvalRunRe
 
 	run, err := h.service.CreateEvalRun(ctx, input)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "failed to create eval run", "error", err)
-		return nil, status.Errorf(codes.Internal, "failed to create eval run: %v", err)
+		return nil, h.serviceError(ctx, "failed to create eval run", err)
 	}
 
 	return &evalv1.CreateEvalRunResponse{
@@ -64,8 +134,7 @@ func (h *Handler) GetEvalRun(ctx context.Context, req *evalv1.GetEvalRunRequest)
 
 	run, err := h.service.GetEvalRun(ctx, req.Id)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "failed to get eval run", "error", err)
-		return nil, status.Errorf(codes.Internal, "failed to get eval run: %v", err)
+		return nil, h.serviceError(ctx, "failed to get eval run", err)
 	}
 	if run == nil {
 		return nil, status.Errorf(codes.NotFound, "eval run not found: %s", req.Id)
@@ -90,8 +159,7 @@ func (h *Handler) ListEvalRuns(ctx context.Context, req *evalv1.ListEvalRunsRequ
 
 	runs, total, err := h.service.ListEvalRuns(ctx, query)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "failed to list eval runs", "error", err)
-		return nil, status.Errorf(codes.Internal, "failed to list eval runs: %v", err)
+		return nil, h.serviceError(ctx, "failed to list eval runs", err)
 	}
 
 	protoRuns := make([]*evalv1.EvalRun, len(runs))
@@ -111,8 +179,7 @@ func (h *Handler) CancelEvalRun(ctx context.Context, req *evalv1.CancelEvalRunRe
 
 	run, err := h.service.CancelEvalRun(ctx, req.Id)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "failed to cancel eval run", "error", err)
-		return nil, status.Errorf(codes.Internal, "failed to cancel eval run: %v", err)
+		return nil, h.serviceError(ctx, "failed to cancel eval run", err)
 	}
 
 	return &evalv1.CancelEvalRunResponse{
@@ -124,6 +191,16 @@ func (h *Handler) CancelEvalRun(ctx context.Context, req *evalv1.CancelEvalRunRe
 func (h *Handler) GetEvalResults(ctx context.Context, req *evalv1.GetEvalResultsRequest) (*evalv1.GetEvalResultsResponse, error) {
 	h.logger.InfoContext(ctx, "getting eval results", "eval_run_id", req.EvalRunId)
 
+	// Resolve the run first, so an unknown id is NOT_FOUND rather than an empty
+	// result set that reads as "this run produced nothing".
+	run, err := h.service.GetEvalRun(ctx, req.EvalRunId)
+	if err != nil {
+		return nil, h.serviceError(ctx, "failed to get eval run", err)
+	}
+	if run == nil {
+		return nil, status.Errorf(codes.NotFound, "eval run not found: %s", req.EvalRunId)
+	}
+
 	query := GetEvalResultsQuery{
 		EvalRunID:  req.EvalRunId,
 		FailedOnly: req.FailedOnly,
@@ -133,8 +210,7 @@ func (h *Handler) GetEvalResults(ctx context.Context, req *evalv1.GetEvalResults
 
 	results, total, err := h.service.GetEvalResults(ctx, query)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "failed to get eval results", "error", err)
-		return nil, status.Errorf(codes.Internal, "failed to get eval results: %v", err)
+		return nil, h.serviceError(ctx, "failed to get eval results", err)
 	}
 
 	protoResults := make([]*evalv1.EvalResult, len(results))
@@ -154,8 +230,7 @@ func (h *Handler) CompareRuns(ctx context.Context, req *evalv1.CompareRunsReques
 
 	result, err := h.service.CompareRuns(ctx, req.RunIdA, req.RunIdB)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "failed to compare runs", "error", err)
-		return nil, status.Errorf(codes.Internal, "failed to compare runs: %v", err)
+		return nil, h.serviceError(ctx, "failed to compare runs", err)
 	}
 
 	examples := make([]*evalv1.ExampleComparison, len(result.Examples))
@@ -199,8 +274,7 @@ func (h *Handler) ListEvaluators(ctx context.Context, req *evalv1.ListEvaluators
 
 	evaluators, err := h.service.ListEvaluators(ctx)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "failed to list evaluators", "error", err)
-		return nil, status.Errorf(codes.Internal, "failed to list evaluators: %v", err)
+		return nil, h.serviceError(ctx, "failed to list evaluators", err)
 	}
 
 	protoEvaluators := make([]*evalv1.Evaluator, len(evaluators))

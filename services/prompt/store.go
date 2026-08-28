@@ -4,14 +4,32 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/lib/pq"
+
 	"github.com/instantcocoa/delos/pkg/config"
 )
+
+// pgUniqueViolation is the SQLSTATE class for a unique-constraint violation.
+// Driver errors carrying it name the constraint, so they are translated into
+// domain errors here rather than being handed to an API caller.
+const pgUniqueViolation = "23505"
+
+// isUniqueViolation reports whether err is a Postgres unique-constraint
+// violation on the named constraint (any constraint when name is empty).
+func isUniqueViolation(err error, constraint string) bool {
+	var pqErr *pq.Error
+	if !errors.As(err, &pqErr) || string(pqErr.Code) != pgUniqueViolation {
+		return false
+	}
+	return constraint == "" || pqErr.Constraint == constraint
+}
 
 // Store defines the interface for prompt storage operations.
 type Store interface {
@@ -53,6 +71,7 @@ type MemoryStore struct {
 	versions map[string][]*Prompt       // id -> all versions
 	slugs    map[string]string          // slug -> id
 	history  map[string][]PromptVersion // id -> version history
+	deleted  map[string]bool            // id -> soft-deleted
 }
 
 // NewMemoryStore creates a new in-memory prompt store.
@@ -62,6 +81,7 @@ func NewMemoryStore() *MemoryStore {
 		versions: make(map[string][]*Prompt),
 		slugs:    make(map[string]string),
 		history:  make(map[string][]PromptVersion),
+		deleted:  make(map[string]bool),
 	}
 }
 
@@ -70,7 +90,7 @@ func (s *MemoryStore) Create(ctx context.Context, prompt *Prompt) error {
 	defer s.mu.Unlock()
 
 	if _, exists := s.slugs[prompt.Slug]; exists {
-		return fmt.Errorf("slug already exists: %s", prompt.Slug)
+		return &SlugConflictError{Slug: prompt.Slug}
 	}
 
 	changeDesc := prompt.ChangeDescription
@@ -98,7 +118,7 @@ func (s *MemoryStore) Get(ctx context.Context, id string) (*Prompt, error) {
 	defer s.mu.RUnlock()
 
 	prompt, ok := s.prompts[id]
-	if !ok {
+	if !ok || s.deleted[id] {
 		return nil, nil
 	}
 
@@ -110,7 +130,7 @@ func (s *MemoryStore) GetBySlug(ctx context.Context, slug string, version int) (
 	defer s.mu.RUnlock()
 
 	id, ok := s.slugs[slug]
-	if !ok {
+	if !ok || s.deleted[id] {
 		return nil, nil
 	}
 
@@ -137,8 +157,8 @@ func (s *MemoryStore) Update(ctx context.Context, prompt *Prompt) error {
 	defer s.mu.Unlock()
 
 	existing, ok := s.prompts[prompt.ID]
-	if !ok {
-		return fmt.Errorf("prompt not found: %s", prompt.ID)
+	if !ok || s.deleted[prompt.ID] {
+		return fmt.Errorf("%w: %s", ErrNotFound, prompt.ID)
 	}
 
 	prompt.Version = existing.Version + 1
@@ -162,17 +182,26 @@ func (s *MemoryStore) Update(ctx context.Context, prompt *Prompt) error {
 	return nil
 }
 
+// Delete soft-deletes a prompt.
+//
+// Soft delete means the record survives for audit and recovery - the row keeps
+// its version history and is marked archived - but the prompt is gone as far as
+// the API is concerned: Get, GetBySlug, GetVersion and List all stop returning
+// it, and a second Delete reports ErrNotFound. GetHistory still resolves, so a
+// past eval run can be explained after the fact. PostgresStore.Delete has the
+// same semantics via the deleted_at column; the two backends must not diverge.
 func (s *MemoryStore) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	prompt, ok := s.prompts[id]
-	if !ok {
-		return fmt.Errorf("prompt not found: %s", id)
+	if !ok || s.deleted[id] {
+		return fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 
 	prompt.Status = PromptStatusArchived
 	prompt.UpdatedAt = time.Now()
+	s.deleted[id] = true
 
 	return nil
 }
@@ -183,7 +212,10 @@ func (s *MemoryStore) List(ctx context.Context, query ListQuery) ([]*Prompt, int
 
 	var results []*Prompt
 
-	for _, prompt := range s.prompts {
+	for id, prompt := range s.prompts {
+		if s.deleted[id] {
+			continue
+		}
 		if !s.matchesQuery(prompt, query) {
 			continue
 		}
@@ -235,7 +267,7 @@ func (s *MemoryStore) GetVersion(ctx context.Context, id string, version int) (*
 	defer s.mu.RUnlock()
 
 	versions, ok := s.versions[id]
-	if !ok {
+	if !ok || s.deleted[id] {
 		return nil, nil
 	}
 
@@ -323,6 +355,11 @@ func (s *PostgresStore) Create(ctx context.Context, prompt *Prompt) error {
 		StatusToString(prompt.Status), prompt.CreatedBy, prompt.CreatedAt,
 		prompt.UpdatedBy, prompt.UpdatedAt)
 	if err != nil {
+		if isUniqueViolation(err, "prompts_slug_key") {
+			// Never surface the driver text or the constraint name: the caller
+			// gets a domain error naming only the slug they chose.
+			return &SlugConflictError{Slug: prompt.Slug}
+		}
 		return fmt.Errorf("failed to insert prompt: %w", err)
 	}
 
@@ -457,12 +494,15 @@ func (s *PostgresStore) Update(ctx context.Context, prompt *Prompt) error {
 	}
 	defer tx.Rollback()
 
-	_, err = tx.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		UPDATE prompts SET description = $2, updated_by = $3, updated_at = $4
-		WHERE id = $1
+		WHERE id = $1 AND deleted_at IS NULL
 	`, prompt.ID, prompt.Description, prompt.UpdatedBy, prompt.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to update prompt: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("%w: %s", ErrNotFound, prompt.ID)
 	}
 
 	// The store owns version numbering (as MemoryStore does): every update
@@ -509,11 +549,30 @@ func (s *PostgresStore) Update(ctx context.Context, prompt *Prompt) error {
 	return tx.Commit()
 }
 
+// Delete soft-deletes a prompt by stamping deleted_at.
+//
+// Soft delete means the row survives for audit and recovery, but the prompt is
+// gone as far as the API is concerned: Get, GetBySlug, GetVersion and List all
+// filter on deleted_at IS NULL, so they report NOT_FOUND afterwards, and a
+// second Delete reports ErrNotFound rather than silently succeeding. The
+// prompt_versions rows are left intact so GetHistory can still explain a past
+// eval run. MemoryStore.Delete has the same semantics; the two backends must
+// not diverge.
 func (s *PostgresStore) Delete(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE prompts SET deleted_at = NOW() WHERE id = $1
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE prompts SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL
 	`, id)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to delete prompt: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to delete prompt: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: %s", ErrNotFound, id)
+	}
+	return nil
 }
 
 func (s *PostgresStore) List(ctx context.Context, query ListQuery) ([]*Prompt, int, error) {
