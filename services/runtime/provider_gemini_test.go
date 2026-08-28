@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // geminiTestProvider returns a provider pointed at an httptest server running
@@ -719,5 +720,320 @@ func TestGeminiModelPath(t *testing.T) {
 	}
 	if got := geminiModelPath("models/gemini-2.5-flash"); got != "models/gemini-2.5-flash" {
 		t.Errorf("geminiModelPath double-prefixed: %q", got)
+	}
+}
+
+// ---- empty content and system-only conversations ----
+
+// `{"role":"user","content":""}` is legal on OpenAI and Anthropic and clients
+// send it. With omitempty alone it serialized as {"parts":[{}]}, which Gemini
+// rejects with 400 INVALID_ARGUMENT.
+func TestGeminiEmptyTextPartIsExplicit(t *testing.T) {
+	raw, err := json.Marshal(geminiPart{Text: ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"text":""}` {
+		t.Errorf("empty text part = %s, want {\"text\":\"\"}", raw)
+	}
+
+	// A non-text part must not gain a spurious empty "text".
+	raw, err = json.Marshal(geminiPart{FunctionCall: &geminiFunctionCall{Name: "f", Args: json.RawMessage(`{}`)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"text"`) {
+		t.Errorf("function-call part carries a text field: %s", raw)
+	}
+	raw, err = json.Marshal(geminiPart{InlineData: &geminiInlineData{MimeType: "image/png", Data: "AAA"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"text"`) {
+		t.Errorf("inline-data part carries a text field: %s", raw)
+	}
+}
+
+func TestGeminiEmptyMessageContent(t *testing.T) {
+	p := NewGeminiProvider("k")
+	req, err := p.buildRequest(CompletionParams{
+		Model:    "gemini-2.5-flash",
+		Messages: []Message{{Role: "user", Content: []ContentPart{TextPart("")}}},
+	})
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"parts":[{"text":""}]`) {
+		t.Errorf("empty user turn serialized as %s", raw)
+	}
+	if strings.Contains(string(raw), `"parts":[{}]`) {
+		t.Errorf("empty part serialized as {}: %s", raw)
+	}
+}
+
+// A conversation that is only system messages produced "contents": null, which
+// the API rejects outright.
+func TestGeminiSystemOnlyConversation(t *testing.T) {
+	p := NewGeminiProvider("k")
+	req, err := p.buildRequest(CompletionParams{
+		Model:    "gemini-2.5-flash",
+		Messages: []Message{TextMessage("system", "you are terse")},
+	})
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if len(req.Contents) == 0 {
+		t.Fatal("Contents is empty; it would serialize as null")
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"contents":null`) {
+		t.Errorf("contents serialized as null: %s", raw)
+	}
+	if req.SystemInstruction == nil {
+		t.Error("system instruction was dropped")
+	}
+}
+
+// ---- schema scrubbing ----
+
+// A Pydantic-generated tool schema: $ref into $defs, oneOf, const,
+// exclusiveMinimum, additionalProperties. All of it used to reach Gemini
+// unchanged and 400.
+func TestGeminiScrubPydanticSchema(t *testing.T) {
+	raw := json.RawMessage(`{
+		"$schema": "https://json-schema.org/draft/2020-12/schema",
+		"$defs": {
+			"Address": {
+				"type": "object",
+				"additionalProperties": false,
+				"properties": {
+					"street": {"type": "string"},
+					"zip": {"type": "string", "pattern": "^[0-9]{5}$"}
+				},
+				"required": ["street"]
+			},
+			"Unit": {"const": "metric"}
+		},
+		"type": "object",
+		"additionalProperties": false,
+		"properties": {
+			"home": {"$ref": "#/$defs/Address"},
+			"unit": {"$ref": "#/$defs/Unit"},
+			"age": {"type": "integer", "exclusiveMinimum": 0, "maximum": 130},
+			"nickname": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+			"kind": {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+			"tags": {"type": "array", "items": {"$ref": "#/$defs/Unit"}}
+		},
+		"required": ["home"]
+	}`)
+
+	var got map[string]any
+	if err := json.Unmarshal(geminiScrubSchema(raw), &got); err != nil {
+		t.Fatalf("scrubbed schema is not valid JSON: %v", err)
+	}
+
+	for _, banned := range []string{"$schema", "$defs", "additionalProperties", "$ref", "oneOf", "const", "exclusiveMinimum"} {
+		if _, present := got[banned]; present {
+			t.Errorf("top level still carries %q", banned)
+		}
+	}
+	assertNoKeyAnywhere(t, got, "$ref")
+	assertNoKeyAnywhere(t, got, "$defs")
+	assertNoKeyAnywhere(t, got, "oneOf")
+	assertNoKeyAnywhere(t, got, "const")
+	assertNoKeyAnywhere(t, got, "exclusiveMinimum")
+
+	props, ok := got["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties = %#v", got["properties"])
+	}
+
+	// $ref was resolved, not just deleted: the referenced shape is inlined.
+	home, _ := props["home"].(map[string]any)
+	if home["type"] != "object" {
+		t.Errorf("home = %#v, want the inlined Address object", home)
+	}
+	homeProps, _ := home["properties"].(map[string]any)
+	if _, ok := homeProps["street"]; !ok {
+		t.Errorf("home lost its properties: %#v", home)
+	}
+	if _, ok := home["additionalProperties"]; ok {
+		t.Error("inlined $ref target kept additionalProperties")
+	}
+
+	// const became a single-value enum.
+	unit, _ := props["unit"].(map[string]any)
+	enum, _ := unit["enum"].([]any)
+	if len(enum) != 1 || enum[0] != "metric" {
+		t.Errorf("unit = %#v, want enum [metric]", unit)
+	}
+
+	// exclusiveMinimum is dropped; the supported bound survives.
+	age, _ := props["age"].(map[string]any)
+	if age["maximum"] == nil {
+		t.Errorf("age lost its maximum: %#v", age)
+	}
+
+	// Optional[str] collapses to a nullable string.
+	nickname, _ := props["nickname"].(map[string]any)
+	if nickname["type"] != "string" || nickname["nullable"] != true {
+		t.Errorf("nickname = %#v, want a nullable string", nickname)
+	}
+
+	// oneOf becomes anyOf.
+	kind, _ := props["kind"].(map[string]any)
+	if _, ok := kind["anyOf"].([]any); !ok {
+		t.Errorf("kind = %#v, want anyOf", kind)
+	}
+
+	// $ref inside items is resolved too.
+	tags, _ := props["tags"].(map[string]any)
+	items, _ := tags["items"].(map[string]any)
+	if _, ok := items["enum"]; !ok {
+		t.Errorf("items = %#v, want the resolved const-as-enum", items)
+	}
+}
+
+// The old scrub matched map keys anywhere, so a schema with a property
+// genuinely named "additionalProperties" silently lost that field. Property
+// names are data, not keywords.
+func TestGeminiScrubKeepsPropertyNamedLikeAKeyword(t *testing.T) {
+	raw := json.RawMessage(`{
+		"type": "object",
+		"additionalProperties": false,
+		"properties": {
+			"additionalProperties": {"type": "string", "description": "a real field"},
+			"$schema": {"type": "string"},
+			"const": {"type": "integer"}
+		}
+	}`)
+	var got map[string]any
+	if err := json.Unmarshal(geminiScrubSchema(raw), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["additionalProperties"]; ok {
+		t.Error("the additionalProperties keyword survived at schema level")
+	}
+	props, _ := got["properties"].(map[string]any)
+	for _, name := range []string{"additionalProperties", "$schema", "const"} {
+		if _, ok := props[name]; !ok {
+			t.Errorf("property %q was deleted; property names are data", name)
+		}
+	}
+	field, _ := props["additionalProperties"].(map[string]any)
+	if field["description"] != "a real field" {
+		t.Errorf("property lost its description: %#v", field)
+	}
+}
+
+// Formats Gemini does not recognise are dropped rather than forwarded.
+func TestGeminiScrubDropsUnknownFormats(t *testing.T) {
+	raw := json.RawMessage(`{"type":"object","properties":{
+		"id": {"type":"string","format":"uuid"},
+		"when": {"type":"string","format":"date-time"},
+		"n": {"type":"integer","format":"int64"}
+	}}`)
+	var got map[string]any
+	if err := json.Unmarshal(geminiScrubSchema(raw), &got); err != nil {
+		t.Fatal(err)
+	}
+	props, _ := got["properties"].(map[string]any)
+	if id, _ := props["id"].(map[string]any); id["format"] != nil {
+		t.Errorf("unknown format survived: %#v", id)
+	}
+	if when, _ := props["when"].(map[string]any); when["format"] != "date-time" {
+		t.Errorf("supported format dropped: %#v", when)
+	}
+	if n, _ := props["n"].(map[string]any); n["format"] != "int64" {
+		t.Errorf("supported integer format dropped: %#v", n)
+	}
+}
+
+// A self-referential $defs entry must terminate, not hang or blow the stack.
+func TestGeminiScrubHandlesRecursiveRefs(t *testing.T) {
+	raw := json.RawMessage(`{
+		"$defs": {"Node": {"type":"object","properties":{"child":{"$ref":"#/$defs/Node"}}}},
+		"$ref": "#/$defs/Node"
+	}`)
+	done := make(chan json.RawMessage, 1)
+	go func() { done <- geminiScrubSchema(raw) }()
+	select {
+	case out := <-done:
+		var parsed map[string]any
+		if err := json.Unmarshal(out, &parsed); err != nil {
+			t.Fatalf("recursive schema produced invalid JSON: %v", err)
+		}
+		if parsed["type"] != "object" {
+			t.Errorf("recursive schema = %#v", parsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scrubbing a recursive schema did not terminate")
+	}
+}
+
+// allOf has no Gemini equivalent and is merged rather than forwarded.
+func TestGeminiScrubMergesAllOf(t *testing.T) {
+	raw := json.RawMessage(`{"allOf":[
+		{"type":"object","properties":{"a":{"type":"string"}}},
+		{"properties":{"b":{"type":"integer"}},"required":["b"]}
+	]}`)
+	var got map[string]any
+	if err := json.Unmarshal(geminiScrubSchema(raw), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["allOf"]; ok {
+		t.Error("allOf survived")
+	}
+	if got["type"] != "object" {
+		t.Errorf("merged schema type = %v", got["type"])
+	}
+	props, _ := got["properties"].(map[string]any)
+	if len(props) == 0 {
+		t.Errorf("merged schema lost its properties: %#v", got)
+	}
+}
+
+// Anything that is not valid JSON is passed through so the backend, not the
+// gateway, reports the problem.
+func TestGeminiScrubPassesThroughInvalidJSON(t *testing.T) {
+	raw := json.RawMessage(`{not json`)
+	if got := string(geminiScrubSchema(raw)); got != `{not json` {
+		t.Errorf("scrub mangled unparseable input: %s", got)
+	}
+	if geminiScrubSchema(nil) != nil {
+		t.Error("empty schema should scrub to nil")
+	}
+}
+
+// assertNoKeyAnywhere fails if key appears at any schema position. Property
+// names are exempt: they live in the "properties" map and are data.
+func assertNoKeyAnywhere(t *testing.T, node any, key string) {
+	t.Helper()
+	switch v := node.(type) {
+	case map[string]any:
+		if _, present := v[key]; present {
+			t.Errorf("key %q survived at %#v", key, v)
+		}
+		for name, sub := range v {
+			if name == "properties" {
+				props, _ := sub.(map[string]any)
+				for _, propSchema := range props {
+					assertNoKeyAnywhere(t, propSchema, key)
+				}
+				continue
+			}
+			assertNoKeyAnywhere(t, sub, key)
+		}
+	case []any:
+		for _, item := range v {
+			assertNoKeyAnywhere(t, item, key)
+		}
 	}
 }
