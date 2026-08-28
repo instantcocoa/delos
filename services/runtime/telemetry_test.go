@@ -409,8 +409,15 @@ func TestTelemetryCacheHitAttribute(t *testing.T) {
 	svc.SetCache(NewLRUCache(10), time.Minute)
 
 	chain := []RouteTarget{{Provider: "openai", Model: "gpt-4o"}}
-	// Deterministic (no temperature) => cacheable.
-	params := CompletionParams{Model: "gpt-4o", Messages: []Message{TextMessage("user", "q")}}
+	// Only an explicit temperature of 0 is deterministic, and only
+	// deterministic requests are cacheable: an absent temperature is the
+	// API default of 1.0. See cacheable().
+	zeroTemp := 0.0
+	params := CompletionParams{
+		Model:       "gpt-4o",
+		Temperature: &zeroTemp,
+		Messages:    []Message{TextMessage("user", "q")},
+	}
 	ctx := context.Background()
 
 	if _, err := svc.CompleteChain(ctx, chain, params); err != nil {

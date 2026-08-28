@@ -1,0 +1,36 @@
+{
+  "name": "anthropic: stop_sequences map onto the Anthropic field",
+  "provider": "anthropic",
+  "surface": "anthropic",
+  "request": {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 64,
+    "stop_sequences": [
+      "THREE"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Count to three."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/messages",
+  "upstream_body_contains": [
+    "\"stop_sequences\":[\"THREE\"]"
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"msg_stop1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5-20250929\",\"content\":[{\"type\":\"text\",\"text\":\"one two \"}],\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"THREE\",\"usage\":{\"input_tokens\":13,\"output_tokens\":4}}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "content.0.text": "one two ",
+      "usage.output_tokens": 4
+    }
+  }
+}

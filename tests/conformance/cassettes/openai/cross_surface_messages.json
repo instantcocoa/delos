@@ -1,0 +1,42 @@
+{
+  "name": "openai backend served on the Anthropic Messages surface",
+  "provider": "openai",
+  "surface": "anthropic",
+  "request": {
+    "model": "gpt-4o",
+    "max_tokens": 64,
+    "system": "You are terse.",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ]
+  },
+  "upstream_path_contains": "/v1/chat/completions",
+  "upstream_body_contains": [
+    "\"role\":\"system\"",
+    "You are terse.",
+    "\"max_tokens\":64"
+  ],
+  "upstream_responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"chatcmpl-XS1\",\"object\":\"chat.completion\",\"created\":1730000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello there!\"},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":4,\"total_tokens\":18}}"
+    }
+  ],
+  "expect": {
+    "status": 200,
+    "json_paths": {
+      "content.0.text": "Hello there!",
+      "content.0.type": "text",
+      "model": "gpt-4o-2024-08-06",
+      "role": "assistant",
+      "stop_reason": "end_turn",
+      "type": "message",
+      "usage.input_tokens": 14,
+      "usage.output_tokens": 4
+    }
+  }
+}

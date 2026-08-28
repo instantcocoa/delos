@@ -72,14 +72,45 @@ type KeyStore interface {
 // ErrKeyNotFound is returned when no key matches.
 var ErrKeyNotFound = errors.New("key not found")
 
+// ErrKeyStoreUnavailable reports that the key store could not answer, as
+// distinct from answering "no such key". The two must not be collapsed: a
+// database blip that reads as "key not found" turns every valid key into a 401
+// telling the caller their key is invalid, which sends operators hunting for a
+// key problem that does not exist. Surfaces map this to 503.
+var ErrKeyStoreUnavailable = errors.New("key store unavailable")
+
+// ErrKeyPrefixConflict reports that a key with the same lookup prefix already
+// exists. Callers regenerate rather than storing a colliding key.
+var ErrKeyPrefixConflict = errors.New("key prefix already in use")
+
 // ---- key material ----
 
-const keyPrefixLen = 8
+// keyPrefixLen is the length of the lookup prefix, in characters of the
+// secret. "dk_" plus 16 base64url characters is 96 bits of prefix, which makes
+// a collision between two generated keys unreachable in practice (a 50%
+// chance needs ~3e14 keys).
+//
+// It used to be 8 — "dk_" plus five characters, about 30 bits, where a 50%
+// chance of a collision arrives at roughly 38,000 keys. A collision was not
+// merely a failed lookup: on the verification cache's hit path a request
+// authenticated with one key could be attributed to, and charged against, the
+// other key's budget and model scope. The stored prefix is public (it is shown
+// by `delos key list`), and revealing 96 of the secret's 256 bits still leaves
+// 160 bits unguessable.
+const keyPrefixLen = 19
+
+// legacyKeyPrefixLen is the prefix length of keys created before the widening.
+// Lookups fall back to it so existing keys keep working; the fallback costs one
+// extra store round trip and only on the legacy path.
+const legacyKeyPrefixLen = 8
+
+// keySecretBytes is the entropy in a generated secret.
+const keySecretBytes = 32
 
 // GenerateKey creates a new secret of the form "dk_<random>". The caller
 // shows it once and stores only the record returned by HashKey.
 func GenerateKey() (string, error) {
-	raw := make([]byte, 24)
+	raw := make([]byte, keySecretBytes)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
@@ -94,14 +125,49 @@ func KeyPrefix(secret string) string {
 	return secret[:keyPrefixLen]
 }
 
+// legacyKeyPrefix returns the pre-widening lookup prefix, or "" when the
+// secret is too short to have one distinct from KeyPrefix.
+func legacyKeyPrefix(secret string) string {
+	if len(secret) <= legacyKeyPrefixLen {
+		return ""
+	}
+	short := secret[:legacyKeyPrefixLen]
+	if short == KeyPrefix(secret) {
+		return ""
+	}
+	return short
+}
+
 // argon2id parameters: modest, since verification results are cached and the
-// threat model is offline hash cracking of a 192-bit random secret.
+// threat model is offline hash cracking of a 256-bit random secret.
 const (
 	argonTime    = 1
 	argonMemory  = 64 * 1024
 	argonThreads = 4
 	argonKeyLen  = 32
 )
+
+// maxConcurrentVerifications bounds how many argon2id verifications run at
+// once. Each costs 64MB and four threads, and the prefix of every live key is
+// public (`delos key list` prints it), so an attacker can aim unlimited
+// garbage at a known-good prefix and force a verification per request. Without
+// a bound that is a few hundred requests per second to exhaust memory and CPU.
+// Four in flight caps the cost at ~256MB and 16 busy threads; the rest queue.
+const maxConcurrentVerifications = 4
+
+var verifySem = make(chan struct{}, maxConcurrentVerifications)
+
+// verifyKeyBounded runs VerifyKey under the concurrency bound, giving up if
+// the caller's context is cancelled while queued.
+func verifyKeyBounded(ctx context.Context, secret, encoded string) (bool, error) {
+	select {
+	case verifySem <- struct{}{}:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+	defer func() { <-verifySem }()
+	return VerifyKey(secret, encoded), nil
+}
 
 // HashKey computes an encoded argon2id hash of the secret.
 func HashKey(secret string) (string, error) {
@@ -140,11 +206,69 @@ func VerifyKey(secret, encoded string) bool {
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
+// ---- key creation ----
+
+// KeySpec describes a key to create. It is everything about a key that is not
+// generated.
+type KeySpec struct {
+	ID          string
+	Name        string
+	Models      []string
+	TokenBudget int64
+	USDBudget   float64
+	CreatedAt   time.Time
+}
+
+// createKeyAttempts bounds prefix-collision retries. With a 96-bit prefix one
+// attempt always suffices; the loop exists so that a collision is a retry
+// rather than either a duplicate-key error to the operator or, worse, two live
+// keys sharing a lookup prefix.
+const createKeyAttempts = 5
+
+// CreateVirtualKey generates a secret, stores its record, and returns the
+// plaintext secret (shown once) alongside the stored key. It regenerates on a
+// prefix collision instead of storing a second key under an existing prefix.
+func CreateVirtualKey(ctx context.Context, store KeyStore, spec KeySpec) (string, *VirtualKey, error) {
+	for attempt := 0; attempt < createKeyAttempts; attempt++ {
+		secret, err := GenerateKey()
+		if err != nil {
+			return "", nil, fmt.Errorf("generating key: %w", err)
+		}
+		hash, err := HashKey(secret)
+		if err != nil {
+			return "", nil, fmt.Errorf("hashing key: %w", err)
+		}
+		created := spec.CreatedAt
+		if created.IsZero() {
+			created = time.Now().UTC()
+		}
+		key := &VirtualKey{
+			ID:          spec.ID,
+			Name:        spec.Name,
+			Prefix:      KeyPrefix(secret),
+			Hash:        hash,
+			Models:      spec.Models,
+			TokenBudget: spec.TokenBudget,
+			USDBudget:   spec.USDBudget,
+			CreatedAt:   created,
+		}
+		err = store.CreateKey(ctx, key)
+		if errors.Is(err, ErrKeyPrefixConflict) {
+			continue
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		return secret, key, nil
+	}
+	return "", nil, fmt.Errorf("could not generate a key with an unused prefix after %d attempts", createKeyAttempts)
+}
+
 // ---- authenticator with verification cache ----
 
-// KeyAuthenticator verifies presented keys against a KeyStore, caching
-// successful verifications (argon2id is deliberately slow; the cache keeps it
-// off the hot path).
+// KeyAuthenticator verifies presented keys against a KeyStore, caching both
+// successful and failed verifications (argon2id is deliberately slow; the
+// cache keeps it off the hot path).
 type KeyAuthenticator struct {
 	store KeyStore
 
@@ -152,12 +276,27 @@ type KeyAuthenticator struct {
 	cache map[string]cachedAuth // sha256(secret) -> result
 }
 
+// cachedAuth is one cached verification. key == nil records a verification
+// that failed.
 type cachedAuth struct {
 	key     *VirtualKey
 	expires time.Time
 }
 
-const authCacheTTL = time.Minute
+const (
+	// authCacheTTL bounds how long a successful verification is reused. The
+	// record is still re-read from the store on every request inside the
+	// window, so revocation and budget changes take effect immediately; what
+	// the cache saves is the argon2id verification, not the lookup.
+	authCacheTTL = time.Minute
+
+	// authNegativeCacheTTL bounds how long a failed verification is
+	// remembered. Without it, an attacker who knows a live key's public prefix
+	// forces a fresh 64MB argon2id hash on every request; with it, a flood of
+	// one bad secret costs one hash per TTL. It is deliberately short so a key
+	// that is rotated in is not locked out for long by an earlier typo.
+	authNegativeCacheTTL = 30 * time.Second
+)
 
 // NewKeyAuthenticator wraps a KeyStore.
 func NewKeyAuthenticator(store KeyStore) *KeyAuthenticator {
@@ -165,6 +304,11 @@ func NewKeyAuthenticator(store KeyStore) *KeyAuthenticator {
 }
 
 // Authenticate resolves a presented secret to its key record.
+//
+// It returns ErrKeyNotFound for a secret that does not name a live key, and an
+// error wrapping ErrKeyStoreUnavailable when the store could not be consulted.
+// Callers must distinguish the two: the first is the caller's fault (401), the
+// second is ours (503).
 func (a *KeyAuthenticator) Authenticate(ctx context.Context, secret string) (*VirtualKey, error) {
 	if secret == "" {
 		return nil, ErrKeyNotFound
@@ -176,27 +320,87 @@ func (a *KeyAuthenticator) Authenticate(ctx context.Context, secret string) (*Vi
 	entry, ok := a.cache[cacheKey]
 	a.mu.RUnlock()
 	if ok && time.Now().Before(entry.expires) {
-		// Revocation must take effect within the TTL: re-check the record.
-		fresh, err := a.store.GetKeyByPrefix(ctx, entry.key.Prefix)
-		if err != nil || fresh.Revoked {
-			a.evict(cacheKey)
+		if entry.key == nil {
+			// Negative hit: this exact secret already failed verification.
 			return nil, ErrKeyNotFound
 		}
-		return fresh, nil
+		fresh, err := a.lookup(ctx, secret)
+		switch {
+		case err == nil && !fresh.Revoked && fresh.ID == entry.key.ID && fresh.Hash == entry.key.Hash:
+			// The freshly loaded record is the very record this secret was
+			// verified against — same ID, same hash — so reusing the
+			// verification is sound without re-running argon2id. Re-reading
+			// also means revocation and budget edits apply within the TTL.
+			//
+			// The old code returned whatever record shared the prefix and
+			// verified nothing: with two keys on one prefix, a request
+			// authenticated with key A was served as key B, inheriting B's
+			// model scope and charging B's budget.
+			return fresh, nil
+		case errors.Is(err, ErrKeyStoreUnavailable):
+			// Availability tradeoff, deliberate: a store outage must not
+			// invalidate keys we have already verified. The entry stays in the
+			// cache and keeps serving until its TTL runs out, so a brief
+			// Postgres blip degrades to "revocations lag by up to a minute"
+			// rather than "every key on the fleet is rejected". Evicting here
+			// — what the old code did — destroyed exactly the state that could
+			// have ridden out the outage.
+			return entry.key, nil
+		default:
+			// Not found, revoked, or a different record on the same prefix:
+			// drop the entry and fall through to a full verification.
+			a.evict(cacheKey)
+		}
 	}
 
-	key, err := a.store.GetKeyByPrefix(ctx, KeyPrefix(secret))
+	key, err := a.lookup(ctx, secret)
 	if err != nil {
+		// A store failure is never reported as "invalid key".
+		return nil, err
+	}
+	if key.Revoked {
 		return nil, ErrKeyNotFound
 	}
-	if key.Revoked || !VerifyKey(secret, key.Hash) {
+	verified, err := verifyKeyBounded(ctx, secret, key.Hash)
+	if err != nil {
+		return nil, fmt.Errorf("verifying key: %w", err)
+	}
+	if !verified {
+		a.remember(cacheKey, cachedAuth{expires: time.Now().Add(authNegativeCacheTTL)})
 		return nil, ErrKeyNotFound
 	}
 
-	a.mu.Lock()
-	a.cache[cacheKey] = cachedAuth{key: key, expires: time.Now().Add(authCacheTTL)}
-	a.mu.Unlock()
+	a.remember(cacheKey, cachedAuth{key: key, expires: time.Now().Add(authCacheTTL)})
 	return key, nil
+}
+
+// lookup finds the live key record for a secret, trying the current prefix
+// length and then the legacy one. Store failures are wrapped in
+// ErrKeyStoreUnavailable; a genuine miss is ErrKeyNotFound.
+func (a *KeyAuthenticator) lookup(ctx context.Context, secret string) (*VirtualKey, error) {
+	key, err := a.store.GetKeyByPrefix(ctx, KeyPrefix(secret))
+	if err == nil {
+		return key, nil
+	}
+	if !errors.Is(err, ErrKeyNotFound) {
+		return nil, fmt.Errorf("%w: %w", ErrKeyStoreUnavailable, err)
+	}
+	if legacy := legacyKeyPrefix(secret); legacy != "" {
+		key, err = a.store.GetKeyByPrefix(ctx, legacy)
+		if err == nil {
+			return key, nil
+		}
+		if !errors.Is(err, ErrKeyNotFound) {
+			return nil, fmt.Errorf("%w: %w", ErrKeyStoreUnavailable, err)
+		}
+	}
+	return nil, ErrKeyNotFound
+}
+
+func (a *KeyAuthenticator) remember(cacheKey string, entry cachedAuth) {
+	a.mu.Lock()
+	a.cache[cacheKey] = entry
+	a.mu.Unlock()
 }
 
 func (a *KeyAuthenticator) evict(cacheKey string) {
@@ -225,6 +429,14 @@ func NewMemoryKeyStore() *MemoryKeyStore {
 func (s *MemoryKeyStore) CreateKey(ctx context.Context, key *VirtualKey) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Mirrors the UNIQUE index on virtual_keys.prefix: two live keys must
+	// never share a lookup prefix, revoked ones included, so that a prefix
+	// lookup can only ever return the key the secret belongs to.
+	for _, existing := range s.keys {
+		if existing.ID != key.ID && existing.Prefix == key.Prefix {
+			return ErrKeyPrefixConflict
+		}
+	}
 	s.keys[key.ID] = key
 	return nil
 }
@@ -232,13 +444,23 @@ func (s *MemoryKeyStore) CreateKey(ctx context.Context, key *VirtualKey) error {
 func (s *MemoryKeyStore) GetKeyByPrefix(ctx context.Context, prefix string) (*VirtualKey, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// CreateKey enforces prefix uniqueness, so at most one key can match; the
+	// lowest ID wins for any record predating that rule, so the answer never
+	// depends on map iteration order.
+	var found *VirtualKey
 	for _, k := range s.keys {
-		if k.Prefix == prefix && !k.Revoked {
-			copied := *k
-			return &copied, nil
+		if k.Prefix != prefix || k.Revoked {
+			continue
+		}
+		if found == nil || k.ID < found.ID {
+			found = k
 		}
 	}
-	return nil, ErrKeyNotFound
+	if found == nil {
+		return nil, ErrKeyNotFound
+	}
+	copied := *found
+	return &copied, nil
 }
 
 func (s *MemoryKeyStore) ListKeys(ctx context.Context) ([]*VirtualKey, error) {

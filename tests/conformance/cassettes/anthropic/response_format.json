@@ -1,0 +1,24 @@
+{
+  "name": "anthropic: response_format is refused without spending an upstream call (see the handover note: this should be a 400, not a 502)",
+  "provider": "anthropic",
+  "surface": "openai",
+  "request": {
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Give me the answer as JSON."
+      }
+    ],
+    "response_format": {
+      "type": "json_object"
+    }
+  },
+  "upstream_responses": [],
+  "expect": {
+    "status": 502,
+    "body_contains": [
+      "response_format is not supported"
+    ]
+  }
+}

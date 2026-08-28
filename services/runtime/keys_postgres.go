@@ -9,6 +9,9 @@ import (
 	"github.com/lib/pq"
 )
 
+// pgUniqueViolation is Postgres SQLSTATE 23505.
+const pgUniqueViolation = "23505"
+
 // Migrations contains the gateway's schema migrations, applied at startup
 // when Postgres is configured.
 //
@@ -26,12 +29,28 @@ func NewPostgresKeyStore(db *sql.DB) *PostgresKeyStore {
 }
 
 func (s *PostgresKeyStore) CreateKey(ctx context.Context, key *VirtualKey) error {
+	// pq.Array of a nil slice is SQL NULL, and models is NOT NULL: an
+	// unscoped key — the common case, a key with no --model restriction —
+	// would be rejected by the column constraint. An unscoped key is an empty
+	// array, not an absent one.
+	models := key.Models
+	if models == nil {
+		models = []string{}
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO virtual_keys (id, name, prefix, hash, models, token_budget, usd_budget, revoked, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		key.ID, key.Name, key.Prefix, key.Hash, pq.Array(key.Models),
+		key.ID, key.Name, key.Prefix, key.Hash, pq.Array(models),
 		key.TokenBudget, key.USDBudget, key.Revoked, key.CreatedAt,
 	)
+	// A prefix collision is reported as such so the caller regenerates rather
+	// than surfacing a raw constraint violation. (Migration 002 added the
+	// unique index; see keys.go for why the prefix must be unique.)
+	var pgErr *pq.Error
+	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation &&
+		pgErr.Constraint == "idx_virtual_keys_prefix_unique" {
+		return ErrKeyPrefixConflict
+	}
 	return err
 }
 
@@ -39,6 +58,7 @@ func (s *PostgresKeyStore) GetKeyByPrefix(ctx context.Context, prefix string) (*
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, name, prefix, hash, models, token_budget, usd_budget, revoked, created_at
 		FROM virtual_keys WHERE prefix = $1 AND NOT revoked
+		ORDER BY created_at, id
 		LIMIT 1`, prefix)
 	return scanKey(row)
 }

@@ -142,7 +142,14 @@ func assertUpstream(t *testing.T, c *Cassette, spec providerSpec, upstream *fake
 
 	call, ok := upstream.firstCall()
 	if !ok {
-		t.Fatal("gateway never called the provider")
+		// A cassette that queues no upstream responses asserts exactly
+		// this: the gateway rejected the request on its own, without
+		// spending an upstream call on a request it already knew would
+		// fail.
+		if len(c.UpstreamResponses) > 0 {
+			t.Fatal("gateway never called the provider")
+		}
+		return
 	}
 	if c.UpstreamPathContains != "" && !strings.Contains(call.Path, c.UpstreamPathContains) {
 		t.Errorf("upstream path = %q, want it to contain %q", call.Path, c.UpstreamPathContains)
@@ -150,6 +157,11 @@ func assertUpstream(t *testing.T, c *Cassette, spec providerSpec, upstream *fake
 	for _, want := range c.UpstreamBodyContains {
 		if !strings.Contains(call.Body, want) {
 			t.Errorf("upstream request body does not contain %q\nbody: %s", want, truncate(call.Body, 2000))
+		}
+	}
+	for _, unwanted := range c.UpstreamBodyExcludes {
+		if strings.Contains(call.Body, unwanted) {
+			t.Errorf("upstream request body contains %q, which the client never sent\nbody: %s", unwanted, truncate(call.Body, 2000))
 		}
 	}
 	if spec.authHeader != "" && spec.replayKey != "" {
@@ -162,8 +174,62 @@ func assertUpstream(t *testing.T, c *Cassette, spec providerSpec, upstream *fake
 	}
 }
 
-// TestMatrixCoverage keeps the suite honest about what it covers: every
-// provider in the curated set must exercise the core feature set.
+// ---- the target matrix ----
+
+// targetFeatures is what the conformance suite is *aiming* to prove for every
+// backend in the curated set, not a description of what happens to exist. A
+// cell is covered when the provider has a cassette whose file name starts with
+// the feature name, so response_format_json_object covers "response_format".
+var targetFeatures = []string{
+	"chat_basic",
+	"chat_streaming",
+	"tool_call",
+	"tool_call_streaming",
+	"usage_mapping",
+	"error_400",
+	"error_429",
+	"vision_data_uri",
+	"embeddings",
+	"stop_sequences",
+	"response_format",
+	"max_completion_tokens",
+	"cross_surface",
+}
+
+// targetProviders is the provider set the matrix applies to. It is listed
+// explicitly so that adding a backend to cassettes/ without deciding what it
+// must cover fails the build.
+var targetProviders = []string{"openai", "anthropic", "gemini", "ollama"}
+
+// exemptions record cells the suite deliberately leaves uncovered, each with
+// the reason. An exemption is a stated debt, not a free pass: an exempt cell
+// that later gains a cassette fails this test, so the note has to be deleted
+// when the gap is closed.
+var exemptions = map[string]string{
+	// Real capability limits.
+	"anthropic/embeddings": "the Anthropic API has no embeddings endpoint",
+	"ollama/embeddings":    "the OpenAI-compatible slot is exercised for chat; /v1/embeddings support varies per server",
+	"ollama/error_429":     "local runtimes do not rate limit; the shared 429 path is pinned on openai and gemini",
+
+	// Recording debt: covered elsewhere or simply not recorded yet.
+	"openai/tool_call_streaming":   "TODO: not recorded; streamed tool-call assembly is pinned on anthropic and in services/runtime unit tests",
+	"gemini/tool_call_streaming":   "TODO: not recorded",
+	"gemini/vision_data_uri":       "TODO: not recorded",
+	"gemini/stop_sequences":        "TODO: not recorded",
+	"gemini/response_format":       "TODO: not recorded; Gemini expresses structured output as responseSchema, which needs its own mapping cassette",
+	"gemini/max_completion_tokens": "TODO: not recorded",
+	"gemini/cross_surface":         "TODO: not recorded; /v1/messages over a Gemini backend is untested",
+	"ollama/tool_call_streaming":   "TODO: not recorded",
+	"ollama/vision_data_uri":       "TODO: not recorded",
+	"ollama/stop_sequences":        "TODO: not recorded",
+	"ollama/response_format":       "TODO: not recorded",
+	"ollama/max_completion_tokens": "TODO: not recorded",
+	"ollama/cross_surface":         "TODO: not recorded",
+}
+
+// TestMatrixCoverage holds the suite to the target matrix above. It used to
+// assert exactly the cassettes that existed, which meant it could never fail;
+// the point of a matrix is that the cells nobody has filled in are visible.
 func TestMatrixCoverage(t *testing.T) {
 	cassettes, err := LoadCassettes(cassetteRoot)
 	if err != nil {
@@ -174,20 +240,57 @@ func TestMatrixCoverage(t *testing.T) {
 		byProvider[c.Provider] = append(byProvider[c.Provider], strings.TrimSuffix(filepath.Base(c.Path()), ".json"))
 	}
 
-	required := map[string][]string{
-		"openai":    {"chat_basic", "chat_streaming", "tool_call", "error_429", "error_400", "usage_mapping", "embeddings", "vision_data_uri"},
-		"anthropic": {"chat_basic", "chat_streaming", "tool_call", "tool_call_streaming", "error_429", "error_400", "usage_mapping", "vision_data_uri"},
-		"gemini":    {"chat_basic", "chat_streaming", "tool_call", "error_429", "error_400", "usage_mapping", "embeddings"},
-		"ollama":    {"chat_basic", "chat_streaming", "tool_call", "error_400", "usage_mapping"},
+	// Every provider with cassettes must be a provider the matrix covers.
+	for provider := range byProvider {
+		if !containsString(targetProviders, provider) {
+			t.Errorf("provider %q has cassettes but is not in the target matrix; add it (and its exemptions)", provider)
+		}
 	}
-	for provider, features := range required {
+
+	covered, exempt := 0, 0
+	for _, provider := range targetProviders {
 		have := byProvider[provider]
-		for _, f := range features {
-			if !containsString(have, f) {
-				t.Errorf("provider %q has no %q cassette (have: %v)", provider, f, have)
+		for _, feature := range targetFeatures {
+			cell := provider + "/" + feature
+			hit := hasFeature(have, feature)
+			reason, isExempt := exemptions[cell]
+			switch {
+			case hit && isExempt:
+				t.Errorf("%s is covered but still listed as exempt (%q); delete the exemption", cell, reason)
+			case hit:
+				covered++
+			case isExempt:
+				exempt++
+			default:
+				t.Errorf("%s has no cassette and no exemption (have: %v)", cell, have)
 			}
 		}
 	}
+
+	// Exemptions for cells outside the matrix are dead notes.
+	for cell := range exemptions {
+		provider, feature, _ := strings.Cut(cell, "/")
+		if !containsString(targetProviders, provider) || !containsString(targetFeatures, feature) {
+			t.Errorf("exemption %q does not name a cell of the matrix", cell)
+		}
+	}
+
+	total := len(targetProviders) * len(targetFeatures)
+	t.Logf("matrix coverage: %d/%d cells (%d exempt, %d unaccounted)",
+		covered, total, exempt, total-covered-exempt)
+}
+
+// hasFeature reports whether any cassette name covers the feature. A name
+// covers a feature when it equals it or extends it with an underscore
+// ("response_format_json_schema" covers "response_format"), never when it
+// merely shares a prefix ("error_400" does not cover "error_4").
+func hasFeature(names []string, feature string) bool {
+	for _, name := range names {
+		if name == feature || strings.HasPrefix(name, feature+"_") {
+			return true
+		}
+	}
+	return false
 }
 
 // TestCassettesAreCanonical keeps hand-authored cassettes byte-identical to

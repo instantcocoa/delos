@@ -34,14 +34,39 @@ var bedrockModels = []string{
 	"amazon.titan-embed-text-v2:0",
 }
 
-// bedrockPricing is USD per 1K total tokens, blended.
-var bedrockPricing = map[string]float64{
-	"anthropic.claude-sonnet-4-5-20250929-v1:0": 0.003,
-	"anthropic.claude-haiku-4-5-20251001-v1:0":  0.001,
-	"amazon.nova-pro-v1:0":                      0.0008,
-	"amazon.nova-lite-v1:0":                     0.00006,
-	"meta.llama3-3-70b-instruct-v1:0":           0.00072,
-	"amazon.titan-embed-text-v2:0":              0.00002,
+// bedrockPricing is USD per 1M tokens, input/output, from the AWS Bedrock
+// on-demand price list. Family keys (without the date and version suffix) are
+// listed alongside the exact IDs so a newer snapshot of the same model still
+// prices by longest-prefix match instead of falling to $0.
+var bedrockPricing = map[string]ModelRate{
+	"anthropic.claude-sonnet-4-5-20250929-v1:0": {Input: 3.00, Output: 15.00, CacheWrite: 3.75, CacheRead: 0.30},
+	"anthropic.claude-haiku-4-5-20251001-v1:0":  {Input: 1.00, Output: 5.00, CacheWrite: 1.25, CacheRead: 0.10},
+	"anthropic.claude-sonnet-4-5":               {Input: 3.00, Output: 15.00, CacheWrite: 3.75, CacheRead: 0.30},
+	"anthropic.claude-haiku-4-5":                {Input: 1.00, Output: 5.00, CacheWrite: 1.25, CacheRead: 0.10},
+	"anthropic.claude-opus-4-5":                 {Input: 5.00, Output: 25.00, CacheWrite: 6.25, CacheRead: 0.50},
+	"amazon.nova-pro-v1:0":                      {Input: 0.80, Output: 3.20},
+	"amazon.nova-lite-v1:0":                     {Input: 0.06, Output: 0.24},
+	"amazon.nova-micro-v1:0":                    {Input: 0.035, Output: 0.14},
+	"meta.llama3-3-70b-instruct-v1:0":           {Input: 0.72, Output: 0.72},
+	"amazon.titan-embed-text-v2:0":              {Input: 0.02},
+}
+
+// bedrockCrossRegionPrefixes are the geo prefixes of cross-region inference
+// profile IDs ("us.anthropic.claude-sonnet-4-5-20250929-v1:0"). In most
+// regions the inference profile is the only way to reach a current Anthropic
+// model at all, so pricing that failed to strip the prefix billed the most
+// commonly used models in the catalogue at $0.
+var bedrockCrossRegionPrefixes = []string{"us-gov.", "us.", "eu.", "apac.", "ap.", "jp.", "au.", "ca.", "global."}
+
+// bedrockNormalizeModel strips a cross-region inference-profile prefix so the
+// underlying model ID can be priced.
+func bedrockNormalizeModel(model string) string {
+	for _, prefix := range bedrockCrossRegionPrefixes {
+		if strings.HasPrefix(model, prefix) {
+			return strings.TrimPrefix(model, prefix)
+		}
+	}
+	return model
 }
 
 // bedrockAPI is the subset of the Bedrock Runtime client this provider uses.
@@ -58,7 +83,12 @@ type BedrockProvider struct {
 	client  bedrockAPI
 	region  string
 	models  []string
-	pricing map[string]float64
+	pricing *PriceTable
+}
+
+// bedrockPriceTable builds the provider's price table.
+func bedrockPriceTable() *PriceTable {
+	return NewPriceTable("bedrock", bedrockPricing).withNormalizer(bedrockNormalizeModel)
 }
 
 // NewBedrockProvider builds a Bedrock provider from the default AWS credential
@@ -76,7 +106,7 @@ func NewBedrockProvider(ctx context.Context, region string) (*BedrockProvider, e
 		client:  bedrockruntime.NewFromConfig(cfg),
 		region:  region,
 		models:  bedrockModels,
-		pricing: bedrockPricing,
+		pricing: bedrockPriceTable(),
 	}, nil
 }
 
@@ -222,10 +252,15 @@ func bedrockFromMessages(messages []Message) ([]brtypes.SystemContentBlock, []br
 // bedrockToolConfig converts tool declarations and the tool choice. It returns
 // nil when no tools were declared.
 func bedrockToolConfig(tools []Tool, choice *ToolChoice) (*brtypes.ToolConfiguration, error) {
-	if choice != nil && choice.Mode == "none" {
-		return nil, fmt.Errorf("bedrock: tool_choice %q is not supported by the Converse API", choice.Mode)
-	}
 	if len(tools) == 0 {
+		return nil, nil
+	}
+	// The Converse API has no "none" tool choice. Sending no tool
+	// configuration at all is the same thing from the model's point of view —
+	// it cannot call a tool — and it keeps a request that is legal on both the
+	// OpenAI and Anthropic surfaces from failing the whole failover chain and
+	// surfacing as a 502.
+	if choice != nil && choice.Mode == "none" {
 		return nil, nil
 	}
 
@@ -366,35 +401,19 @@ func bedrockMessageFromBlocks(blocks []brtypes.ContentBlock) (Message, error) {
 	return msg, nil
 }
 
-func (p *BedrockProvider) cost(model string, totalTokens int) float64 {
-	rate, ok := p.pricing[model]
-	if !ok {
-		for m, r := range p.pricing {
-			if strings.HasPrefix(model, m) {
-				rate = r
-				break
-			}
-		}
-	}
-	return rate * float64(totalTokens) / 1000
-}
-
 func (p *BedrockProvider) usage(model string, tu *brtypes.TokenUsage) Usage {
 	if tu == nil {
 		return Usage{}
 	}
-	in := int(aws.ToInt32(tu.InputTokens))
-	out := int(aws.ToInt32(tu.OutputTokens))
-	total := int(aws.ToInt32(tu.TotalTokens))
-	if total == 0 {
-		total = in + out
-	}
-	return Usage{
-		PromptTokens:     in,
-		CompletionTokens: out,
-		TotalTokens:      total,
-		CostUSD:          p.cost(model, total),
-	}
+	u := Usage{
+		PromptTokens:        int(aws.ToInt32(tu.InputTokens)),
+		CompletionTokens:    int(aws.ToInt32(tu.OutputTokens)),
+		TotalTokens:         int(aws.ToInt32(tu.TotalTokens)),
+		CacheCreationTokens: int(aws.ToInt32(tu.CacheWriteInputTokens)),
+		CacheReadTokens:     int(aws.ToInt32(tu.CacheReadInputTokens)),
+	}.withDerivedTotals()
+	u.CostUSD = p.pricing.Cost(model, u)
+	return u
 }
 
 // bedrockError normalizes an SDK error into a ProviderError carrying the
@@ -472,7 +491,24 @@ func (p *BedrockProvider) CompleteStream(ctx context.Context, params CompletionP
 	model := aws.ToString(in.ModelId)
 	id, _ := awsmiddleware.GetRequestIDMetadata(out.ResultMetadata)
 	stream := out.GetStream()
+	if stream == nil {
+		return nil, &ProviderError{Provider: p.Name(), StatusCode: 502, Message: "bedrock: response carried no event stream"}
+	}
+	return p.streamChunks(stream, model, id), nil
+}
 
+// bedrockStream is the part of the SDK's ConverseStreamEventStream this
+// provider consumes. Naming it as an interface is what makes the event loop
+// below — the tool-index mapping state machine above all — testable with a
+// scripted stream and no AWS account.
+type bedrockStream interface {
+	Events() <-chan brtypes.ConverseStreamOutput
+	Err() error
+	Close() error
+}
+
+// streamChunks translates a Bedrock event stream into gateway stream chunks.
+func (p *BedrockProvider) streamChunks(stream bedrockStream, model, id string) <-chan StreamChunk {
 	chunks := make(chan StreamChunk)
 	go func() {
 		defer close(chunks)
@@ -550,7 +586,7 @@ func (p *BedrockProvider) CompleteStream(ctx context.Context, params CompletionP
 			Model:        model,
 		}
 	}()
-	return chunks, nil
+	return chunks
 }
 
 func (p *BedrockProvider) Embed(ctx context.Context, params EmbedParams) (*EmbedResult, error) {
@@ -595,14 +631,12 @@ func (p *BedrockProvider) Embed(ctx context.Context, params EmbedParams) (*Embed
 		})
 	}
 
+	embedUsage := Usage{PromptTokens: promptTokens}.withDerivedTotals()
+	embedUsage.CostUSD = p.pricing.Cost(model, embedUsage)
 	return &EmbedResult{
 		Embeddings: embeddings,
 		Model:      model,
 		Provider:   p.Name(),
-		Usage: Usage{
-			PromptTokens: promptTokens,
-			TotalTokens:  promptTokens,
-			CostUSD:      p.cost(model, promptTokens),
-		},
+		Usage:      embedUsage,
 	}, nil
 }

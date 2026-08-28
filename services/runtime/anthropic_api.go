@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -228,6 +229,7 @@ func (s *HTTPServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
+	r = withKey(r, key)
 	limitBody(w, r)
 
 	var req anthMessagesRequest
@@ -321,8 +323,14 @@ func (s *HTTPServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Requ
 		s.writeAnthropicProviderError(w, r, err)
 		return
 	}
-	s.recordUsage(context.WithoutCancel(r.Context()), key, result.Usage)
+	s.recordUsage(context.WithoutCancel(r.Context()), key, billableUsage(result))
 	s.tailComplete(r, key, result.Model, result.Provider, result.Usage, result.Cached)
+
+	// Same contract as the OpenAI surface: a cache hit is announced, and it
+	// is billed at zero because nothing was bought upstream.
+	if result.Cached {
+		w.Header().Set("X-Delos-Cache", "hit")
+	}
 
 	writeJSON(w, http.StatusOK, anthMessagesResponse{
 		ID:         orDefault(result.ID, "msg_"+uuid.NewString()),
@@ -412,11 +420,29 @@ func (s *HTTPServer) streamAnthropicMessages(w http.ResponseWriter, r *http.Requ
 		})
 	}
 
-	var usage *Usage
 	provider := ""
 	finish := FinishStop
+
+	// delivered accumulates everything the client received, so the stream can
+	// still be metered when the provider reports no usage of its own; see
+	// estimateStreamUsage.
+	var delivered strings.Builder
+	usage := Usage{}
+	metered := false
+	meter := func(u Usage) {
+		if metered {
+			return
+		}
+		metered = true
+		usage = u
+		s.recordUsage(context.WithoutCancel(r.Context()), key, u)
+	}
+
 	for chunk := range chunks {
 		if chunk.Err != nil {
+			// What was already delivered was generated upstream even though
+			// the stream broke, so it is metered rather than written off.
+			meter(estimateStreamUsage(params, delivered.String()))
 			emit("error", anthErrorEnvelope{Type: "error", Error: anthErrorBody{
 				Type: "api_error", Message: chunk.Err.Error(),
 			}})
@@ -427,9 +453,12 @@ func (s *HTTPServer) streamAnthropicMessages(w http.ResponseWriter, r *http.Requ
 			provider = chunk.Provider
 		}
 		if chunk.Done {
-			usage = chunk.Usage
-			if usage != nil {
-				s.recordUsage(context.WithoutCancel(r.Context()), key, *usage)
+			// Every stream is metered, estimating when the provider reported
+			// nothing: metering only what arrives makes those requests free.
+			if chunk.Usage != nil {
+				meter(*chunk.Usage)
+			} else {
+				meter(estimateStreamUsage(params, delivered.String()))
 			}
 			if chunk.FinishReason != "" {
 				finish = chunk.FinishReason
@@ -449,6 +478,7 @@ func (s *HTTPServer) streamAnthropicMessages(w http.ResponseWriter, r *http.Requ
 				currentToolIndex = tc.Index
 			}
 			if tc.ArgumentsDelta != "" {
+				delivered.WriteString(tc.ArgumentsDelta)
 				emit("content_block_delta", map[string]any{
 					"type": "content_block_delta", "index": blockIndex,
 					"delta": map[string]string{"type": "input_json_delta", "partial_json": tc.ArgumentsDelta},
@@ -461,6 +491,7 @@ func (s *HTTPServer) streamAnthropicMessages(w http.ResponseWriter, r *http.Requ
 				openBlock(map[string]any{"type": "text", "text": ""})
 				currentToolIndex = -1
 			}
+			delivered.WriteString(chunk.Delta)
 			emit("content_block_delta", map[string]any{
 				"type": "content_block_delta", "index": blockIndex,
 				"delta": map[string]string{"type": "text_delta", "text": chunk.Delta},
@@ -468,22 +499,22 @@ func (s *HTTPServer) streamAnthropicMessages(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	// A stream that ends without a Done chunk still consumed what it
+	// delivered.
+	meter(estimateStreamUsage(params, delivered.String()))
+
 	closeBlock()
-	deltaEvent := map[string]any{
+	// The Anthropic surface always carries usage on message_delta - the real
+	// API does, and SDKs read it there - so it is always populated, from the
+	// provider when it reported usage and from the estimate otherwise.
+	emit("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": anthStopReason(finish), "stop_sequence": nil},
-	}
-	if usage != nil {
-		deltaEvent["usage"] = anthUsage{InputTokens: usage.PromptTokens, OutputTokens: usage.CompletionTokens}
-	}
-	emit("message_delta", deltaEvent)
+		"usage": anthUsage{InputTokens: usage.PromptTokens, OutputTokens: usage.CompletionTokens},
+	})
 	emit("message_stop", map[string]any{"type": "message_stop"})
 
-	streamUsage := Usage{}
-	if usage != nil {
-		streamUsage = *usage
-	}
-	s.tailComplete(r, key, params.Model, provider, streamUsage, false)
+	s.tailComplete(r, key, params.Model, provider, usage, false)
 }
 
 // ptr returns a pointer to v.

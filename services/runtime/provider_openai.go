@@ -21,14 +21,38 @@ type OpenAIProvider struct {
 	apiKey     string
 	httpClient *http.Client
 
-	staticModels []string           // fixed model list (openai.com)
-	pricing      map[string]float64 // model -> USD per 1K total tokens
+	staticModels []string // fixed model list (openai.com)
+	pricing      *PriceTable
 
 	// dynamic model discovery for compat endpoints
 	discoverModels bool
 	modelsMu       sync.Mutex
 	cachedModels   []string
-	lastDiscovery  time.Time
+	lastAttempt    time.Time // last discovery attempt, success or failure
+	lastOK         bool      // whether that attempt succeeded
+	discovering    bool      // a discovery call is in flight
+}
+
+// openaiPricing is USD per 1M tokens, input/output, from OpenAI's published
+// price list. Dated snapshots (gpt-4o-2024-11-20) and unlisted members of a
+// family fall back to the family key by longest-prefix match.
+var openaiPricing = map[string]ModelRate{
+	"gpt-5.1":                {Input: 1.25, Output: 10.00},
+	"gpt-5":                  {Input: 1.25, Output: 10.00},
+	"gpt-5-mini":             {Input: 0.25, Output: 2.00},
+	"gpt-5-nano":             {Input: 0.05, Output: 0.40},
+	"gpt-4.1":                {Input: 2.00, Output: 8.00},
+	"gpt-4.1-mini":           {Input: 0.40, Output: 1.60},
+	"gpt-4.1-nano":           {Input: 0.10, Output: 0.40},
+	"gpt-4o":                 {Input: 2.50, Output: 10.00},
+	"gpt-4o-mini":            {Input: 0.15, Output: 0.60},
+	"chatgpt-4o-latest":      {Input: 5.00, Output: 15.00},
+	"o3":                     {Input: 2.00, Output: 8.00},
+	"o3-mini":                {Input: 1.10, Output: 4.40},
+	"o4-mini":                {Input: 1.10, Output: 4.40},
+	"text-embedding-3-small": {Input: 0.02},
+	"text-embedding-3-large": {Input: 0.13},
+	"text-embedding-ada-002": {Input: 0.10},
 }
 
 // NewOpenAIProvider creates the provider for api.openai.com.
@@ -45,25 +69,22 @@ func NewOpenAIProvider(apiKey string) *OpenAIProvider {
 			"gpt-4.1",
 			"gpt-4o",
 			"gpt-4o-mini",
+			"o3",
+			"o4-mini",
 			"text-embedding-3-small",
 			"text-embedding-3-large",
 		},
-		pricing: map[string]float64{
-			"gpt-5.1":                0.00125,
-			"gpt-5":                  0.00125,
-			"gpt-5-mini":             0.00025,
-			"gpt-4.1":                0.002,
-			"gpt-4o":                 0.005,
-			"gpt-4o-mini":            0.00015,
-			"text-embedding-3-small": 0.00002,
-			"text-embedding-3-large": 0.00013,
-		},
+		pricing: NewPriceTable("openai", openaiPricing),
 	}
 }
 
 // NewOpenAICompatProvider creates a provider for any OpenAI-compatible
 // endpoint. baseURL includes the /v1 suffix (e.g. "http://localhost:11434/v1").
 // The model list is discovered from GET {baseURL}/models and cached.
+// The provider ships with an empty price table: the gateway cannot know what a
+// self-hosted or third-party endpoint charges. Every model served through it
+// therefore costs $0.00 until an operator prices it with SetPricing, and each
+// unpriced model is logged once so the hole is visible rather than silent.
 func NewOpenAICompatProvider(name, baseURL, apiKey string) *OpenAIProvider {
 	return &OpenAIProvider{
 		name:           name,
@@ -71,49 +92,103 @@ func NewOpenAICompatProvider(name, baseURL, apiKey string) *OpenAIProvider {
 		apiKey:         apiKey,
 		httpClient:     &http.Client{},
 		discoverModels: true,
+		pricing:        NewPriceTable(name, nil),
 	}
+}
+
+// SetPricing prices models this provider serves, in USD per 1M tokens. It is
+// how an operator makes USD budgets enforceable for a self-hosted or
+// third-party OpenAI-compatible endpoint.
+func (p *OpenAIProvider) SetPricing(rates map[string]ModelRate) {
+	p.pricing.SetAll(rates)
 }
 
 func (p *OpenAIProvider) Name() string { return p.name }
 
+// Model-discovery cache lifetimes. A failed discovery is cached too: without
+// negative caching a stopped Ollama makes every GET /v1/models pay the full
+// dial timeout again.
+const (
+	modelDiscoveryTTL     = time.Minute
+	modelDiscoveryFailTTL = 30 * time.Second
+	modelDiscoveryTimeout = 5 * time.Second
+)
+
+// Models returns the provider's models, discovering them from the backend for
+// compat endpoints.
+//
+// The discovery call never happens under the mutex: a single slow or dead
+// backend would otherwise serialize every concurrent /v1/models request behind
+// one 5s dial. At most one discovery is in flight; callers that arrive while
+// it runs get the last known list immediately.
 func (p *OpenAIProvider) Models(ctx context.Context) []string {
 	if !p.discoverModels {
 		return p.staticModels
 	}
 
 	p.modelsMu.Lock()
-	defer p.modelsMu.Unlock()
-	if time.Since(p.lastDiscovery) < time.Minute && p.cachedModels != nil {
-		return p.cachedModels
+	ttl := modelDiscoveryTTL
+	if !p.lastOK {
+		ttl = modelDiscoveryFailTTL
 	}
+	if !p.lastAttempt.IsZero() && time.Since(p.lastAttempt) < ttl {
+		cached := p.cachedModels
+		p.modelsMu.Unlock()
+		return cached
+	}
+	if p.discovering {
+		cached := p.cachedModels
+		p.modelsMu.Unlock()
+		return cached
+	}
+	p.discovering = true
+	cached := p.cachedModels
+	p.modelsMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	models, err := p.discover(ctx)
+
+	p.modelsMu.Lock()
+	defer p.modelsMu.Unlock()
+	p.discovering = false
+	p.lastAttempt = time.Now()
+	p.lastOK = err == nil
+	if err != nil {
+		return cached
+	}
+	p.cachedModels = models
+	return models
+}
+
+// discover performs one GET {baseURL}/models. It holds no locks.
+func (p *OpenAIProvider) discover(ctx context.Context) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, modelDiscoveryTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/models", nil)
 	if err != nil {
-		return p.cachedModels
+		return nil, err
 	}
 	p.setAuth(req)
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return p.cachedModels
+		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: model discovery returned %d", p.name, resp.StatusCode)
+	}
 	var list struct {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&list) != nil {
-		return p.cachedModels
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, err
 	}
 	models := make([]string, 0, len(list.Data))
 	for _, m := range list.Data {
 		models = append(models, m.ID)
 	}
-	p.cachedModels = models
-	p.lastDiscovery = time.Now()
-	return models
+	return models, nil
 }
 
 func (p *OpenAIProvider) setAuth(req *http.Request) {
@@ -341,8 +416,16 @@ func (p *OpenAIProvider) apiError(resp *http.Response) error {
 	return &ProviderError{Provider: p.name, StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
 }
 
-func (p *OpenAIProvider) cost(model string, usage oaiUsage) float64 {
-	return p.pricing[model] * float64(usage.TotalTokens) / 1000
+// usageFrom converts wire usage, deriving the total the backend may have
+// omitted and pricing input and output separately.
+func (p *OpenAIProvider) usageFrom(model string, wire oaiUsage) Usage {
+	u := Usage{
+		PromptTokens:     wire.PromptTokens,
+		CompletionTokens: wire.CompletionTokens,
+		TotalTokens:      wire.TotalTokens,
+	}.withDerivedTotals()
+	u.CostUSD = p.pricing.Cost(model, u)
+	return u
 }
 
 func oaiFinishReason(reason string) string {
@@ -395,20 +478,24 @@ func (p *OpenAIProvider) Complete(ctx context.Context, params CompletionParams) 
 		})
 	}
 
+	// Backends routinely report finish_reason "stop" alongside a populated
+	// tool_calls array (several OpenAI-compatible servers always do). Agent
+	// loops branch on the finish reason, so an uncorrected "stop" means the
+	// tool never runs. Gemini already applies this correction; do it here too.
+	finish := oaiFinishReason(choice.FinishReason)
+	if len(msg.ToolCalls) > 0 && finish == FinishStop {
+		finish = FinishToolCalls
+	}
+
 	result := &CompletionResult{
 		ID:           out.ID,
 		Message:      msg,
-		FinishReason: oaiFinishReason(choice.FinishReason),
+		FinishReason: finish,
 		Provider:     p.name,
 		Model:        out.Model,
 	}
 	if out.Usage != nil {
-		result.Usage = Usage{
-			PromptTokens:     out.Usage.PromptTokens,
-			CompletionTokens: out.Usage.CompletionTokens,
-			TotalTokens:      out.Usage.TotalTokens,
-			CostUSD:          p.cost(params.Model, *out.Usage),
-		}
+		result.Usage = p.usageFrom(params.Model, *out.Usage)
 	}
 	return result, nil
 }
@@ -437,6 +524,7 @@ func (p *OpenAIProvider) CompleteStream(ctx context.Context, params CompletionPa
 
 		var usage *Usage
 		finish := FinishStop
+		sawToolCall := false
 		id, model := "", params.Model
 
 		for event := range events {
@@ -460,12 +548,8 @@ func (p *OpenAIProvider) CompleteStream(ctx context.Context, params CompletionPa
 				model = chunk.Model
 			}
 			if chunk.Usage != nil {
-				usage = &Usage{
-					PromptTokens:     chunk.Usage.PromptTokens,
-					CompletionTokens: chunk.Usage.CompletionTokens,
-					TotalTokens:      chunk.Usage.TotalTokens,
-					CostUSD:          p.cost(params.Model, *chunk.Usage),
-				}
+				u := p.usageFrom(params.Model, *chunk.Usage)
+				usage = &u
 			}
 			if len(chunk.Choices) == 0 {
 				continue
@@ -478,6 +562,7 @@ func (p *OpenAIProvider) CompleteStream(ctx context.Context, params CompletionPa
 				chunks <- StreamChunk{ID: id, Delta: *choice.Delta.Content, Provider: p.name, Model: model}
 			}
 			for _, tc := range choice.Delta.ToolCalls {
+				sawToolCall = true
 				index := 0
 				if tc.Index != nil {
 					index = *tc.Index
@@ -496,6 +581,10 @@ func (p *OpenAIProvider) CompleteStream(ctx context.Context, params CompletionPa
 			}
 		}
 
+		// Same finish_reason correction as the non-streaming path.
+		if sawToolCall && finish == FinishStop {
+			finish = FinishToolCalls
+		}
 		chunks <- StreamChunk{ID: id, Done: true, FinishReason: finish, Usage: usage, Provider: p.name, Model: model}
 	}()
 	return chunks, nil
@@ -531,11 +620,7 @@ func (p *OpenAIProvider) Embed(ctx context.Context, params EmbedParams) (*EmbedR
 		result.Embeddings = append(result.Embeddings, Embedding{Values: d.Embedding, Dimensions: len(d.Embedding)})
 	}
 	if out.Usage != nil {
-		result.Usage = Usage{
-			PromptTokens: out.Usage.PromptTokens,
-			TotalTokens:  out.Usage.TotalTokens,
-			CostUSD:      p.cost(params.Model, *out.Usage),
-		}
+		result.Usage = p.usageFrom(params.Model, *out.Usage)
 	}
 	return result, nil
 }

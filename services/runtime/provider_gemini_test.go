@@ -409,7 +409,8 @@ func TestGeminiComplete(t *testing.T) {
 	if result.Usage.PromptTokens != 10 || result.Usage.CompletionTokens != 5 || result.Usage.TotalTokens != 15 {
 		t.Errorf("usage = %+v", result.Usage)
 	}
-	if want := 0.0003 * 15 / 1000; !geminiCostClose(result.Usage.CostUSD, want) {
+	// 10 input at $0.30/1M plus 5 output at $2.50/1M.
+	if want := (10*0.30 + 5*2.50) / 1e6; !geminiCostClose(result.Usage.CostUSD, want) {
 		t.Errorf("CostUSD = %v, want %v", result.Usage.CostUSD, want)
 	}
 }
@@ -577,7 +578,7 @@ func TestGeminiCompleteStream(t *testing.T) {
 	if final.Usage == nil || final.Usage.TotalTokens != 15 {
 		t.Fatalf("usage = %+v", final.Usage)
 	}
-	if want := 0.0003 * 15 / 1000; !geminiCostClose(final.Usage.CostUSD, want) {
+	if want := (10*0.30 + 5*2.50) / 1e6; !geminiCostClose(final.Usage.CostUSD, want) {
 		t.Errorf("CostUSD = %v, want %v", final.Usage.CostUSD, want)
 	}
 }
@@ -706,7 +707,7 @@ func TestGeminiNameAndModels(t *testing.T) {
 		t.Errorf("Models() = %v", models)
 	}
 	for _, m := range models {
-		if _, ok := p.pricing[m]; !ok {
+		if _, ok := p.pricing.Rate(m); !ok {
 			t.Errorf("model %q has no pricing entry", m)
 		}
 	}

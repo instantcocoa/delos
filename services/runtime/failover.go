@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -92,6 +94,12 @@ type breaker struct {
 	failures  int
 	openUntil time.Time
 	probing   bool
+
+	// lastErr is the most recent failure that counted against this
+	// breaker. While the breaker is open no provider is contacted, so it
+	// is the only remaining explanation the caller can be given for why
+	// its request was refused.
+	lastErr error
 }
 
 // allow reports whether a request may proceed. In the open state one probe
@@ -117,16 +125,28 @@ func (b *breaker) success() {
 	defer b.mu.Unlock()
 	b.failures = 0
 	b.probing = false
+	b.lastErr = nil
 }
 
-func (b *breaker) failure(now time.Time) {
+func (b *breaker) failure(now time.Time, cause error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.failures++
 	b.probing = false
+	if cause != nil {
+		b.lastErr = cause
+	}
 	if b.failures >= breakerThreshold {
 		b.openUntil = now.Add(breakerCooldown)
 	}
+}
+
+// lastFailure returns the failure that most recently counted against the
+// breaker, if any.
+func (b *breaker) lastFailure() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastErr
 }
 
 func (s *RuntimeService) breakerFor(provider string) *breaker {
@@ -166,26 +186,47 @@ const (
 	maxBackoff        = 2 * time.Second
 )
 
-// retryable reports whether an error is worth retrying or failing over.
+// retryable reports whether an error is worth another attempt on the same
+// target or a failover to the next one.
+//
+// The policy is an allowlist: an error is retried only when it is positively
+// identified as transient. Everything else is final. That matters most for
+// failures raised before the request ever left this process - a malformed
+// tool_result, an unsupported content part, a response_format the backend
+// cannot express. Those fail identically on every attempt and every fallback,
+// so retrying them only spends latency and money, and each attempt counts
+// against the provider's circuit breaker, letting one bad client request
+// degrade that provider for every other tenant.
 func retryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	// A cancelled or timed-out caller is final: the client is already gone,
+	// and failing over would start a fresh paid request nobody will read.
+	// This check comes first so it also catches a context error wrapped
+	// inside a ProviderError.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// An upstream answered: its status (and quota code) decides.
 	var pe *ProviderError
 	if errors.As(err, &pe) {
 		return pe.Retryable()
 	}
+	// Transport-level failures - connection refused or reset, TLS handshake,
+	// dial timeouts - surface as net.Error (*url.Error implements it), and a
+	// truncated body is a broken connection by another name.
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return true
 	}
-	// Connection-level failures come through url.Error and friends; treat
-	// any non-ProviderError transport failure as retryable, but a cancelled
-	// or timed-out caller context is final.
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
 	}
-	return !errors.Is(err, errNotRetryable)
+	// Anything else is a translation, validation, or programming failure:
+	// deterministic, so there is nothing to gain from trying again.
+	return false
 }
-
-var errNotRetryable = errors.New("not retryable")
 
 // backoffDelay computes jittered exponential backoff for attempt n (0-based).
 func backoffDelay(attempt int) time.Duration {
@@ -212,8 +253,36 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 
 // cacheable reports whether a request may be served from / stored in the
 // response cache: only deterministic requests qualify.
+//
+// An absent temperature is NOT deterministic. Both the OpenAI and Anthropic
+// APIs default it to 1.0, so treating "unset" as 0 made every plain request
+// - the overwhelming majority of traffic - cacheable, and two identical
+// prompts came back byte-identical. Only an explicit temperature of 0
+// qualifies.
 func cacheable(params CompletionParams) bool {
-	return params.Temperature == nil || *params.Temperature == 0
+	return params.Temperature != nil && *params.Temperature == 0
+}
+
+// breakerOpenError explains a request refused because a provider's circuit
+// breaker is open. The breaker exists to stop hammering a broken provider,
+// but "circuit breaker open" on its own erases the only useful thing the
+// caller could learn - that their key is out of credit, say - so the last
+// real upstream failure is carried through, status, code and all.
+func breakerOpenError(provider string, last error) error {
+	const reason = "circuit breaker open after repeated failures"
+	if pe, ok := errAs[*ProviderError](last); ok {
+		return &ProviderError{
+			Provider:   provider,
+			StatusCode: pe.StatusCode,
+			Code:       pe.Code,
+			Message:    reason + "; last upstream error: " + pe.Message,
+			Wrapped:    last,
+		}
+	}
+	if last != nil {
+		return fmt.Errorf("provider %s: %s; last error: %w", provider, reason, last)
+	}
+	return fmt.Errorf("provider %s: circuit breaker open", provider)
 }
 
 // CompleteChain runs a completion against a fallback chain.
@@ -226,10 +295,9 @@ func (s *RuntimeService) CompleteChain(ctx context.Context, chain []RouteTarget,
 	if s.cache != nil && cacheable(params) {
 		cacheKey = CacheKey(params)
 		if cached, ok := s.cache.Get(ctx, cacheKey); ok && cacheKey != "" {
-			hit := *cached
-			hit.Cached = true
+			hit := cachedResult(cached)
 			s.logger.InfoContext(ctx, "cache hit", "model", params.Model)
-			return &hit, nil
+			return hit, nil
 		}
 	}
 
@@ -243,7 +311,7 @@ func (s *RuntimeService) CompleteChain(ctx context.Context, chain []RouteTarget,
 		b := s.breakerFor(target.Provider)
 		if !b.allow(time.Now()) {
 			s.logger.WarnContext(ctx, "circuit open, skipping target", "target", target.String())
-			lastErr = fmt.Errorf("provider %s: circuit breaker open", target.Provider)
+			lastErr = breakerOpenError(target.Provider, b.lastFailure())
 			continue
 		}
 		tried++
@@ -266,7 +334,7 @@ func (s *RuntimeService) CompleteChain(ctx context.Context, chain []RouteTarget,
 				b.success() // a 4xx is not the provider's unhealthiness
 				return nil, err
 			}
-			b.failure(time.Now())
+			b.failure(time.Now(), err)
 			if attempt+1 < attemptsPerTarget {
 				if !b.allow(time.Now()) {
 					break
@@ -302,7 +370,7 @@ func (s *RuntimeService) EmbedChain(ctx context.Context, chain []RouteTarget, pa
 		}
 		b := s.breakerFor(target.Provider)
 		if !b.allow(time.Now()) {
-			lastErr = fmt.Errorf("provider %s: circuit breaker open", target.Provider)
+			lastErr = breakerOpenError(target.Provider, b.lastFailure())
 			continue
 		}
 		targetParams := params
@@ -318,7 +386,7 @@ func (s *RuntimeService) EmbedChain(ctx context.Context, chain []RouteTarget, pa
 			b.success()
 			return nil, err
 		}
-		b.failure(time.Now())
+		b.failure(time.Now(), err)
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no targets available")
@@ -358,7 +426,7 @@ func (s *RuntimeService) completeStreamChain(ctx context.Context, chain []RouteT
 			}
 			b := s.breakerFor(target.Provider)
 			if !b.allow(time.Now()) {
-				lastErr = fmt.Errorf("provider %s: circuit breaker open", target.Provider)
+				lastErr = breakerOpenError(target.Provider, b.lastFailure())
 				continue
 			}
 
@@ -374,7 +442,7 @@ func (s *RuntimeService) completeStreamChain(ctx context.Context, chain []RouteT
 					send(StreamChunk{Err: err, Provider: target.Provider, Model: target.Model})
 					return
 				}
-				b.failure(time.Now())
+				b.failure(time.Now(), err)
 				s.logger.WarnContext(ctx, "stream start failed, failing over",
 					"target", target.String(), "error", err)
 				continue
@@ -391,7 +459,7 @@ func (s *RuntimeService) completeStreamChain(ctx context.Context, chain []RouteT
 				if chunk.Err != nil {
 					lastErr = chunk.Err
 					failed = true
-					b.failure(time.Now())
+					b.failure(time.Now(), chunk.Err)
 					canFailover := i+1 < len(chain) && !committed
 					s.logger.WarnContext(ctx, "stream broke mid-flight",
 						"target", target.String(), "error", chunk.Err,
@@ -419,7 +487,7 @@ func (s *RuntimeService) completeStreamChain(ctx context.Context, chain []RouteT
 				// Channel closed without Done or Err: treat as a broken
 				// stream and fail over.
 				lastErr = fmt.Errorf("provider %s: stream ended without completing", target.Provider)
-				b.failure(time.Now())
+				b.failure(time.Now(), lastErr)
 			}
 		}
 		if lastErr == nil {

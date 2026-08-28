@@ -14,7 +14,8 @@ import (
 )
 
 // Response caching: exact-match only. A request is cacheable when it is
-// deterministic (temperature unset or zero) and non-streaming; the key is a
+// explicitly deterministic (temperature set to 0 - an absent temperature
+// means the API default of 1.0) and non-streaming; the key is a
 // SHA-256 over a canonical serialization of the request parameters. Semantic
 // caching is deliberately out of scope (see ROADMAP.md).
 
@@ -133,6 +134,39 @@ func CacheKey(params CompletionParams) string {
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+// cachedResult prepares a stored result for return to a caller.
+//
+// A cache hit never reached a provider: no tokens were generated and no
+// invoice line was created, so the request is billed at zero. Charging the
+// original request's cost again would invent revenue for the operator and
+// spend a tenant's budget on a request that cost nothing - while the response
+// carries X-Delos-Cache: hit, which says the opposite.
+//
+// The token counts are kept: they describe the payload the client actually
+// received, so client-side context accounting still works. Cost is what the
+// gateway meters (see recordUsage), and cost is zero.
+func cachedResult(stored *CompletionResult) *CompletionResult {
+	hit := *stored
+	hit.Cached = true
+	hit.Usage.CostUSD = 0
+	return &hit
+}
+
+// billableUsage is what the gateway charges a key for a completed request. A
+// cache hit is billed as nothing at all - no provider call, no tokens bought -
+// while still being recorded as a request that happened (and published on the
+// tail stream with cache_hit=true), so traffic stays visible without inventing
+// consumption.
+func billableUsage(result *CompletionResult) Usage {
+	if result == nil {
+		return Usage{}
+	}
+	if result.Cached {
+		return Usage{}
+	}
+	return result.Usage
 }
 
 // ---- in-process LRU ----

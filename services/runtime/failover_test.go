@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -344,5 +345,114 @@ func TestStreamChainAllTargetsFail(t *testing.T) {
 	}
 	if !sawErr || sawDone {
 		t.Errorf("sawErr=%v sawDone=%v; when every target fails the client must see an error and no completion", sawErr, sawDone)
+	}
+}
+
+func TestCompleteChainDoesNotRetryTranslationFailures(t *testing.T) {
+	// A malformed client request fails identically on every attempt and
+	// every fallback. Retrying it produced a 502 describing a caller
+	// mistake, and - worse - three breaker failures per request, so one bad
+	// client could open the circuit for every tenant on that provider.
+	primary := &mockProvider{
+		name:        "primary",
+		completeErr: fmt.Errorf("messages[0]: unsupported content part type %q", "audio"),
+	}
+	fallback := &mockProvider{name: "fallback", completeResult: okResult("fallback", "x")}
+	svc := newTestService(primary, fallback)
+
+	_, err := svc.CompleteChain(context.Background(), []RouteTarget{
+		{Provider: "primary", Model: "m1"},
+		{Provider: "fallback", Model: "m2"},
+	}, CompletionParams{})
+	if err == nil {
+		t.Fatal("a translation failure must be reported, not retried into a fallback")
+	}
+	if fallback.lastParams != nil {
+		t.Error("a deterministic failure must not fail over to a paid fallback")
+	}
+	if state := svc.BreakerState("primary"); state != "closed" {
+		t.Errorf("breaker = %s; a caller's mistake is not the provider's unhealthiness", state)
+	}
+}
+
+func TestCompleteChainDoesNotRetryQuotaExhaustion(t *testing.T) {
+	// HTTP 429 covers both "slow down" and "you are out of credit". Only
+	// the first is worth retrying; the second is permanent, and retrying it
+	// trips the breaker so that every later request gets a generic "circuit
+	// breaker open" instead of the billing message the operator needs.
+	quota := &ProviderError{
+		Provider: "openai", StatusCode: 429, Code: "insufficient_quota",
+		Message: "You exceeded your current quota, please check your plan and billing details.",
+	}
+	p := &mockProvider{name: "openai", completeErr: quota}
+	svc := newTestService(p)
+	chain := []RouteTarget{{Provider: "openai", Model: "gpt-4o"}}
+
+	for i := 0; i < breakerThreshold+2; i++ {
+		_, err := svc.CompleteChain(context.Background(), chain, CompletionParams{})
+		if err == nil {
+			t.Fatal("expected the quota error to surface")
+		}
+		if !strings.Contains(err.Error(), "check your plan and billing details") {
+			t.Fatalf("the upstream billing message must reach the caller, got %v", err)
+		}
+	}
+	if state := svc.BreakerState("openai"); state != "closed" {
+		t.Errorf("breaker = %s; a permanent billing failure must not open the circuit", state)
+	}
+}
+
+func TestBreakerOpenErrorCarriesLastUpstreamError(t *testing.T) {
+	// "circuit breaker open" on its own erases the only useful thing the
+	// caller could learn. The last real failure travels with it, status and
+	// message intact.
+	p := &flakyProvider{
+		mockProvider:  mockProvider{name: "openai"},
+		failCompletes: 99,
+		breakStreamAt: -1,
+	}
+	svc := newTestService(p)
+	chain := []RouteTarget{{Provider: "openai", Model: "gpt-4o"}}
+
+	for i := 0; i < breakerThreshold; i++ {
+		svc.CompleteChain(context.Background(), chain, CompletionParams{})
+	}
+	if state := svc.BreakerState("openai"); state != "open" {
+		t.Fatalf("breaker state = %s, want open", state)
+	}
+
+	_, err := svc.CompleteChain(context.Background(), chain, CompletionParams{})
+	if err == nil {
+		t.Fatal("expected an error while the breaker is open")
+	}
+	if !strings.Contains(err.Error(), "circuit breaker open") {
+		t.Errorf("error = %v, want it to still say the breaker is open", err)
+	}
+	if !strings.Contains(err.Error(), "upstream exploded") {
+		t.Errorf("error = %v, want it to carry the last upstream failure", err)
+	}
+	pe, ok := errAs[*ProviderError](err)
+	if !ok {
+		t.Fatalf("error = %v (%T), want a ProviderError so surfaces map the upstream status", err, err)
+	}
+	if pe.StatusCode != 500 {
+		t.Errorf("status = %d, want the last upstream status", pe.StatusCode)
+	}
+}
+
+func TestCacheableRequiresExplicitZeroTemperature(t *testing.T) {
+	// An absent temperature is the API default of 1.0, not 0. Treating it
+	// as deterministic made almost all traffic cacheable, and two identical
+	// "tell me a joke" requests came back byte-identical.
+	if cacheable(CompletionParams{}) {
+		t.Error("an unset temperature is 1.0 by default and must not be cacheable")
+	}
+	zero := 0.0
+	if !cacheable(CompletionParams{Temperature: &zero}) {
+		t.Error("an explicit temperature of 0 is deterministic and must be cacheable")
+	}
+	hot := 0.7
+	if cacheable(CompletionParams{Temperature: &hot}) {
+		t.Error("a non-zero temperature must not be cacheable")
 	}
 }
