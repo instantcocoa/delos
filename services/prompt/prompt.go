@@ -32,10 +32,13 @@ type Prompt struct {
 	Tags          []string
 	Metadata      map[string]string
 	Status        PromptStatus
-	CreatedBy     string
-	CreatedAt     time.Time
-	UpdatedBy     string
-	UpdatedAt     time.Time
+	// ChangeDescription describes the change that produced this version. It is
+	// recorded in the version history rather than on the prompt row itself.
+	ChangeDescription string
+	CreatedBy         string
+	CreatedAt         time.Time
+	UpdatedBy         string
+	UpdatedAt         time.Time
 }
 
 // PromptMessage represents a message in a prompt template.

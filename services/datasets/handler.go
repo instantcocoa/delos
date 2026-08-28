@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -167,6 +168,9 @@ func (h *Handler) AddExamples(ctx context.Context, req *datasetsv1.AddExamplesRe
 	examples, err := h.service.AddExamples(ctx, input)
 	if err != nil {
 		h.logger.ErrorContext(ctx, "failed to add examples", "error", err)
+		if strings.Contains(err.Error(), "dataset not found") {
+			return nil, status.Errorf(codes.NotFound, "dataset not found: %s", req.DatasetId)
+		}
 		return nil, status.Errorf(codes.Internal, "failed to add examples: %v", err)
 	}
 
@@ -184,6 +188,16 @@ func (h *Handler) AddExamples(ctx context.Context, req *datasetsv1.AddExamplesRe
 // GetExamples retrieves examples from a dataset.
 func (h *Handler) GetExamples(ctx context.Context, req *datasetsv1.GetExamplesRequest) (*datasetsv1.GetExamplesResponse, error) {
 	h.logger.InfoContext(ctx, "getting examples", "dataset_id", req.DatasetId)
+
+	// Verify the dataset exists so an unknown ID 404s instead of silently
+	// reporting zero examples.
+	dataset, err := h.service.GetDataset(ctx, req.DatasetId)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get dataset: %v", err)
+	}
+	if dataset == nil {
+		return nil, status.Errorf(codes.NotFound, "dataset not found: %s", req.DatasetId)
+	}
 
 	query := GetExamplesQuery{
 		DatasetID: req.DatasetId,
@@ -316,6 +330,15 @@ func (h *Handler) ImportExamples(ctx context.Context, req *datasetsv1.ImportExam
 // ExportExamples exports examples to various formats.
 func (h *Handler) ExportExamples(ctx context.Context, req *datasetsv1.ExportExamplesRequest) (*datasetsv1.ExportExamplesResponse, error) {
 	h.logger.InfoContext(ctx, "exporting examples", "dataset_id", req.DatasetId, "format", req.Format)
+
+	// Verify dataset exists
+	dataset, err := h.service.GetDataset(ctx, req.DatasetId)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get dataset: %v", err)
+	}
+	if dataset == nil {
+		return nil, status.Errorf(codes.NotFound, "dataset not found: %s", req.DatasetId)
+	}
 
 	// Get examples from dataset
 	query := GetExamplesQuery{
@@ -500,15 +523,23 @@ func (h *Handler) convertToExamples(rawData []map[string]interface{}, mappings [
 		} else {
 			// Auto-detect: use "input_*" and "expected_*" prefixes, or "input"/"expected_output" fields
 			for key, val := range row {
+				// Skip the envelope fields ExportExamples emits, so an export
+				// can be re-imported without them leaking into the input.
+				if key == "id" || key == "dataset_id" || key == "metadata" || key == "created_at" {
+					continue
+				}
 				if key == "input" {
 					if m, ok := val.(map[string]interface{}); ok {
-						input = m
+						// Merge rather than replace: map iteration order is
+						// random, so replacing would drop sibling fields
+						// non-deterministically.
+						maps.Copy(input, m)
 					} else {
 						input["value"] = val
 					}
 				} else if key == "expected_output" || key == "expected" || key == "output" {
 					if m, ok := val.(map[string]interface{}); ok {
-						output = m
+						maps.Copy(output, m)
 					} else {
 						output["value"] = val
 					}

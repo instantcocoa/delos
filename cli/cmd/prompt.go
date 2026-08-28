@@ -3,6 +3,8 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -16,7 +18,20 @@ import (
 var promptCmd = &cobra.Command{
 	Use:   "prompt",
 	Short: "Manage prompts",
-	Long:  "Commands for creating, updating, and managing prompts.",
+	Long: `Commands for creating, updating, and managing prompts.
+
+Every command that takes <id-or-slug> accepts either the prompt ID or its
+slug, so "delos prompt get summarizer" and "delos prompt get pmt_123" are
+equivalent.`,
+}
+
+// parseVersionArg parses a positional version argument ("2" or "v2").
+func parseVersionArg(arg string) (int32, error) {
+	n, err := strconv.Atoi(strings.TrimPrefix(arg, "v"))
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("invalid version %q: expected a positive version number such as 1 or v1", arg)
+	}
+	return int32(n), nil
 }
 
 var promptListCmd = &cobra.Command{
@@ -61,7 +76,7 @@ var promptListCmd = &cobra.Command{
 				updated = p.UpdatedAt.AsTime().Format("2006-01-02 15:04")
 			}
 			table.Rows[i] = []string{
-				p.Id[:8],
+				shortID(p.Id, 8),
 				p.Name,
 				p.Slug,
 				fmt.Sprintf("v%d", p.Version),
@@ -99,6 +114,9 @@ var promptGetCmd = &cobra.Command{
 		resp, err := client.GetPrompt(ctx, req)
 		if err != nil {
 			return fmt.Errorf("failed to get prompt: %w", err)
+		}
+		if resp.Prompt == nil {
+			return fmt.Errorf("prompt not found: %s", args[0])
 		}
 
 		w := output.NewWriter(cfg.Format)
@@ -164,7 +182,7 @@ var promptCreateCmd = &cobra.Command{
 }
 
 var promptUpdateCmd = &cobra.Command{
-	Use:   "update <id>",
+	Use:   "update <id-or-slug>",
 	Short: "Update a prompt (creates new version)",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -213,7 +231,7 @@ var promptUpdateCmd = &cobra.Command{
 }
 
 var promptDeleteCmd = &cobra.Command{
-	Use:   "delete <id>",
+	Use:   "delete <id-or-slug>",
 	Short: "Delete a prompt",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -240,7 +258,7 @@ var promptDeleteCmd = &cobra.Command{
 }
 
 var promptHistoryCmd = &cobra.Command{
-	Use:   "history <id>",
+	Use:   "history <id-or-slug>",
 	Short: "List prompt version history",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -296,7 +314,7 @@ var promptHistoryCmd = &cobra.Command{
 }
 
 var promptCompareCmd = &cobra.Command{
-	Use:   "compare <id> <version-a> <version-b>",
+	Use:   "compare <id-or-slug> <version-a> <version-b>",
 	Short: "Compare two prompt versions",
 	Args:  cobra.ExactArgs(3),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -310,9 +328,14 @@ var promptCompareCmd = &cobra.Command{
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		var versionA, versionB int32
-		fmt.Sscanf(args[1], "%d", &versionA)
-		fmt.Sscanf(args[2], "%d", &versionB)
+		versionA, err := parseVersionArg(args[1])
+		if err != nil {
+			return err
+		}
+		versionB, err := parseVersionArg(args[2])
+		if err != nil {
+			return err
+		}
 
 		resp, err := client.CompareVersions(ctx, &promptv1.CompareVersionsRequest{
 			PromptId: args[0],
@@ -357,7 +380,7 @@ func init() {
 	promptListCmd.Flags().Int32("limit", 100, "Maximum results")
 
 	// Get flags
-	promptGetCmd.Flags().String("reference", "", "Version reference (e.g., 'summarizer:v2')")
+	promptGetCmd.Flags().String("reference", "", "Version selector: 'slug:v2', 'slug:latest', or a bare 'v2'")
 
 	// Create flags
 	promptCreateCmd.Flags().String("slug", "", "URL-friendly name")
