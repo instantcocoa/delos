@@ -17,7 +17,11 @@
 #
 #   OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY (or GOOGLE_API_KEY),
 #   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, DELOS_COMPAT_API_KEY,
-#   DELOS_DB_PASSWORD
+#   DELOS_DB_PASSWORD, DELOS_AUTH_TOKEN
+#
+# DELOS_AUTH_TOKEN is the control plane's shared secret. There is deliberately
+# no `auth_token:` key here - this file rejects unknown keys, so adding one is
+# a startup error rather than a secret quietly committed to git.
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +44,23 @@ log_format: json
 
 # gRPC-over-h2c + /healthz listen port.          env: DELOS_PORT
 port: 8081
+
+# Authentication and exposure are environment-only, and have no keys in this
+# file:
+#
+#   DELOS_AUTH_TOKEN   the shared secret every CLI/CI call must present, as
+#                      `authorization: Bearer <token>` (gRPC and HTTP alike).
+#                      Unset means the control plane binds loopback only.
+#   DELOS_BIND         listen host, e.g. 0.0.0.0. Only widen it with a token
+#                      set. Defaults to 127.0.0.1 without one.
+#
+# The gateway has two of its own:
+#
+#   DELOS_ALLOW_UNAUTHENTICATED=true   acknowledge an open gateway (no virtual
+#                                      keys) on a reachable address. Without
+#                                      it the gateway refuses to start rather
+#                                      than front your provider keys anonymously.
+#   DELOS_BIND                         same meaning as above.
 
 # memory | postgres                              env: DELOS_STORAGE_BACKEND
 # "memory" is ephemeral and meant for development; everything is lost on

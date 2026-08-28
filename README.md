@@ -7,7 +7,10 @@ caching, virtual keys, budgets and full `gen_ai.*` tracing — without deploying
 Python proxy, a ClickHouse cluster and a separate observability vendor.
 
 ```bash
-docker run -p 8080:8080 -e OPENAI_API_KEY=sk-... ghcr.io/instantcocoa/delos-gateway
+docker run -p 8080:8080 \
+  -e OPENAI_API_KEY=sk-... \
+  -e DELOS_ALLOW_UNAUTHENTICATED=true \
+  ghcr.io/instantcocoa/delos-gateway
 ```
 
 ```python
@@ -24,6 +27,15 @@ That is the whole setup. No config file, no signup, no database. With no config
 the gateway runs in **dev mode**: any `api_key` value is accepted (`delos-dev` is
 just a convention), model names route straight through to whichever providers
 have keys in the environment, the cache is in-process, and nothing is metered.
+
+`DELOS_ALLOW_UNAUTHENTICATED=true` is doing real work in that command, and it is
+deliberately something you type rather than a default. A published port with no
+virtual keys is an open proxy in front of your provider credits: anyone who can
+reach it can spend them. The gateway refuses to start that way unless you say
+so. On a laptop that is fine; before anyone else can route to it, set
+`DELOS_STORAGE_BACKEND=postgres` and issue a key with `delos key create` — see
+[docs/deploy.md](docs/deploy.md). Run without the flag and you get loopback-only
+binding, which is safe but unreachable from outside a container.
 
 Using the Anthropic SDK instead? Swap the same way:
 
@@ -170,7 +182,9 @@ has the full environment-variable reference.
 | [docs/architecture/overview.md](docs/architecture/overview.md) | How the pieces fit |
 
 Documentation code blocks marked `# docs-test` are extracted and executed in CI
-(`make docs-test`), so stale docs fail the build.
+(`make docs-test`), so those blocks cannot go stale. It is an opt-in marker on
+individual blocks, not whole-workflow coverage: blocks needing Docker, provider
+credentials, or a running stack are deliberately not marked.
 
 ## Performance
 
