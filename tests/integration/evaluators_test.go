@@ -40,8 +40,6 @@ func TestEvaluator_ListAvailable(t *testing.T) {
 		t.Fatalf("ListEvaluators failed: %v", err)
 	}
 
-	t.Logf("Available evaluators (%d):", len(resp.Evaluators))
-
 	expectedTypes := map[string]bool{
 		"exact_match":         false,
 		"contains":            false,
@@ -52,11 +50,11 @@ func TestEvaluator_ListAvailable(t *testing.T) {
 	}
 
 	for _, e := range resp.Evaluators {
-		t.Logf("  - %s (%s): %s", e.Type, e.Name, e.Description)
-		if len(e.Params) > 0 {
-			for _, p := range e.Params {
-				t.Logf("      param: %s (%s) required=%v default=%s", p.Name, p.Type, p.Required, p.DefaultValue)
-			}
+		if e.Name == "" {
+			t.Errorf("evaluator %q has no display name", e.Type)
+		}
+		if e.Description == "" {
+			t.Errorf("evaluator %q has no description", e.Type)
 		}
 		expectedTypes[e.Type] = true
 	}
@@ -137,8 +135,6 @@ func TestEvalRun_Create(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateEvalRun failed: %v", err)
 	}
-
-	t.Logf("Created eval run: %s", runResp.EvalRun.Id)
 
 	// Verify the response
 	if runResp.EvalRun.Name != "Test Eval Run" {
@@ -232,7 +228,6 @@ func TestEvalRun_Get(t *testing.T) {
 		t.Errorf("Expected name 'Get Test Run', got '%s'", getResp.EvalRun.Name)
 	}
 
-	t.Logf("Successfully retrieved eval run: %s", getResp.EvalRun.Id)
 }
 
 // ============================================================================
@@ -297,8 +292,6 @@ func TestEvalRun_List(t *testing.T) {
 		t.Fatalf("ListEvalRuns failed: %v", err)
 	}
 
-	t.Logf("Found %d eval runs (total_count=%d)", len(listResp.EvalRuns), listResp.TotalCount)
-
 	// Should have at least 3 runs
 	if len(listResp.EvalRuns) < 3 {
 		t.Errorf("Expected at least 3 eval runs, got %d", len(listResp.EvalRuns))
@@ -312,8 +305,6 @@ func TestEvalRun_List(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListEvalRuns with filter failed: %v", err)
 	}
-
-	t.Logf("Found %d eval runs for prompt %s", len(filteredResp.EvalRuns), promptResp.Prompt.Id)
 
 	// All returned runs should match the prompt_id
 	for _, run := range filteredResp.EvalRuns {
@@ -392,16 +383,12 @@ func TestEvalRun_Cancel(t *testing.T) {
 		t.Errorf("Expected status CANCELLED, got %s", cancelResp.EvalRun.Status)
 	}
 
-	t.Logf("Successfully cancelled eval run: %s (status=%s)", cancelResp.EvalRun.Id, cancelResp.EvalRun.Status)
-
 	// Verify we can't cancel again
 	_, err = evalClient.CancelEvalRun(ctx, &evalv1.CancelEvalRunRequest{
 		Id: createResp.EvalRun.Id,
 	})
 	if err == nil {
-		t.Error("Expected error when cancelling already cancelled run")
-	} else {
-		t.Logf("Correctly rejected re-cancel: %v", err)
+		t.Error("Expected error when cancelling an already cancelled run")
 	}
 }
 
@@ -489,35 +476,90 @@ func TestEvalRun_MultipleEvaluatorConfigs(t *testing.T) {
 	var totalWeight float64
 	for _, e := range createResp.EvalRun.Config.Evaluators {
 		totalWeight += e.Weight
-		t.Logf("  Evaluator: %s (%s) weight=%.1f", e.Type, e.Name, e.Weight)
 	}
 
 	if totalWeight < 0.99 || totalWeight > 1.01 {
 		t.Errorf("Expected weights to sum to 1.0, got %.2f", totalWeight)
 	}
 
-	t.Logf("Successfully stored eval run with %d evaluators", len(createResp.EvalRun.Config.Evaluators))
 }
 
 // ============================================================================
-// TEST: Eval service health check (from evaluators test)
+// TEST: Results of a run that has not executed yet
 // ============================================================================
 
-func TestEvalService_HealthFromEvaluatorsTest(t *testing.T) {
+// TestEvalRun_ResultsBeforeExecution asserts a freshly created run reports no
+// results and no summary, so a caller cannot mistake "not run yet" for "ran and
+// scored zero". This replaces the log-only eval walkthrough in
+// all_services_test.go.
+func TestEvalRun_ResultsBeforeExecution(t *testing.T) {
 	evalClient, evalCleanup := getEvalClient(t)
 	defer evalCleanup()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	promptClient, promptCleanup := getPromptClient(t)
+	defer promptCleanup()
+
+	datasetsClient, datasetsCleanup := getDatasetsClient(t)
+	defer datasetsCleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	resp, err := evalClient.Health(ctx, &evalv1.HealthRequest{})
+	promptResp, err := promptClient.CreatePrompt(ctx, &promptv1.CreatePromptRequest{
+		Name: "Eval Results Test",
+		Slug: fmt.Sprintf("eval-results-test-%d", time.Now().UnixNano()),
+		Messages: []*promptv1.PromptMessage{
+			{Role: "user", Content: "{{q}}"},
+		},
+		Variables: []*promptv1.PromptVariable{
+			{Name: "q", Type: "string", Required: true},
+		},
+	})
 	if err != nil {
-		t.Fatalf("Health check failed: %v", err)
+		t.Fatalf("CreatePrompt failed: %v", err)
 	}
+	defer promptClient.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptResp.Prompt.Id})
 
-	if resp.Status != "healthy" {
-		t.Errorf("Expected status 'healthy', got '%s'", resp.Status)
+	datasetResp, err := datasetsClient.CreateDataset(ctx, &datasetsv1.CreateDatasetRequest{
+		Name:     "Eval Results Test Dataset",
+		PromptId: promptResp.Prompt.Id,
+	})
+	if err != nil {
+		t.Fatalf("CreateDataset failed: %v", err)
 	}
+	defer datasetsClient.DeleteDataset(ctx, &datasetsv1.DeleteDatasetRequest{Id: datasetResp.Dataset.Id})
 
-	t.Logf("Eval service health: status=%s version=%s", resp.Status, resp.Version)
+	runResp, err := evalClient.CreateEvalRun(ctx, &evalv1.CreateEvalRunRequest{
+		Name:      "Results Test Run",
+		PromptId:  promptResp.Prompt.Id,
+		DatasetId: datasetResp.Dataset.Id,
+		Config: &evalv1.EvalConfig{
+			Evaluators: []*evalv1.EvaluatorConfig{
+				{Type: "exact_match", Weight: 1.0},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateEvalRun failed: %v", err)
+	}
+	// Cancel so the execution engine does not pick it up mid-assertion.
+	defer evalClient.CancelEvalRun(ctx, &evalv1.CancelEvalRunRequest{Id: runResp.EvalRun.Id})
+
+	resultsResp, err := evalClient.GetEvalResults(ctx, &evalv1.GetEvalResultsRequest{
+		EvalRunId: runResp.EvalRun.Id,
+		Limit:     10,
+	})
+	if err != nil {
+		t.Fatalf("GetEvalResults failed: %v", err)
+	}
+	if len(resultsResp.Results) != 0 {
+		t.Errorf("expected no results for a run that has not executed, got %d", len(resultsResp.Results))
+	}
+	if runResp.EvalRun.Summary != nil {
+		t.Errorf("expected no summary on a pending run, got %+v", runResp.EvalRun.Summary)
+	}
+	if runResp.EvalRun.CompletedExamples != 0 {
+		t.Errorf("expected 0 completed examples on a pending run, got %d",
+			runResp.EvalRun.CompletedExamples)
+	}
 }

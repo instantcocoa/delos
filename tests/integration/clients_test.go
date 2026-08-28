@@ -27,6 +27,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
 	datasetsv1 "github.com/instantcocoa/delos/gen/go/datasets/v1"
 	deployv1 "github.com/instantcocoa/delos/gen/go/deploy/v1"
@@ -47,11 +48,41 @@ func controlPlaneAddr() string {
 	return "localhost:8081"
 }
 
-// dialControlPlane opens a gRPC connection to the control plane.
+// controlPlaneToken returns the bearer token the control plane requires, if the
+// stack under test was started with one. Empty means an unauthenticated stack.
+func controlPlaneToken() string {
+	return os.Getenv("DELOS_AUTH_TOKEN")
+}
+
+// gatewayToken returns the API key the gateway expects. The gateway accepts any
+// key in dev mode, so this only has to be non-empty once virtual keys are
+// enforced.
+func gatewayToken() string {
+	if k := os.Getenv("DELOS_GATEWAY_API_KEY"); k != "" {
+		return k
+	}
+	return os.Getenv("DELOS_AUTH_TOKEN")
+}
+
+// bearerUnaryInterceptor attaches an Authorization header to every unary RPC.
+func bearerUnaryInterceptor(token string) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any,
+		cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+}
+
+// dialControlPlane opens a gRPC connection to the control plane, carrying the
+// bearer token when the stack requires one.
 func dialControlPlane(t *testing.T) (*grpc.ClientConn, func()) {
 	t.Helper()
 	addr := controlPlaneAddr()
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if token := controlPlaneToken(); token != "" {
+		opts = append(opts, grpc.WithUnaryInterceptor(bearerUnaryInterceptor(token)))
+	}
+	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		t.Fatalf("failed to connect to control plane at %s: %v", addr, err)
 	}
@@ -145,6 +176,9 @@ func (g *gatewayClient) postRaw(ctx context.Context, path string, body []byte) (
 }
 
 func (g *gatewayClient) do(req *http.Request) (int, []byte, error) {
+	if token := gatewayToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	resp, err := g.http.Do(req)
 	if err != nil {
 		return 0, nil, err
@@ -170,6 +204,9 @@ func (g *gatewayClient) postStream(ctx context.Context, path string, payload any
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
+	if token := gatewayToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	return g.http.Do(req)
 }
 
@@ -287,6 +324,29 @@ func listGatewayModels(t *testing.T, ctx context.Context) gwModelList {
 		t.Fatalf("GET /v1/models: invalid JSON: %v (body: %s)", err, body)
 	}
 	return list
+}
+
+// requireGatewayModel returns a model the gateway can actually serve, or skips
+// the test with a visible reason. Tests that call a provider use this so a
+// credential-free CI run reports SKIP - never a silent PASS - while a run with
+// a provider configured is held to the full response contract.
+func requireGatewayModel(t *testing.T) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	list := listGatewayModels(t, ctx)
+	if len(list.Data) == 0 {
+		t.Skip("gateway has no provider configured (GET /v1/models is empty) - " +
+			"set a provider credential to exercise completions")
+	}
+	// Prefer a local Ollama model so the test does not depend on cloud credits.
+	for _, m := range list.Data {
+		if m.OwnedBy == ollamaProvider {
+			return m.ID
+		}
+	}
+	return list.Data[0].ID
 }
 
 // decodeGatewayError parses an OpenAI-style error envelope.

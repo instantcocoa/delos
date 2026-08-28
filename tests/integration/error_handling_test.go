@@ -35,24 +35,43 @@ func TestPromptService_GetPrompt_NotFound(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// A missing prompt is NOT_FOUND. Returning a nil prompt with no error is a
+	// contract violation: callers cannot distinguish it from an empty result.
 	resp, err := client.GetPrompt(ctx, &promptv1.GetPromptRequest{
 		Id: "nonexistent-prompt-id",
 	})
+	if err == nil {
+		t.Fatalf("expected NOT_FOUND for a nonexistent prompt id, got prompt=%+v", resp.GetPrompt())
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected a gRPC status error, got: %v", err)
+	}
+	if st.Code() != codes.NotFound {
+		t.Errorf("expected NOT_FOUND, got %s: %s", st.Code(), st.Message())
+	}
+}
 
-	// Service may return nil prompt with no error, or NOT_FOUND error
-	if err != nil {
-		st, ok := status.FromError(err)
-		if !ok {
-			t.Fatalf("Expected gRPC status error, got: %v", err)
-		}
-		if st.Code() != codes.NotFound {
-			t.Errorf("Expected NOT_FOUND, got %s: %s", st.Code(), st.Message())
-		}
-		t.Logf("Correctly returned NOT_FOUND: %s", st.Message())
-	} else if resp.Prompt == nil {
-		t.Log("Returned nil prompt for nonexistent ID (acceptable)")
-	} else {
-		t.Errorf("Expected error or nil prompt for nonexistent ID, got: %+v", resp.Prompt)
+// TestPromptService_GetPrompt_NotFound_BySlug covers the reference form the CLI
+// uses: an unknown slug is NOT_FOUND, not a null prompt.
+func TestPromptService_GetPrompt_NotFound_BySlug(t *testing.T) {
+	client, cleanup := getPromptClient(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	slug := fmt.Sprintf("no-such-slug-%d", time.Now().UnixNano())
+	resp, err := client.GetPrompt(ctx, &promptv1.GetPromptRequest{Reference: slug})
+	if err == nil {
+		t.Fatalf("expected NOT_FOUND for an unknown slug %q, got prompt=%+v", slug, resp.GetPrompt())
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected a gRPC status error, got: %v", err)
+	}
+	if st.Code() != codes.NotFound {
+		t.Errorf("expected NOT_FOUND, got %s: %s", st.Code(), st.Message())
 	}
 }
 
@@ -77,8 +96,10 @@ func TestPromptService_DeletePrompt_NotFound(t *testing.T) {
 		t.Fatalf("Expected gRPC status error, got: %v", err)
 	}
 
-	// Could be NOT_FOUND or INTERNAL depending on implementation
-	t.Logf("Delete nonexistent returned %s: %s", st.Code(), st.Message())
+	if st.Code() != codes.NotFound {
+		t.Errorf("expected NOT_FOUND when deleting a nonexistent prompt, got %s: %s",
+			st.Code(), st.Message())
+	}
 }
 
 func TestPromptService_CreatePrompt_DuplicateSlug(t *testing.T) {
@@ -120,10 +141,11 @@ func TestPromptService_CreatePrompt_DuplicateSlug(t *testing.T) {
 		t.Fatalf("Expected gRPC status error, got: %v", err)
 	}
 
-	// Should be ALREADY_EXISTS or INVALID_ARGUMENT
-	t.Logf("Duplicate slug returned %s: %s", st.Code(), st.Message())
-	if st.Code() != codes.AlreadyExists && st.Code() != codes.Internal {
-		t.Logf("Note: Expected ALREADY_EXISTS, got %s", st.Code())
+	if st.Code() != codes.AlreadyExists {
+		t.Errorf("expected ALREADY_EXISTS for a duplicate slug, got %s: %s", st.Code(), st.Message())
+	}
+	if !strings.Contains(st.Message(), slug) {
+		t.Errorf("expected the error to name the conflicting slug %q, got %q", slug, st.Message())
 	}
 }
 
@@ -153,8 +175,6 @@ func TestDatasetsService_GetDataset_NotFound(t *testing.T) {
 	if st.Code() != codes.NotFound {
 		t.Errorf("Expected NOT_FOUND, got %s: %s", st.Code(), st.Message())
 	}
-
-	t.Logf("Correctly returned NOT_FOUND: %s", st.Message())
 }
 
 func TestDatasetsService_AddExamples_InvalidDatasetID(t *testing.T) {
@@ -177,7 +197,10 @@ func TestDatasetsService_AddExamples_InvalidDatasetID(t *testing.T) {
 		t.Fatalf("Expected gRPC status error, got: %v", err)
 	}
 
-	t.Logf("Add to invalid dataset returned %s: %s", st.Code(), st.Message())
+	if st.Code() != codes.InvalidArgument && st.Code() != codes.NotFound {
+		t.Errorf("expected INVALID_ARGUMENT or NOT_FOUND adding to a nonexistent dataset, got %s: %s",
+			st.Code(), st.Message())
+	}
 }
 
 func TestDatasetsService_ImportExamples_NoData(t *testing.T) {
@@ -187,9 +210,18 @@ func TestDatasetsService_ImportExamples_NoData(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Import with no data should fail with INVALID_ARGUMENT
-	_, err := client.ImportExamples(ctx, &datasetsv1.ImportExamplesRequest{
-		DatasetId: "any-dataset",
+	// Use a dataset that really exists, so the only thing wrong with the request
+	// is the missing payload.
+	created, err := client.CreateDataset(ctx, &datasetsv1.CreateDatasetRequest{
+		Name: fmt.Sprintf("import-no-data-%d", time.Now().UnixNano()),
+	})
+	if err != nil {
+		t.Fatalf("CreateDataset failed: %v", err)
+	}
+	defer client.DeleteDataset(ctx, &datasetsv1.DeleteDatasetRequest{Id: created.Dataset.Id})
+
+	_, err = client.ImportExamples(ctx, &datasetsv1.ImportExamplesRequest{
+		DatasetId: created.Dataset.Id,
 		Format:    datasetsv1.DataFormat_DATA_FORMAT_JSON,
 	})
 	if err == nil {
@@ -201,8 +233,10 @@ func TestDatasetsService_ImportExamples_NoData(t *testing.T) {
 		t.Fatalf("Expected gRPC status error, got: %v", err)
 	}
 
-	// Should be INVALID_ARGUMENT (no data) or NOT_FOUND (dataset doesn't exist)
-	t.Logf("ImportExamples with no data returned %s: %s", st.Code(), st.Message())
+	if st.Code() != codes.InvalidArgument {
+		t.Errorf("expected INVALID_ARGUMENT importing with no data, got %s: %s",
+			st.Code(), st.Message())
+	}
 }
 
 func TestDatasetsService_ExportExamples_NonexistentDataset(t *testing.T) {
@@ -212,18 +246,22 @@ func TestDatasetsService_ExportExamples_NonexistentDataset(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Export from nonexistent dataset - may return empty or error
+	// Exporting a dataset that does not exist is NOT_FOUND. Returning an empty
+	// export would tell a caller their dataset is empty, not missing.
 	resp, err := client.ExportExamples(ctx, &datasetsv1.ExportExamplesRequest{
 		DatasetId: "nonexistent-dataset",
 		Format:    datasetsv1.DataFormat_DATA_FORMAT_JSON,
 	})
-	if err != nil {
-		st, ok := status.FromError(err)
-		if ok {
-			t.Logf("ExportExamples returned %s: %s", st.Code(), st.Message())
-		}
-	} else {
-		t.Logf("ExportExamples returned %d examples", resp.ExportedCount)
+	if err == nil {
+		t.Fatalf("expected NOT_FOUND exporting a nonexistent dataset, got %d examples",
+			resp.ExportedCount)
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected a gRPC status error, got: %v", err)
+	}
+	if st.Code() != codes.NotFound {
+		t.Errorf("expected NOT_FOUND, got %s: %s", st.Code(), st.Message())
 	}
 }
 
@@ -253,8 +291,6 @@ func TestEvalService_GetEvalRun_NotFound(t *testing.T) {
 	if st.Code() != codes.NotFound {
 		t.Errorf("Expected NOT_FOUND, got %s: %s", st.Code(), st.Message())
 	}
-
-	t.Logf("Correctly returned NOT_FOUND: %s", st.Message())
 }
 
 func TestEvalService_CancelEvalRun_NotFound(t *testing.T) {
@@ -276,7 +312,10 @@ func TestEvalService_CancelEvalRun_NotFound(t *testing.T) {
 		t.Fatalf("Expected gRPC status error, got: %v", err)
 	}
 
-	t.Logf("Cancel nonexistent returned %s: %s", st.Code(), st.Message())
+	if st.Code() != codes.NotFound {
+		t.Errorf("expected NOT_FOUND cancelling a nonexistent eval run, got %s: %s",
+			st.Code(), st.Message())
+	}
 }
 
 func TestEvalService_CompareRuns_NotFound(t *testing.T) {
@@ -299,7 +338,10 @@ func TestEvalService_CompareRuns_NotFound(t *testing.T) {
 		t.Fatalf("Expected gRPC status error, got: %v", err)
 	}
 
-	t.Logf("Compare nonexistent returned %s: %s", st.Code(), st.Message())
+	if st.Code() != codes.NotFound {
+		t.Errorf("expected NOT_FOUND comparing nonexistent runs, got %s: %s",
+			st.Code(), st.Message())
+	}
 }
 
 // ============================================================================
@@ -392,8 +434,10 @@ func TestEvalService_CreateEvalRun_InvalidPromptID(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Create eval run with nonexistent prompt and dataset
-	_, err := client.CreateEvalRun(ctx, &evalv1.CreateEvalRunRequest{
+	// An eval run that names a prompt and dataset which do not exist can never
+	// execute, so it must be rejected at creation rather than accepted and left
+	// to fail asynchronously.
+	resp, err := client.CreateEvalRun(ctx, &evalv1.CreateEvalRunRequest{
 		Name:      "Invalid References Test",
 		PromptId:  "nonexistent-prompt",
 		DatasetId: "nonexistent-dataset",
@@ -403,14 +447,16 @@ func TestEvalService_CreateEvalRun_InvalidPromptID(t *testing.T) {
 			},
 		},
 	})
-
-	// Note: This might succeed (creating the record) or fail depending on validation
-	if err != nil {
-		st, ok := status.FromError(err)
-		if ok {
-			t.Logf("Invalid references returned %s: %s", st.Code(), st.Message())
-		}
-	} else {
-		t.Log("CreateEvalRun accepted invalid references (validation happens later or not at all)")
+	if err == nil {
+		t.Fatalf("expected CreateEvalRun to reject a nonexistent prompt and dataset, got run %s",
+			resp.GetEvalRun().GetId())
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected a gRPC status error, got: %v", err)
+	}
+	if st.Code() != codes.NotFound && st.Code() != codes.InvalidArgument {
+		t.Errorf("expected NOT_FOUND or INVALID_ARGUMENT for unresolvable references, got %s: %s",
+			st.Code(), st.Message())
 	}
 }

@@ -79,26 +79,37 @@ func ollamaComplete(t *testing.T, ctx context.Context, req gwChatRequest) gwChat
 // OLLAMA PROVIDER TESTS
 // ============================================================================
 
+// TestOllama_Available asserts the gateway advertises the model the rest of
+// this file completes against. Without it every other Ollama test would fail
+// deep inside a completion with a confusing provider error.
 func TestOllama_Available(t *testing.T) {
+	skipIfOllamaUnavailable(t)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	list := listGatewayModels(t, ctx)
 
-	var ollamaFound, hasModel bool
+	var ollamaModels []string
+	hasModel := false
 	for _, m := range list.Data {
-		if m.OwnedBy == ollamaProvider {
-			ollamaFound = true
-			if strings.Contains(m.ID, "gemma3") {
-				hasModel = true
-			}
+		if m.OwnedBy != ollamaProvider {
+			continue
+		}
+		ollamaModels = append(ollamaModels, m.ID)
+		if m.ID == "" {
+			t.Error("ollama model advertised with an empty id")
+		}
+		if strings.Contains(m.ID, "gemma3") {
+			hasModel = true
 		}
 	}
-	if !ollamaFound {
-		t.Skip("Ollama provider not registered on the gateway - skipping")
+	if len(ollamaModels) == 0 {
+		t.Fatal("ollama is registered but advertises no models")
 	}
 	if !hasModel {
-		t.Logf("Warning: gemma3 model not found in Ollama model list")
+		t.Errorf("the %s model these tests require is not advertised; ollama serves %v",
+			ollamaModel, ollamaModels)
 	}
 }
 
@@ -113,17 +124,20 @@ func TestOllama_Complete_SimpleQuestion(t *testing.T) {
 		MaxTokens: 20,
 	})
 
-	t.Logf("Response: %s", resp.content())
-	if resp.Usage != nil {
-		t.Logf("Usage: prompt=%d, completion=%d, total=%d",
-			resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens)
-		if resp.Usage.CostUSD != 0 {
-			t.Logf("Note: Cost reported as %f (expected 0 for local models)", resp.Usage.CostUSD)
-		}
-	}
-
 	if !strings.Contains(resp.content(), "4") {
 		t.Errorf("Expected response to contain '4', got: %s", resp.content())
+	}
+	if resp.Usage == nil {
+		t.Fatal("expected usage accounting on a completion")
+	}
+	if resp.Usage.PromptTokens <= 0 || resp.Usage.CompletionTokens <= 0 {
+		t.Errorf("expected non-zero token counts, got prompt=%d completion=%d",
+			resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	}
+	// A locally hosted model costs nothing; a non-zero cost means the pricing
+	// table is being applied to a provider it does not describe.
+	if resp.Usage.CostUSD != 0 {
+		t.Errorf("expected cost_usd 0 for a local ollama model, got %f", resp.Usage.CostUSD)
 	}
 }
 
@@ -141,9 +155,25 @@ func TestOllama_Complete_SystemPrompt(t *testing.T) {
 		MaxTokens: 50,
 	})
 
-	t.Logf("Response: %s", resp.content())
-	if !strings.Contains(strings.ToLower(resp.content()), "arr") {
-		t.Logf("Warning: Response may not follow pirate system prompt: %s", resp.content())
+	// Whether the model plays along with the persona is not deterministic, so
+	// assert what a system message must always produce: a well-formed assistant
+	// reply with content and token accounting that includes the system message.
+	if len(resp.Choices) == 0 {
+		t.Fatal("expected a choice in the response")
+	}
+	if resp.Choices[0].Message == nil || resp.Choices[0].Message.Role != "assistant" {
+		t.Fatalf("expected an assistant message, got %+v", resp.Choices[0])
+	}
+	if strings.TrimSpace(resp.content()) == "" {
+		t.Error("expected non-empty content when a system prompt is supplied")
+	}
+	if resp.Usage == nil {
+		t.Fatal("expected usage accounting")
+	}
+	// The system message is part of the prompt, so it must be billed for.
+	if resp.Usage.PromptTokens <= 0 {
+		t.Errorf("expected the system message to count toward prompt tokens, got %d",
+			resp.Usage.PromptTokens)
 	}
 }
 
@@ -160,9 +190,10 @@ func TestOllama_Complete_Temperature(t *testing.T) {
 		MaxTokens:   10,
 	})
 
-	t.Logf("Low temperature response: %s", resp.content())
+	// At temperature 0.1 the continuation of "1, 2, 3, " is 4.
 	if !strings.Contains(resp.content(), "4") {
-		t.Logf("Note: Expected '4' in response, got: %s", resp.content())
+		t.Errorf("expected the low-temperature continuation of \"1, 2, 3, \" to contain \"4\", got: %s",
+			resp.content())
 	}
 }
 
@@ -213,14 +244,11 @@ func TestOllama_CompleteStream(t *testing.T) {
 		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
 			fullContent.WriteString(chunk.Choices[0].Delta.Content)
 		}
-		if chunks <= 3 {
-			t.Logf("Chunk %d: %q", chunks, payload)
-		}
 	}
 
-	t.Logf("Received %d chunks", chunks)
-	t.Logf("Full content: %s", fullContent.String())
-
+	if strings.TrimSpace(fullContent.String()) == "" {
+		t.Errorf("expected the streamed deltas to carry content, got %q", fullContent.String())
+	}
 	if chunks == 0 {
 		t.Error("Expected to receive at least one chunk")
 	}
@@ -240,7 +268,6 @@ func TestOllama_Complete_MultiTurn(t *testing.T) {
 		Messages:  []gwChatMessage{{Role: "user", Content: "My name is Alice. What is my name?"}},
 		MaxTokens: 30,
 	})
-	t.Logf("Turn 1 response: %s", resp1.content())
 
 	// Second turn - reference previous context
 	resp2 := ollamaComplete(t, ctx, gwChatRequest{
@@ -251,8 +278,6 @@ func TestOllama_Complete_MultiTurn(t *testing.T) {
 		},
 		MaxTokens: 30,
 	})
-	t.Logf("Turn 2 response: %s", resp2.content())
-
 	if !strings.Contains(strings.ToLower(resp2.content()), "alice") {
 		t.Errorf("Expected response to contain 'Alice', got: %s", resp2.content())
 	}
@@ -269,12 +294,32 @@ func TestOllama_Complete_MaxTokens(t *testing.T) {
 		MaxTokens: 10,
 	})
 
-	t.Logf("Response with max_tokens=10: %s", resp.content())
-	if resp.Usage != nil {
-		t.Logf("Completion tokens used: %d", resp.Usage.CompletionTokens)
-		if resp.Usage.CompletionTokens > 20 {
-			t.Logf("Note: Got %d completion tokens, expected closer to 10", resp.Usage.CompletionTokens)
+	// max_tokens is a hard cap the gateway must pass through to the provider.
+	// A prompt that invites a long answer is the case that exposes it being
+	// dropped. Allow modest slack for tokenizer accounting, not 10x.
+	const requested = 10
+	const tolerated = 2 * requested
+
+	if resp.Usage == nil {
+		t.Fatal("expected usage accounting to verify the max_tokens cap")
+	}
+	if resp.Usage.CompletionTokens > tolerated {
+		t.Errorf("max_tokens=%d was not enforced: the response used %d completion tokens",
+			requested, resp.Usage.CompletionTokens)
+	}
+	if resp.Usage.CompletionTokens <= 0 {
+		t.Errorf("expected a non-zero completion token count, got %d", resp.Usage.CompletionTokens)
+	}
+	if len(resp.Choices) == 0 {
+		t.Fatal("expected a choice in the response")
+	}
+	// Being cut off by the cap is reported as finish_reason "length".
+	if fr := resp.Choices[0].FinishReason; fr == nil || *fr != "length" {
+		got := "<nil>"
+		if fr != nil {
+			got = *fr
 		}
+		t.Errorf("expected finish_reason \"length\" when max_tokens truncates the answer, got %q", got)
 	}
 }
 
@@ -308,8 +353,6 @@ func TestOllama_WithPromptService(t *testing.T) {
 	}
 
 	promptID := createResp.Prompt.Id
-	t.Logf("Created prompt: %s (slug: %s)", promptID, createResp.Prompt.Slug)
-
 	defer func() {
 		promptClient.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptID})
 	}()
@@ -327,10 +370,10 @@ func TestOllama_WithPromptService(t *testing.T) {
 	}
 
 	resp := ollamaComplete(t, ctx, gwChatRequest{Messages: messages, MaxTokens: 20})
-	t.Logf("Translation response: %s", resp.content())
 
+	// The rendered prompt asks for "Hello" in Spanish and nothing else.
 	if !strings.Contains(strings.ToLower(resp.content()), "hola") {
-		t.Logf("Note: Expected 'hola' in response, got: %s", resp.content())
+		t.Errorf("expected the rendered translation prompt to yield \"hola\", got: %s", resp.content())
 	}
 }
 
@@ -356,18 +399,26 @@ Industrialization marked a shift to powered, special-purpose machinery, factorie
 		Temperature: &temp,
 	})
 
-	t.Logf("Summary: %s", resp.content())
-
-	if len(resp.content()) > len(longText) {
-		t.Logf("Note: Summary longer than original text")
+	// Which words a summary picks is not deterministic. That it is a summary -
+	// non-empty, shorter than its input, and billed for the long prompt - is.
+	summary := strings.TrimSpace(resp.content())
+	if summary == "" {
+		t.Fatal("expected a non-empty summary")
 	}
-
-	lowered := strings.ToLower(resp.content())
-	hasKeyword := strings.Contains(lowered, "industrial") ||
-		strings.Contains(lowered, "revolution") ||
-		strings.Contains(lowered, "manufacturing")
-	if !hasKeyword {
-		t.Logf("Note: Summary may not capture key concepts: %s", resp.content())
+	if len(summary) >= len(longText) {
+		t.Errorf("expected the summary (%d chars) to be shorter than the input (%d chars): %s",
+			len(summary), len(longText), summary)
+	}
+	if resp.Usage == nil {
+		t.Fatal("expected usage accounting")
+	}
+	if resp.Usage.CompletionTokens > 100 {
+		t.Errorf("max_tokens=100 was not enforced: the summary used %d completion tokens",
+			resp.Usage.CompletionTokens)
+	}
+	if resp.Usage.PromptTokens <= resp.Usage.CompletionTokens {
+		t.Errorf("summarizing a long passage should cost more prompt than completion tokens, got prompt=%d completion=%d",
+			resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 	}
 }
 
@@ -386,10 +437,10 @@ func TestOllama_CodeGeneration(t *testing.T) {
 		Temperature: &temp,
 	})
 
-	t.Logf("Generated code:\n%s", resp.content())
-
-	if !strings.Contains(resp.content(), "def ") {
-		t.Logf("Note: Response may not contain Python function definition")
+	// "Write a Python function ... just the function" has exactly one shape.
+	code := resp.content()
+	if !strings.Contains(code, "def ") {
+		t.Errorf("expected a Python function definition (\"def \") in the generated code, got:\n%s", code)
 	}
 }
 

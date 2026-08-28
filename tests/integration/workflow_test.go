@@ -8,11 +8,10 @@ package integration
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
-
-	"google.golang.org/protobuf/types/known/structpb"
 
 	datasetsv1 "github.com/instantcocoa/delos/gen/go/datasets/v1"
 	deployv1 "github.com/instantcocoa/delos/gen/go/deploy/v1"
@@ -27,9 +26,51 @@ import (
 // so eval runs exercise that hop server-side.
 
 // ============================================================================
+// SHARED HELPERS
+// ============================================================================
+
+// waitForEvalRun polls until the run reaches a terminal state and returns it.
+// A run that fails, is cancelled, or never finishes fails the test: a workflow
+// test whose evaluation did not run has verified nothing.
+func waitForEvalRun(t *testing.T, ctx context.Context, client evalv1.EvalServiceClient,
+	runID string, timeout time.Duration) *evalv1.EvalRun {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var last *evalv1.EvalRun
+
+	for time.Now().Before(deadline) {
+		resp, err := client.GetEvalRun(ctx, &evalv1.GetEvalRunRequest{Id: runID})
+		if err != nil {
+			t.Fatalf("GetEvalRun(%s) failed while waiting: %v", runID, err)
+		}
+		last = resp.EvalRun
+
+		switch last.Status {
+		case evalv1.EvalRunStatus_EVAL_RUN_STATUS_COMPLETED:
+			return last
+		case evalv1.EvalRunStatus_EVAL_RUN_STATUS_FAILED:
+			t.Fatalf("eval run %s FAILED after %d/%d examples: %s",
+				runID, last.CompletedExamples, last.TotalExamples, last.ErrorMessage)
+		case evalv1.EvalRunStatus_EVAL_RUN_STATUS_CANCELLED:
+			t.Fatalf("eval run %s was CANCELLED unexpectedly", runID)
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	t.Fatalf("eval run %s did not complete within %s (last status %s, %d/%d examples)",
+		runID, timeout, last.GetStatus(), last.GetCompletedExamples(), last.GetTotalExamples())
+	return nil
+}
+
+// ============================================================================
 // PROMPT VERSIONING WORKFLOW TESTS
 // ============================================================================
 
+// TestPromptVersioningWorkflow covers what is unique to the workflow: resolving
+// a prompt through slug:version references and diffing two versions. The shape
+// of the version history itself is asserted in TestPromptService_GetPromptHistory.
 func TestPromptVersioningWorkflow(t *testing.T) {
 	promptClient, cleanup := getPromptClient(t)
 	defer cleanup()
@@ -39,8 +80,7 @@ func TestPromptVersioningWorkflow(t *testing.T) {
 
 	slug := fmt.Sprintf("versioning-workflow-%d", time.Now().UnixNano())
 
-	// Step 1: Create initial prompt (v1)
-	t.Log("Step 1: Creating initial prompt v1")
+	// v1
 	createResp, err := promptClient.CreatePrompt(ctx, &promptv1.CreatePromptRequest{
 		Name:        "Versioning Workflow Test",
 		Slug:        slug,
@@ -67,10 +107,8 @@ func TestPromptVersioningWorkflow(t *testing.T) {
 	if createResp.Prompt.Version != 1 {
 		t.Errorf("Expected version 1, got %d", createResp.Prompt.Version)
 	}
-	t.Logf("Created prompt %s (v%d)", promptID, createResp.Prompt.Version)
 
-	// Step 2: Update prompt to create v2 with different system prompt
-	t.Log("Step 2: Updating to v2 with improved system prompt")
+	// v2: new messages.
 	updateResp, err := promptClient.UpdatePrompt(ctx, &promptv1.UpdatePromptRequest{
 		Id:          promptID,
 		Description: "Improved summarization prompt",
@@ -86,10 +124,8 @@ func TestPromptVersioningWorkflow(t *testing.T) {
 	if updateResp.Prompt.Version != 2 {
 		t.Errorf("Expected version 2, got %d", updateResp.Prompt.Version)
 	}
-	t.Logf("Updated to v%d", updateResp.Prompt.Version)
 
-	// Step 3: Update again for v3
-	t.Log("Step 3: Updating to v3 with temperature adjustment")
+	// v3: config only. A partial update must not drop the messages set in v2.
 	updateResp2, err := promptClient.UpdatePrompt(ctx, &promptv1.UpdatePromptRequest{
 		Id: promptID,
 		DefaultConfig: &promptv1.GenerationConfig{
@@ -104,12 +140,11 @@ func TestPromptVersioningWorkflow(t *testing.T) {
 	if updateResp2.Prompt.Version != 3 {
 		t.Errorf("Expected version 3, got %d", updateResp2.Prompt.Version)
 	}
-	t.Logf("Updated to v%d", updateResp2.Prompt.Version)
+	if got := len(updateResp2.Prompt.Messages); got != 2 {
+		t.Errorf("a config-only update dropped the messages: v3 has %d, want 2", got)
+	}
 
-	// Step 4: Get specific versions using slug:version reference
-	t.Log("Step 4: Testing slug:version references")
-
-	// Get v1
+	// slug:version references must resolve to the exact version named.
 	v1Resp, err := promptClient.GetPrompt(ctx, &promptv1.GetPromptRequest{
 		Reference: fmt.Sprintf("%s:v1", slug),
 	})
@@ -119,9 +154,25 @@ func TestPromptVersioningWorkflow(t *testing.T) {
 	if v1Resp.Prompt.Version != 1 {
 		t.Errorf("Expected version 1, got %d", v1Resp.Prompt.Version)
 	}
-	t.Logf("Retrieved %s:v1 - version %d", slug, v1Resp.Prompt.Version)
+	if v1Resp.Prompt.Id != promptID {
+		t.Errorf("%s:v1 resolved to prompt %s, want %s", slug, v1Resp.Prompt.Id, promptID)
+	}
+	if len(v1Resp.Prompt.Messages) > 0 &&
+		!strings.Contains(v1Resp.Prompt.Messages[0].Content, "You are a helpful assistant.") {
+		t.Errorf("%s:v1 returned v1's version number but not v1's content: %q",
+			slug, v1Resp.Prompt.Messages[0].Content)
+	}
 
-	// Get latest
+	v2Resp, err := promptClient.GetPrompt(ctx, &promptv1.GetPromptRequest{
+		Reference: fmt.Sprintf("%s:v2", slug),
+	})
+	if err != nil {
+		t.Fatalf("GetPrompt v2 by reference failed: %v", err)
+	}
+	if v2Resp.Prompt.Version != 2 {
+		t.Errorf("Expected version 2, got %d", v2Resp.Prompt.Version)
+	}
+
 	latestResp, err := promptClient.GetPrompt(ctx, &promptv1.GetPromptRequest{
 		Reference: fmt.Sprintf("%s:latest", slug),
 	})
@@ -131,23 +182,15 @@ func TestPromptVersioningWorkflow(t *testing.T) {
 	if latestResp.Prompt.Version != 3 {
 		t.Errorf("Expected latest version 3, got %d", latestResp.Prompt.Version)
 	}
-	t.Logf("Retrieved %s:latest - version %d", slug, latestResp.Prompt.Version)
 
-	// Step 5: Get version history
-	t.Log("Step 5: Getting version history")
-	historyResp, err := promptClient.GetPromptHistory(ctx, &promptv1.GetPromptHistoryRequest{
-		Id: promptID,
-	})
-	if err != nil {
-		t.Fatalf("GetPromptHistory failed: %v", err)
-	}
-	t.Logf("Found %d versions in history", len(historyResp.Versions))
-	for _, v := range historyResp.Versions {
-		t.Logf("  Version %d: %s", v.Version, v.ChangeDescription)
+	// An unknown version is an error, not a silent fallback to latest.
+	if bad, err := promptClient.GetPrompt(ctx, &promptv1.GetPromptRequest{
+		Reference: fmt.Sprintf("%s:v99", slug),
+	}); err == nil {
+		t.Errorf("expected an error for %s:v99, got version %d", slug, bad.GetPrompt().GetVersion())
 	}
 
-	// Step 6: Compare versions
-	t.Log("Step 6: Comparing v1 and v2")
+	// Comparing v1 and v2 must report the messages that changed.
 	compareResp, err := promptClient.CompareVersions(ctx, &promptv1.CompareVersionsRequest{
 		PromptId: promptID,
 		VersionA: 1,
@@ -156,14 +199,11 @@ func TestPromptVersioningWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompareVersions failed: %v", err)
 	}
-	t.Logf("Semantic similarity: %.2f", compareResp.SemanticSimilarity)
-	t.Logf("Diffs found: %d", len(compareResp.Diffs))
-	for _, diff := range compareResp.Diffs {
-		t.Logf("  %s: %s", diff.Field, diff.DiffType)
-	}
-
 	if compareResp.SemanticSimilarity < 0 || compareResp.SemanticSimilarity > 1 {
 		t.Errorf("Semantic similarity should be 0-1, got %f", compareResp.SemanticSimilarity)
+	}
+	if len(compareResp.Diffs) == 0 {
+		t.Error("expected CompareVersions to report the messages that changed between v1 and v2")
 	}
 }
 
@@ -180,7 +220,6 @@ func TestPromptWithOllamaCompletion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// Create a prompt with variables
 	slug := fmt.Sprintf("ollama-prompt-%d", time.Now().UnixNano())
 	createResp, err := promptClient.CreatePrompt(ctx, &promptv1.CreatePromptRequest{
 		Name:        "Ollama Integration Test",
@@ -204,27 +243,27 @@ func TestPromptWithOllamaCompletion(t *testing.T) {
 	}
 	promptID := createResp.Prompt.Id
 	defer promptClient.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptID})
-	t.Logf("Created prompt: %s", promptID)
 
-	// Get the prompt to retrieve its messages
+	// Read the prompt back and render it, the way the eval runner does.
 	getResp, err := promptClient.GetPrompt(ctx, &promptv1.GetPromptRequest{Id: promptID})
 	if err != nil {
 		t.Fatalf("GetPrompt failed: %v", err)
 	}
+	if getResp.Prompt.DefaultConfig == nil {
+		t.Fatal("expected the stored prompt to carry its default generation config")
+	}
 
-	// Render the prompt messages manually (in real app, prompt service would do this)
 	renderedMessages := make([]gwChatMessage, len(getResp.Prompt.Messages))
 	for i, msg := range getResp.Prompt.Messages {
 		content := msg.Content
 		content = strings.ReplaceAll(content, "{{role}}", "math tutor")
 		content = strings.ReplaceAll(content, "{{question}}", "What is 15 * 7?")
-		renderedMessages[i] = gwChatMessage{
-			Role:    msg.Role,
-			Content: content,
+		if strings.Contains(content, "{{") {
+			t.Errorf("message %d still has an unrendered variable: %q", i, content)
 		}
+		renderedMessages[i] = gwChatMessage{Role: msg.Role, Content: content}
 	}
 
-	// Call Ollama through the gateway with the rendered prompt
 	temperature := getResp.Prompt.DefaultConfig.Temperature
 	completeResp := ollamaComplete(t, ctx, gwChatRequest{
 		Messages:    renderedMessages,
@@ -232,11 +271,10 @@ func TestPromptWithOllamaCompletion(t *testing.T) {
 		MaxTokens:   int(getResp.Prompt.DefaultConfig.MaxTokens),
 	})
 
-	t.Logf("Response: %s", completeResp.content())
-
-	// Verify the response contains the answer
+	// The rendered prompt asks a math tutor for 15 * 7. The answer is 105.
 	if !strings.Contains(completeResp.content(), "105") {
-		t.Logf("Note: Expected '105' in response, got: %s", completeResp.content())
+		t.Errorf("expected the rendered prompt to yield 105 for 15 * 7, got: %s",
+			completeResp.content())
 	}
 }
 
@@ -259,8 +297,6 @@ func TestEvalWithOllama(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	// Step 1: Create a math prompt
-	t.Log("Step 1: Creating math prompt")
 	slug := fmt.Sprintf("eval-ollama-%d", time.Now().UnixNano())
 	promptResp, err := promptClient.CreatePrompt(ctx, &promptv1.CreatePromptRequest{
 		Name:        "Math Evaluator",
@@ -283,10 +319,7 @@ func TestEvalWithOllama(t *testing.T) {
 	}
 	promptID := promptResp.Prompt.Id
 	defer promptClient.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptID})
-	t.Logf("Created prompt: %s", promptID)
 
-	// Step 2: Create a dataset with test cases
-	t.Log("Step 2: Creating dataset with math test cases")
 	datasetResp, err := datasetsClient.CreateDataset(ctx, &datasetsv1.CreateDatasetRequest{
 		Name:        "Math Test Dataset",
 		Description: "Simple math questions for evaluation",
@@ -298,9 +331,7 @@ func TestEvalWithOllama(t *testing.T) {
 	}
 	datasetID := datasetResp.Dataset.Id
 	defer datasetsClient.DeleteDataset(ctx, &datasetsv1.DeleteDatasetRequest{Id: datasetID})
-	t.Logf("Created dataset: %s", datasetID)
 
-	// Add test examples
 	examples := []*datasetsv1.ExampleInput{
 		{
 			Input:          toStruct(t, map[string]interface{}{"question": "What is 2 + 2?"}),
@@ -323,67 +354,44 @@ func TestEvalWithOllama(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddExamples failed: %v", err)
 	}
-	t.Logf("Added %d examples to dataset", addResp.AddedCount)
+	if addResp.AddedCount != int32(len(examples)) {
+		t.Fatalf("AddExamples stored %d of %d examples", addResp.AddedCount, len(examples))
+	}
 
-	// Step 3: Create an eval run
-	t.Log("Step 3: Creating eval run with contains evaluator")
 	evalRunResp, err := evalClient.CreateEvalRun(ctx, &evalv1.CreateEvalRunRequest{
 		Name:          "Math Eval with Ollama",
 		PromptId:      promptID,
 		PromptVersion: 1,
 		DatasetId:     datasetID,
 		Config: &evalv1.EvalConfig{
-			Provider: "ollama",
-			Model:    "gemma3:4b",
+			Provider: ollamaProvider,
+			Model:    ollamaModel,
 			Evaluators: []*evalv1.EvaluatorConfig{
 				{
 					Type:   "contains",
 					Weight: 1.0,
-					Params: map[string]string{
-						"case_sensitive": "false",
-					},
+					Params: map[string]string{"case_sensitive": "false"},
 				},
 			},
 		},
-		Metadata: map[string]string{
-			"test_type": "integration",
-		},
+		Metadata: map[string]string{"test_type": "integration"},
 	})
 	if err != nil {
 		t.Fatalf("CreateEvalRun failed: %v", err)
 	}
 	evalRunID := evalRunResp.EvalRun.Id
-	t.Logf("Created eval run: %s (status: %s)", evalRunID, evalRunResp.EvalRun.Status)
 
-	// Step 4: Wait for eval to complete (poll status)
-	t.Log("Step 4: Waiting for eval to complete...")
-	maxWait := 120 * time.Second
-	pollInterval := 2 * time.Second
-	deadline := time.Now().Add(maxWait)
+	// The run must actually finish. A timeout or a FAILED run fails the test.
+	run := waitForEvalRun(t, ctx, evalClient, evalRunID, 120*time.Second)
 
-	var finalStatus string
-	for time.Now().Before(deadline) {
-		statusResp, err := evalClient.GetEvalRun(ctx, &evalv1.GetEvalRunRequest{Id: evalRunID})
-		if err != nil {
-			t.Fatalf("GetEvalRun failed: %v", err)
-		}
-
-		finalStatus = statusResp.EvalRun.Status.String()
-		t.Logf("  Status: %s, Progress: %d/%d",
-			finalStatus,
-			statusResp.EvalRun.CompletedExamples,
-			statusResp.EvalRun.TotalExamples)
-
-		if statusResp.EvalRun.Status == evalv1.EvalRunStatus_EVAL_RUN_STATUS_COMPLETED ||
-			statusResp.EvalRun.Status == evalv1.EvalRunStatus_EVAL_RUN_STATUS_FAILED {
-			break
-		}
-
-		time.Sleep(pollInterval)
+	if run.TotalExamples != int32(len(examples)) {
+		t.Errorf("run covers %d examples, dataset has %d", run.TotalExamples, len(examples))
+	}
+	if run.CompletedExamples != run.TotalExamples {
+		t.Errorf("a COMPLETED run left %d of %d examples unfinished",
+			run.TotalExamples-run.CompletedExamples, run.TotalExamples)
 	}
 
-	// Step 5: Get eval results
-	t.Log("Step 5: Getting eval results")
 	resultsResp, err := evalClient.GetEvalResults(ctx, &evalv1.GetEvalResultsRequest{
 		EvalRunId: evalRunID,
 		Limit:     10,
@@ -391,39 +399,54 @@ func TestEvalWithOllama(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetEvalResults failed: %v", err)
 	}
+	if len(resultsResp.Results) != len(examples) {
+		t.Fatalf("expected one result per example (%d), got %d", len(examples), len(resultsResp.Results))
+	}
 
-	t.Logf("Got %d results:", len(resultsResp.Results))
 	passCount := 0
 	for i, result := range resultsResp.Results {
-		t.Logf("  Result %d: score=%.2f, passed=%v", i+1, result.OverallScore, result.Passed)
+		if result.OverallScore < 0 || result.OverallScore > 1 {
+			t.Errorf("result %d: overall score %.2f is outside [0, 1]", i, result.OverallScore)
+		}
 		if result.Passed {
 			passCount++
 		}
 	}
 
-	// Step 6: Get eval summary
-	t.Log("Step 6: Getting eval run summary")
-	finalResp, err := evalClient.GetEvalRun(ctx, &evalv1.GetEvalRunRequest{Id: evalRunID})
-	if err != nil {
-		t.Fatalf("GetEvalRun final failed: %v", err)
+	// The summary is a rollup of the results above, so it must agree with them.
+	summary := run.Summary
+	if summary == nil {
+		t.Fatal("expected a COMPLETED run to carry a summary")
 	}
-
-	if finalResp.EvalRun.Summary != nil {
-		t.Logf("Summary:")
-		t.Logf("  Overall Score: %.2f", finalResp.EvalRun.Summary.OverallScore)
-		t.Logf("  Pass Rate: %.2f%%", finalResp.EvalRun.Summary.PassRate*100)
-		t.Logf("  Avg Latency: %.0fms", finalResp.EvalRun.Summary.AvgLatencyMs)
+	wantPassRate := float64(passCount) / float64(len(resultsResp.Results))
+	if diff := summary.PassRate - wantPassRate; diff > 0.01 || diff < -0.01 {
+		t.Errorf("summary pass rate %.2f disagrees with the results (%d/%d = %.2f)",
+			summary.PassRate, passCount, len(resultsResp.Results), wantPassRate)
 	}
-
-	t.Logf("Passed: %d/%d examples", passCount, len(resultsResp.Results))
+	if summary.OverallScore < 0 || summary.OverallScore > 1 {
+		t.Errorf("summary overall score %.2f is outside [0, 1]", summary.OverallScore)
+	}
+	if summary.AvgLatencyMs <= 0 {
+		t.Errorf("expected the summary to record latency for real LLM calls, got %.0fms",
+			summary.AvgLatencyMs)
+	}
 }
 
 // ============================================================================
 // TRACING VERIFICATION TESTS
 // ============================================================================
 
+// TestOllamaCallsAreTraced asserts a gateway completion shows up in the observe
+// backend. It needs the gateway to be exporting OTLP at the control plane; when
+// it is not, the test skips visibly rather than passing on an empty result.
 func TestOllamaCallsAreTraced(t *testing.T) {
 	skipIfOllamaUnavailable(t)
+
+	if os.Getenv("DELOS_OTLP_ENDPOINT") == "" {
+		t.Skip("DELOS_OTLP_ENDPOINT is unset, so the gateway under test exports no " +
+			"spans - start it with DELOS_OTLP_ENDPOINT pointed at the control plane " +
+			"to exercise tracing")
+	}
 
 	observeClient, observeCleanup := getObserveClient(t)
 	defer observeCleanup()
@@ -431,60 +454,53 @@ func TestOllamaCallsAreTraced(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// Generate a unique identifier for this test
 	testID := fmt.Sprintf("trace-test-%d", time.Now().UnixNano())
 
-	// Step 1: Make an Ollama completion with unique content
-	t.Log("Step 1: Making Ollama completion request")
 	completeResp := ollamaComplete(t, ctx, gwChatRequest{
 		Messages:  []gwChatMessage{{Role: "user", Content: fmt.Sprintf("Test ID: %s. What is 1+1?", testID)}},
 		MaxTokens: 10,
 	})
-	t.Logf("Got response: %s", completeResp.content())
-
-	// Step 2: Wait a moment for traces to be ingested
-	t.Log("Step 2: Waiting for traces to be ingested...")
-	time.Sleep(2 * time.Second)
-
-	// Step 3: Query for recent traces from the runtime service
-	t.Log("Step 3: Querying for runtime service traces")
-	queryResp, err := observeClient.QueryTraces(ctx, &observev1.QueryTracesRequest{
-		ServiceName: "delos-gateway",
-		Limit:       20,
-	})
-	if err != nil {
-		t.Fatalf("QueryTraces failed: %v", err)
+	if strings.TrimSpace(completeResp.content()) == "" {
+		t.Fatal("expected a completion to trace")
 	}
 
-	t.Logf("Found %d traces from the gateway", len(queryResp.Traces))
+	// Spans are batched, so poll rather than sleeping once.
+	var traces []*observev1.Trace
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		queryResp, err := observeClient.QueryTraces(ctx, &observev1.QueryTracesRequest{
+			ServiceName: "delos-gateway",
+			Limit:       50,
+		})
+		if err != nil {
+			t.Fatalf("QueryTraces failed: %v", err)
+		}
+		traces = queryResp.Traces
+		if len(traces) > 0 {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
 
-	// Check if we can find traces with LLM-related operations
-	foundLLMTrace := false
-	for _, trace := range queryResp.Traces {
+	if len(traces) == 0 {
+		t.Fatal("the gateway is exporting OTLP but observe holds no delos-gateway traces " +
+			"after a completion")
+	}
+
+	var llmSpans int
+	for _, trace := range traces {
 		for _, span := range trace.Spans {
-			if strings.Contains(span.Name, "Complete") ||
-				strings.Contains(span.Name, "ollama") ||
-				strings.Contains(span.Name, "LLM") {
-				foundLLMTrace = true
-				t.Logf("Found LLM trace: %s (span: %s)", trace.TraceId, span.Name)
+			if span.GenAiSystem != "" || span.RequestModel != "" ||
+				strings.Contains(strings.ToLower(span.Name), "chat") ||
+				strings.Contains(strings.ToLower(span.Name), "complet") {
+				llmSpans++
 			}
 		}
 	}
-
-	if !foundLLMTrace {
-		t.Log("Note: No explicit LLM traces found - tracing may not be fully implemented")
+	if llmSpans == 0 {
+		t.Errorf("found %d gateway traces but none carries an LLM span (gen_ai attributes "+
+			"or a chat/completion operation name)", len(traces))
 	}
-
-	// Step 4: Query by operation name
-	t.Log("Step 4: Querying traces by operation")
-	queryResp2, err := observeClient.QueryTraces(ctx, &observev1.QueryTracesRequest{
-		OperationName: "Complete",
-		Limit:         10,
-	})
-	if err != nil {
-		t.Fatalf("QueryTraces by operation failed: %v", err)
-	}
-	t.Logf("Found %d traces for 'Complete' operation", len(queryResp2.Traces))
 }
 
 // ============================================================================
@@ -494,7 +510,6 @@ func TestOllamaCallsAreTraced(t *testing.T) {
 func TestEndToEndWorkflow(t *testing.T) {
 	skipIfOllamaUnavailable(t)
 
-	// Get all clients
 	promptClient, promptCleanup := getPromptClient(t)
 	defer promptCleanup()
 
@@ -512,11 +527,7 @@ func TestEndToEndWorkflow(t *testing.T) {
 
 	timestamp := time.Now().UnixNano()
 
-	// ========================================
-	// PHASE 1: Create Prompt (v1)
-	// ========================================
-	t.Log("=== PHASE 1: Creating Prompt v1 ===")
-
+	// ---- Prompt v1 ----
 	slug := fmt.Sprintf("e2e-workflow-%d", timestamp)
 	promptResp, err := promptClient.CreatePrompt(ctx, &promptv1.CreatePromptRequest{
 		Name:        "E2E Workflow Prompt",
@@ -540,13 +551,8 @@ func TestEndToEndWorkflow(t *testing.T) {
 	}
 	promptID := promptResp.Prompt.Id
 	defer promptClient.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: promptID})
-	t.Logf("Created prompt: %s (v%d)", promptID, promptResp.Prompt.Version)
 
-	// ========================================
-	// PHASE 2: Create Dataset with Test Cases
-	// ========================================
-	t.Log("=== PHASE 2: Creating Dataset ===")
-
+	// ---- Dataset ----
 	datasetResp, err := datasetsClient.CreateDataset(ctx, &datasetsv1.CreateDatasetRequest{
 		Name:        "E2E Test Dataset",
 		Description: "Test cases for e2e workflow",
@@ -558,10 +564,8 @@ func TestEndToEndWorkflow(t *testing.T) {
 	}
 	datasetID := datasetResp.Dataset.Id
 	defer datasetsClient.DeleteDataset(ctx, &datasetsv1.DeleteDatasetRequest{Id: datasetID})
-	t.Logf("Created dataset: %s", datasetID)
 
-	// Add test examples
-	_, err = datasetsClient.AddExamples(ctx, &datasetsv1.AddExamplesRequest{
+	if _, err := datasetsClient.AddExamples(ctx, &datasetsv1.AddExamplesRequest{
 		DatasetId: datasetID,
 		Examples: []*datasetsv1.ExampleInput{
 			{
@@ -573,25 +577,19 @@ func TestEndToEndWorkflow(t *testing.T) {
 				ExpectedOutput: toStruct(t, map[string]interface{}{"answer": "4"}),
 			},
 		},
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("AddExamples failed: %v", err)
 	}
-	t.Log("Added 2 test examples")
 
-	// ========================================
-	// PHASE 3: Run Evaluation with Ollama
-	// ========================================
-	t.Log("=== PHASE 3: Running Evaluation ===")
-
+	// ---- Evaluate v1 ----
 	evalRunResp, err := evalClient.CreateEvalRun(ctx, &evalv1.CreateEvalRunRequest{
 		Name:          "E2E Eval Run",
 		PromptId:      promptID,
 		PromptVersion: 1,
 		DatasetId:     datasetID,
 		Config: &evalv1.EvalConfig{
-			Provider: "ollama",
-			Model:    "gemma3:4b",
+			Provider: ollamaProvider,
+			Model:    ollamaModel,
 			Evaluators: []*evalv1.EvaluatorConfig{
 				{Type: "contains", Weight: 1.0},
 			},
@@ -601,64 +599,39 @@ func TestEndToEndWorkflow(t *testing.T) {
 		t.Fatalf("CreateEvalRun failed: %v", err)
 	}
 	evalRunID := evalRunResp.EvalRun.Id
-	t.Logf("Created eval run: %s", evalRunID)
 
-	// Wait for eval to complete
-	t.Log("Waiting for evaluation to complete...")
-	maxWait := 120 * time.Second
-	deadline := time.Now().Add(maxWait)
-	var evalScore float64
-	evalCompleted := false
-
-	for time.Now().Before(deadline) {
-		statusResp, err := evalClient.GetEvalRun(ctx, &evalv1.GetEvalRunRequest{Id: evalRunID})
-		if err != nil {
-			t.Fatalf("GetEvalRun failed: %v", err)
-		}
-
-		if statusResp.EvalRun.Status == evalv1.EvalRunStatus_EVAL_RUN_STATUS_COMPLETED {
-			if statusResp.EvalRun.Summary != nil {
-				evalScore = float64(statusResp.EvalRun.Summary.OverallScore)
-			}
-			evalCompleted = true
-			t.Logf("Eval completed: score=%.2f", evalScore)
-			break
-		}
-		if statusResp.EvalRun.Status == evalv1.EvalRunStatus_EVAL_RUN_STATUS_FAILED {
-			t.Logf("Eval failed: %s", statusResp.EvalRun.ErrorMessage)
-			break
-		}
-
-		time.Sleep(2 * time.Second)
+	// The gate assertions below are only meaningful if the run finished, so a
+	// timed-out or failed run fails the test here.
+	run := waitForEvalRun(t, ctx, evalClient, evalRunID, 120*time.Second)
+	if run.Summary == nil {
+		t.Fatal("expected a COMPLETED run to carry a summary the gate can read")
 	}
 
-	// ========================================
-	// PHASE 4: Quality Gate the run should pass
-	// ========================================
-	t.Log("=== PHASE 4: Creating a Quality Gate the run passes ===")
+	// ---- Gates ----
+	//
+	// Both gates have fixed outcomes that hold for any score the model produces,
+	// so the test asserts the gate engine rather than re-deriving the verdict
+	// from the score the server just reported.
+	//
+	//   permissive: overall_score >= 0  -> every completed run clears it
+	//   strict:     overall_score >= 0.99 AND avg_latency_ms <= 0.001
+	//               -> no real LLM run clears it
 
 	passGateName := fmt.Sprintf("e2e-gate-pass-%d", timestamp)
-	passGateResp, err := deployClient.CreateQualityGate(ctx, &deployv1.CreateQualityGateRequest{
+	if _, err := deployClient.CreateQualityGate(ctx, &deployv1.CreateQualityGateRequest{
 		Name:        passGateName,
-		Description: "Permissive gate: the eval run above should clear it",
+		Description: "Permissive gate: any completed eval run clears it",
 		PromptId:    promptID,
 		Conditions: []*deployv1.GateCondition{
 			{
 				Metric:    "overall_score",
 				Operator:  deployv1.GateOperator_GATE_OPERATOR_GTE,
-				Threshold: 0.1,
+				Threshold: 0,
 			},
 		},
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("CreateQualityGate (permissive) failed: %v", err)
 	}
-	t.Logf("Created quality gate: %s (%s)", passGateResp.QualityGate.Name, passGateResp.QualityGate.Id)
-
-	// ========================================
-	// PHASE 5: Gate verdicts (what CI acts on)
-	// ========================================
-	t.Log("=== PHASE 5: Reading Gate Verdicts ===")
 
 	passVerdict, err := deployClient.GetGateVerdict(ctx, &deployv1.GetGateVerdictRequest{
 		Name: passGateName,
@@ -666,29 +639,18 @@ func TestEndToEndWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetGateVerdict (permissive) failed: %v", err)
 	}
-	t.Logf("Permissive gate verdict: pass=%v run=%s reasons=%v",
-		passVerdict.Pass, passVerdict.EvalRunId, passVerdict.Reasons)
+	if !passVerdict.Pass {
+		t.Errorf("gate overall_score>=0 must pass for a completed run scoring %.2f, got reasons: %v",
+			run.Summary.OverallScore, passVerdict.Reasons)
+	}
 	if len(passVerdict.Reasons) == 0 {
 		t.Error("expected the verdict to explain itself")
 	}
-	if evalCompleted {
-		// The verdict must agree with the score the run actually produced.
-		want := evalScore >= 0.1
-		if passVerdict.Pass != want {
-			t.Errorf("gate overall_score>=0.1 returned pass=%v for a run scoring %.2f: %v",
-				passVerdict.Pass, evalScore, passVerdict.Reasons)
-		}
-		if !want {
-			t.Logf("note: the model scored %.2f, below the permissive threshold", evalScore)
-		}
-		if passVerdict.EvalRunId == "" {
-			t.Error("expected the verdict to name the eval run it was computed from")
-		}
-	} else {
-		t.Logf("eval run did not complete; verdict reported pass=%v", passVerdict.Pass)
+	if passVerdict.EvalRunId != evalRunID {
+		t.Errorf("verdict was computed from run %q, want the run just completed (%s)",
+			passVerdict.EvalRunId, evalRunID)
 	}
 
-	// A gate no real run clears: same prompt, impossible threshold.
 	strictGateName := fmt.Sprintf("e2e-gate-strict-%d", timestamp)
 	if _, err := deployClient.CreateQualityGate(ctx, &deployv1.CreateQualityGateRequest{
 		Name:        strictGateName,
@@ -716,19 +678,20 @@ func TestEndToEndWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetGateVerdict (strict) failed: %v", err)
 	}
-	t.Logf("Strict gate verdict: pass=%v reasons=%v", strictVerdict.Pass, strictVerdict.Reasons)
 	if strictVerdict.Pass {
-		t.Errorf("expected the strict gate to fail, reasons: %v", strictVerdict.Reasons)
+		t.Errorf("expected the strict gate to fail an LLM run that took %.0fms, reasons: %v",
+			run.Summary.AvgLatencyMs, strictVerdict.Reasons)
 	}
 	if len(strictVerdict.Reasons) == 0 {
 		t.Error("expected the failing verdict to explain which condition failed")
 	}
+	// The latency condition is unsatisfiable for a real call, so it must be the
+	// one named in the failure.
+	if !strings.Contains(strings.ToLower(strings.Join(strictVerdict.Reasons, " ")), "latency") {
+		t.Errorf("expected the failing verdict to name avg_latency_ms, got %v", strictVerdict.Reasons)
+	}
 
-	// ========================================
-	// PHASE 6: Update Prompt to v2
-	// ========================================
-	t.Log("=== PHASE 6: Creating Prompt v2 ===")
-
+	// ---- Prompt v2, evaluate, compare ----
 	updateResp, err := promptClient.UpdatePrompt(ctx, &promptv1.UpdatePromptRequest{
 		Id: promptID,
 		Messages: []*promptv1.PromptMessage{
@@ -740,12 +703,9 @@ func TestEndToEndWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdatePrompt to v2 failed: %v", err)
 	}
-	t.Logf("Updated to v%d", updateResp.Prompt.Version)
-
-	// ========================================
-	// PHASE 7: Run Eval on v2 and Compare
-	// ========================================
-	t.Log("=== PHASE 7: Evaluating v2 and Comparing ===")
+	if updateResp.Prompt.Version != 2 {
+		t.Fatalf("expected version 2 after update, got %d", updateResp.Prompt.Version)
+	}
 
 	evalRun2Resp, err := evalClient.CreateEvalRun(ctx, &evalv1.CreateEvalRunRequest{
 		Name:          "E2E Eval Run v2",
@@ -753,8 +713,8 @@ func TestEndToEndWorkflow(t *testing.T) {
 		PromptVersion: 2,
 		DatasetId:     datasetID,
 		Config: &evalv1.EvalConfig{
-			Provider: "ollama",
-			Model:    "gemma3:4b",
+			Provider: ollamaProvider,
+			Model:    ollamaModel,
 			Evaluators: []*evalv1.EvaluatorConfig{
 				{Type: "contains", Weight: 1.0},
 			},
@@ -764,59 +724,35 @@ func TestEndToEndWorkflow(t *testing.T) {
 		t.Fatalf("CreateEvalRun v2 failed: %v", err)
 	}
 	evalRun2ID := evalRun2Resp.EvalRun.Id
-	t.Logf("Created eval run for v2: %s", evalRun2ID)
 
-	// Wait for v2 eval
-	deadline = time.Now().Add(maxWait)
-	for time.Now().Before(deadline) {
-		statusResp, err := evalClient.GetEvalRun(ctx, &evalv1.GetEvalRunRequest{Id: evalRun2ID})
-		if err != nil {
-			t.Fatalf("GetEvalRun v2 failed: %v", err)
-		}
-
-		if statusResp.EvalRun.Status == evalv1.EvalRunStatus_EVAL_RUN_STATUS_COMPLETED ||
-			statusResp.EvalRun.Status == evalv1.EvalRunStatus_EVAL_RUN_STATUS_FAILED {
-			break
-		}
-		time.Sleep(2 * time.Second)
+	run2 := waitForEvalRun(t, ctx, evalClient, evalRun2ID, 120*time.Second)
+	if run2.Summary == nil {
+		t.Fatal("expected the v2 run to carry a summary")
 	}
 
-	// Compare the two runs
 	compareResp, err := evalClient.CompareRuns(ctx, &evalv1.CompareRunsRequest{
 		RunIdA: evalRunID,
 		RunIdB: evalRun2ID,
 	})
 	if err != nil {
-		t.Logf("CompareRuns failed: %v", err)
-	} else {
-		t.Logf("Comparison: score_diff=%.2f, regressions=%d, improvements=%d",
-			compareResp.ScoreDiff, compareResp.Regressions, compareResp.Improvements)
+		t.Fatalf("CompareRuns failed for two completed runs: %v", err)
+	}
+	// The reported difference must be the difference between the two summaries.
+	wantDiff := run2.Summary.OverallScore - run.Summary.OverallScore
+	if diff := compareResp.ScoreDiff - wantDiff; diff > 0.01 || diff < -0.01 {
+		t.Errorf("CompareRuns reported score_diff=%.3f, but the runs scored %.3f and %.3f (diff %.3f)",
+			compareResp.ScoreDiff, run.Summary.OverallScore, run2.Summary.OverallScore, wantDiff)
 	}
 
-	// ========================================
-	// Summary
-	// ========================================
-	t.Log("=== END-TO-END WORKFLOW COMPLETE ===")
-	t.Logf("Prompt: %s (v1 -> v2)", promptID)
-	t.Logf("Dataset: %s (2 examples)", datasetID)
-	t.Logf("Eval Runs: %s (v1), %s (v2)", evalRunID, evalRun2ID)
-	t.Logf("Gates: %s (pass=%v), %s (pass=%v)", passGateName, passVerdict.Pass, strictGateName, strictVerdict.Pass)
-}
-
-// ============================================================================
-// NOTE: Import/Export Dataset Tests
-// ============================================================================
-// Import/Export functionality is implemented. See datasets_test.go for tests.
-// Supports JSON, JSONL, and CSV formats with column mappings.
-
-// ============================================================================
-// HELPER: Create struct from map
-// ============================================================================
-
-func mustStruct(m map[string]interface{}) *structpb.Struct {
-	s, err := structpb.NewStruct(m)
+	// The newest completed run is what a gate on this prompt now reads.
+	latestVerdict, err := deployClient.GetGateVerdict(ctx, &deployv1.GetGateVerdictRequest{
+		Name: passGateName,
+	})
 	if err != nil {
-		panic(err)
+		t.Fatalf("GetGateVerdict after the v2 run failed: %v", err)
 	}
-	return s
+	if latestVerdict.EvalRunId != evalRun2ID {
+		t.Errorf("gate verdict still points at run %q; after a newer completed run it should read %s",
+			latestVerdict.EvalRunId, evalRun2ID)
+	}
 }

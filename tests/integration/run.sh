@@ -12,7 +12,13 @@
 # Environment:
 #   DELOS_CONTROL_PLANE_ADDR   Control plane gRPC address (default localhost:8081)
 #   DELOS_GATEWAY_URL          Gateway base URL (default http://localhost:8080)
+#   DELOS_AUTH_TOKEN           Bearer token, when the stack requires one
+#   DELOS_CLI_BINARY           Prebuilt delos binary for the CLI tests
+#                              (default: ../../bin/delos, else built on demand)
 #   OPENAI_API_KEY             Required for cloud LLM completion tests
+#
+# Tests that need a provider (gateway completions, embeddings, Ollama) SKIP with
+# a visible reason when none is configured; they never pass silently.
 
 set -e
 
