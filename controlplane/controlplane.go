@@ -170,7 +170,13 @@ func Run() error {
 
 	evalStore := eval.NewMemoryStore()
 	evalService := eval.NewEvalService(evalStore)
-	evalHandler := eval.NewHandler(logger, evalService)
+	// Reference validation: an eval run naming a prompt or dataset that does not
+	// exist is rejected at creation instead of being queued and failed minutes
+	// later by the runner.
+	evalHandler := eval.NewHandler(logger, evalService, eval.WithReferenceValidation(
+		promptSource{h: promptHandler},
+		exampleSource{h: datasetsHandler},
+	))
 
 	deployStore := deploy.NewMemoryStore()
 	deployService := deploy.NewDeployService(deployStore, evalResults{store: evalStore})

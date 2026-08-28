@@ -3,11 +3,16 @@ package datasets
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// ErrDatasetNotFound is returned when an operation names a dataset that does
+// not exist. Handlers map it to gRPC NOT_FOUND.
+var ErrDatasetNotFound = errors.New("dataset not found")
 
 // DatasetsService handles dataset business logic.
 type DatasetsService struct {
@@ -54,20 +59,34 @@ func (s *DatasetsService) GetDataset(ctx context.Context, id string) (*Dataset, 
 	return dataset, nil
 }
 
-// UpdateDataset updates a dataset.
+// UpdateDataset applies a partial update to a dataset.
+//
+// The request carries plain proto3 scalars, which cannot distinguish "set this
+// to empty" from "leave it alone", so an omitted (zero-valued) field leaves the
+// stored value untouched. Sending only a description must not wipe the name.
+// Clearing a field is therefore not expressible today; that needs an explicit
+// field mask or wrapper types in the proto.
 func (s *DatasetsService) UpdateDataset(ctx context.Context, input UpdateDatasetInput) (*Dataset, error) {
 	existing, err := s.store.GetDataset(ctx, input.ID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get dataset: %w", err)
 	}
 	if existing == nil {
-		return nil, fmt.Errorf("dataset not found: %s", input.ID)
+		return nil, fmt.Errorf("%w: %s", ErrDatasetNotFound, input.ID)
 	}
 
-	existing.Name = input.Name
-	existing.Description = input.Description
-	existing.Tags = input.Tags
-	existing.Metadata = input.Metadata
+	if input.Name != "" {
+		existing.Name = input.Name
+	}
+	if input.Description != "" {
+		existing.Description = input.Description
+	}
+	if len(input.Tags) > 0 {
+		existing.Tags = input.Tags
+	}
+	if len(input.Metadata) > 0 {
+		existing.Metadata = input.Metadata
+	}
 	existing.LastUpdated = time.Now()
 	existing.Version++
 
@@ -103,7 +122,7 @@ func (s *DatasetsService) AddExamples(ctx context.Context, input AddExamplesInpu
 		return nil, fmt.Errorf("failed to get dataset: %w", err)
 	}
 	if dataset == nil {
-		return nil, fmt.Errorf("dataset not found: %s", input.DatasetID)
+		return nil, fmt.Errorf("%w: %s", ErrDatasetNotFound, input.DatasetID)
 	}
 
 	now := time.Now()
@@ -162,7 +181,7 @@ func (s *DatasetsService) ImportExamples(ctx context.Context, input ImportExampl
 		return nil, fmt.Errorf("failed to get dataset: %w", err)
 	}
 	if dataset == nil {
-		return nil, fmt.Errorf("dataset not found: %s", input.DatasetID)
+		return nil, fmt.Errorf("%w: %s", ErrDatasetNotFound, input.DatasetID)
 	}
 
 	// Create data source
@@ -273,7 +292,7 @@ func (s *DatasetsService) ExportExamples(ctx context.Context, input ExportExampl
 		return nil, fmt.Errorf("failed to get dataset: %w", err)
 	}
 	if dataset == nil {
-		return nil, fmt.Errorf("dataset not found: %s", input.DatasetID)
+		return nil, fmt.Errorf("%w: %s", ErrDatasetNotFound, input.DatasetID)
 	}
 
 	// Get examples

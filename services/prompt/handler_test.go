@@ -3,10 +3,15 @@ package prompt
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
 )
@@ -477,5 +482,182 @@ func TestToProto_Nil(t *testing.T) {
 	result := toProto(nil)
 	if result != nil {
 		t.Error("expected nil result for nil input")
+	}
+}
+
+// ---- error mapping ----
+
+// TestDeletePrompt_NotFound: deleting a prompt that does not exist used to
+// return the raw store error (code Unknown) or, on Postgres, succeed silently.
+func TestDeletePrompt_NotFound(t *testing.T) {
+	store := &mockStore{deleteErr: fmt.Errorf("%w: %s", ErrNotFound, "pmt_missing")}
+	handler := NewHandler(store, newTestLogger())
+
+	_, err := handler.DeletePrompt(context.Background(), &promptv1.DeletePromptRequest{Id: "pmt_missing"})
+	if err == nil {
+		t.Fatal("DeletePrompt() on a nonexistent prompt returned no error, want NOT_FOUND")
+	}
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("DeletePrompt() code = %s, want NotFound", got)
+	}
+	if !strings.Contains(status.Convert(err).Message(), "pmt_missing") {
+		t.Errorf("DeletePrompt() message = %q, want it to name the id", status.Convert(err).Message())
+	}
+}
+
+func TestDeletePrompt_EmptyID(t *testing.T) {
+	handler := NewHandler(&mockStore{}, newTestLogger())
+
+	_, err := handler.DeletePrompt(context.Background(), &promptv1.DeletePromptRequest{})
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Errorf("DeletePrompt(\"\") code = %s, want InvalidArgument", got)
+	}
+}
+
+// TestCreatePrompt_DuplicateSlug: a slug clash is ALREADY_EXISTS naming the
+// slug. It used to be INTERNAL carrying the Postgres driver string and the
+// constraint name.
+func TestCreatePrompt_DuplicateSlug(t *testing.T) {
+	store := &mockStore{createErr: &SlugConflictError{Slug: "taken-slug"}}
+	handler := NewHandler(store, newTestLogger())
+
+	_, err := handler.CreatePrompt(context.Background(), &promptv1.CreatePromptRequest{
+		Name: "Second", Slug: "taken-slug",
+	})
+	if err == nil {
+		t.Fatal("CreatePrompt() with a duplicate slug returned no error")
+	}
+	if got := status.Code(err); got != codes.AlreadyExists {
+		t.Errorf("CreatePrompt() code = %s, want AlreadyExists", got)
+	}
+	msg := status.Convert(err).Message()
+	if !strings.Contains(msg, "taken-slug") {
+		t.Errorf("CreatePrompt() message = %q, want it to name the conflicting slug", msg)
+	}
+}
+
+// TestCreatePrompt_StoreErrorDoesNotLeak: an unexpected store error may embed
+// driver text and constraint names. Those belong in the log, not the response.
+func TestCreatePrompt_StoreErrorDoesNotLeak(t *testing.T) {
+	store := &mockStore{createErr: errors.New(
+		`pq: duplicate key value violates unique constraint "prompts_pkey" (23505)`)}
+	handler := NewHandler(store, newTestLogger())
+
+	_, err := handler.CreatePrompt(context.Background(), &promptv1.CreatePromptRequest{Name: "X"})
+	if got := status.Code(err); got != codes.Internal {
+		t.Fatalf("CreatePrompt() code = %s, want Internal", got)
+	}
+	msg := status.Convert(err).Message()
+	for _, leak := range []string{"pq:", "constraint", "prompts_pkey", "23505"} {
+		if strings.Contains(msg, leak) {
+			t.Errorf("CreatePrompt() message %q leaks %q", msg, leak)
+		}
+	}
+}
+
+func TestUpdatePrompt_StoreNotFound(t *testing.T) {
+	store := &mockStore{
+		getResult: samplePrompt(),
+		updateErr: fmt.Errorf("%w: %s", ErrNotFound, "pmt_123"),
+	}
+	handler := NewHandler(store, newTestLogger())
+
+	_, err := handler.UpdatePrompt(context.Background(), &promptv1.UpdatePromptRequest{
+		Id: "pmt_123", Description: "new",
+	})
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("UpdatePrompt() code = %s, want NotFound", got)
+	}
+}
+
+// TestUpdatePrompt_PartialUpdate pins that an omitted field is left alone: a
+// config-only update must not drop the messages, and a description-only update
+// must not drop the tags.
+func TestUpdatePrompt_PartialUpdate(t *testing.T) {
+	store := NewMemoryStore()
+	handler := NewHandler(store, newTestLogger())
+	ctx := context.Background()
+
+	created, err := handler.CreatePrompt(ctx, &promptv1.CreatePromptRequest{
+		Name: "Partial", Slug: "partial-update",
+		Description: "original description",
+		Messages: []*promptv1.PromptMessage{
+			{Role: "system", Content: "You are helpful"},
+			{Role: "user", Content: "Hello"},
+		},
+		Tags: []string{"keep-me"},
+	})
+	if err != nil {
+		t.Fatalf("CreatePrompt() error = %v", err)
+	}
+	id := created.Prompt.Id
+
+	// Config-only update: messages and tags survive.
+	updated, err := handler.UpdatePrompt(ctx, &promptv1.UpdatePromptRequest{
+		Id:            id,
+		DefaultConfig: &promptv1.GenerationConfig{Temperature: 0.5, MaxTokens: 256},
+	})
+	if err != nil {
+		t.Fatalf("UpdatePrompt(config only) error = %v", err)
+	}
+	if len(updated.Prompt.Messages) != 2 {
+		t.Errorf("config-only update dropped messages: got %d, want 2", len(updated.Prompt.Messages))
+	}
+	if len(updated.Prompt.Tags) != 1 {
+		t.Errorf("config-only update dropped tags: got %v", updated.Prompt.Tags)
+	}
+	if updated.Prompt.Description != "original description" {
+		t.Errorf("config-only update changed the description: got %q", updated.Prompt.Description)
+	}
+
+	// Description-only update: messages, tags and config survive.
+	updated, err = handler.UpdatePrompt(ctx, &promptv1.UpdatePromptRequest{
+		Id: id, Description: "new description",
+	})
+	if err != nil {
+		t.Fatalf("UpdatePrompt(description only) error = %v", err)
+	}
+	if updated.Prompt.Description != "new description" {
+		t.Errorf("description not applied: got %q", updated.Prompt.Description)
+	}
+	if len(updated.Prompt.Messages) != 2 {
+		t.Errorf("description-only update dropped messages: got %d, want 2", len(updated.Prompt.Messages))
+	}
+	if updated.Prompt.Name != "Partial" {
+		t.Errorf("description-only update clobbered the name: got %q", updated.Prompt.Name)
+	}
+	if updated.Prompt.DefaultConfig.GetMaxTokens() != 256 {
+		t.Errorf("description-only update dropped the config: got %+v", updated.Prompt.DefaultConfig)
+	}
+}
+
+// TestGetPrompt_AfterDelete pins the soft-delete semantic at the API boundary:
+// a deleted prompt is NOT_FOUND, matching what List and the Postgres backend
+// already did.
+func TestGetPrompt_AfterDelete(t *testing.T) {
+	store := NewMemoryStore()
+	handler := NewHandler(store, newTestLogger())
+	ctx := context.Background()
+
+	created, err := handler.CreatePrompt(ctx, &promptv1.CreatePromptRequest{
+		Name: "Doomed", Slug: "doomed-prompt",
+	})
+	if err != nil {
+		t.Fatalf("CreatePrompt() error = %v", err)
+	}
+	id := created.Prompt.Id
+
+	if _, err := handler.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: id}); err != nil {
+		t.Fatalf("DeletePrompt() error = %v", err)
+	}
+
+	if _, err := handler.GetPrompt(ctx, &promptv1.GetPromptRequest{Id: id}); status.Code(err) != codes.NotFound {
+		t.Errorf("GetPrompt() after delete code = %s, want NotFound", status.Code(err))
+	}
+	if _, err := handler.GetPrompt(ctx, &promptv1.GetPromptRequest{Id: "doomed-prompt"}); status.Code(err) != codes.NotFound {
+		t.Errorf("GetPrompt(by slug) after delete code = %s, want NotFound", status.Code(err))
+	}
+	if _, err := handler.DeletePrompt(ctx, &promptv1.DeletePromptRequest{Id: id}); status.Code(err) != codes.NotFound {
+		t.Errorf("second DeletePrompt() code = %s, want NotFound", status.Code(err))
 	}
 }

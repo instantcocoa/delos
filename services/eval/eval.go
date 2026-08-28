@@ -17,6 +17,25 @@ const (
 	EvalRunStatusCancelled
 )
 
+// String renders a run status for humans - error messages and logs. Without it
+// %s on the underlying int prints a Go debug artefact.
+func (s EvalRunStatus) String() string {
+	switch s {
+	case EvalRunStatusPending:
+		return "pending"
+	case EvalRunStatusRunning:
+		return "running"
+	case EvalRunStatusCompleted:
+		return "completed"
+	case EvalRunStatusFailed:
+		return "failed"
+	case EvalRunStatusCancelled:
+		return "cancelled"
+	default:
+		return "unspecified"
+	}
+}
+
 // EvalRun represents an evaluation execution.
 type EvalRun struct {
 	ID                string
