@@ -1,6 +1,8 @@
 -- Prompts table
 CREATE TABLE prompts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- Application-generated ("pmt_<nanos>"), not a UUID: the store supplies
+    -- this value, so the column must accept exactly what it writes.
+    id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     slug TEXT NOT NULL UNIQUE,
     description TEXT,
@@ -20,7 +22,7 @@ CREATE INDEX idx_prompts_deleted_at ON prompts(deleted_at) WHERE deleted_at IS N
 -- Prompt versions table (stores each version of a prompt)
 CREATE TABLE prompt_versions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    prompt_id UUID NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
+    prompt_id TEXT NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
     version INTEGER NOT NULL,
     change_description TEXT,
     updated_by TEXT,
@@ -61,13 +63,13 @@ CREATE TABLE prompt_generation_configs (
     temperature DOUBLE PRECISION,
     max_tokens INTEGER,
     top_p DOUBLE PRECISION,
-    stop_sequences TEXT[],
+    stop_sequences TEXT,
     output_schema TEXT
 );
 
 -- Prompt tags table
 CREATE TABLE prompt_tags (
-    prompt_id UUID NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
+    prompt_id TEXT NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
     tag TEXT NOT NULL,
     PRIMARY KEY(prompt_id, tag)
 );
@@ -76,7 +78,7 @@ CREATE INDEX idx_prompt_tags_tag ON prompt_tags(tag);
 
 -- Prompt metadata table (key-value pairs)
 CREATE TABLE prompt_metadata (
-    prompt_id UUID NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
+    prompt_id TEXT NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
     key TEXT NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY(prompt_id, key)

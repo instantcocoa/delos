@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/instantcocoa/delos/pkg/database"
 	"os"
 	"testing"
 	"time"
@@ -547,73 +548,20 @@ func setupTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
+// createTables applies the real migration. Using hand-written DDL here once
+// let the test schema drift from production's: the tests declared id
+// VARCHAR(255) while the migration declared id UUID, so prompt creation passed
+// in tests and failed against a real database.
 func createTables(t *testing.T, db *sql.DB) {
 	t.Helper()
 
-	tables := []string{
-		`CREATE TABLE IF NOT EXISTS prompts (
-			id VARCHAR(255) PRIMARY KEY,
-			name VARCHAR(255) NOT NULL,
-			slug VARCHAR(255) UNIQUE NOT NULL,
-			description TEXT,
-			status VARCHAR(50) DEFAULT 'draft',
-			created_by VARCHAR(255),
-			created_at TIMESTAMPTZ DEFAULT NOW(),
-			updated_by VARCHAR(255),
-			updated_at TIMESTAMPTZ DEFAULT NOW(),
-			deleted_at TIMESTAMPTZ
-		)`,
-		`CREATE TABLE IF NOT EXISTS prompt_versions (
-			id VARCHAR(255) PRIMARY KEY DEFAULT gen_random_uuid()::text,
-			prompt_id VARCHAR(255) REFERENCES prompts(id),
-			version INT NOT NULL,
-			change_description TEXT,
-			updated_by VARCHAR(255),
-			updated_at TIMESTAMPTZ DEFAULT NOW(),
-			UNIQUE(prompt_id, version)
-		)`,
-		`CREATE TABLE IF NOT EXISTS prompt_messages (
-			id VARCHAR(255) PRIMARY KEY DEFAULT gen_random_uuid()::text,
-			prompt_version_id VARCHAR(255) REFERENCES prompt_versions(id),
-			role VARCHAR(50) NOT NULL,
-			content TEXT NOT NULL,
-			position INT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS prompt_variables (
-			id VARCHAR(255) PRIMARY KEY DEFAULT gen_random_uuid()::text,
-			prompt_version_id VARCHAR(255) REFERENCES prompt_versions(id),
-			name VARCHAR(255) NOT NULL,
-			description TEXT,
-			var_type VARCHAR(50),
-			required BOOLEAN DEFAULT false,
-			default_value TEXT
-		)`,
-		`CREATE TABLE IF NOT EXISTS prompt_generation_configs (
-			id VARCHAR(255) PRIMARY KEY DEFAULT gen_random_uuid()::text,
-			prompt_version_id VARCHAR(255) REFERENCES prompt_versions(id) UNIQUE,
-			temperature FLOAT,
-			max_tokens INT,
-			top_p FLOAT,
-			stop_sequences TEXT,
-			output_schema TEXT
-		)`,
-		`CREATE TABLE IF NOT EXISTS prompt_tags (
-			prompt_id VARCHAR(255) REFERENCES prompts(id),
-			tag VARCHAR(255) NOT NULL,
-			PRIMARY KEY(prompt_id, tag)
-		)`,
-		`CREATE TABLE IF NOT EXISTS prompt_metadata (
-			prompt_id VARCHAR(255) REFERENCES prompts(id),
-			key VARCHAR(255) NOT NULL,
-			value TEXT,
-			PRIMARY KEY(prompt_id, key)
-		)`,
+	wrapped := &database.DB{DB: db}
+	migrator := database.NewMigrator(wrapped, "prompt")
+	if err := migrator.LoadMigrations(Migrations, "migrations"); err != nil {
+		t.Fatalf("failed to load prompt migrations: %v", err)
 	}
-
-	for _, query := range tables {
-		if _, err := db.Exec(query); err != nil {
-			t.Fatalf("failed to create table: %v", err)
-		}
+	if err := migrator.Up(context.Background()); err != nil {
+		t.Fatalf("failed to apply prompt migrations: %v", err)
 	}
 }
 
@@ -633,6 +581,11 @@ func cleanupTables(t *testing.T, db *sql.DB) {
 	for _, table := range tables {
 		db.Exec("DROP TABLE IF EXISTS " + table + " CASCADE")
 	}
+
+	// The migrator records what it has applied. Dropping the tables without
+	// clearing that bookkeeping would make the next test's migration a no-op
+	// against a database with no tables in it.
+	db.Exec("DROP TABLE IF EXISTS prompt_schema_migrations CASCADE")
 }
 
 func TestPostgresStore_Create_Integration(t *testing.T) {
