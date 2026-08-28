@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
+	cpclient "github.com/instantcocoa/delos/cli/internal/client"
 	"github.com/instantcocoa/delos/cli/internal/output"
 	"github.com/instantcocoa/delos/cli/internal/promptfile"
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
@@ -29,7 +29,7 @@ func promptDirArg(args []string) string {
 }
 
 func promptClientConn() (promptv1.PromptServiceClient, *grpc.ClientConn, error) {
-	conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := cpclient.Dial(cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to connect to control plane at %s: %w", cfg.ControlPlaneAddr, err)
 	}

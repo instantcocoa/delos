@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
+	cpclient "github.com/instantcocoa/delos/cli/internal/client"
 	"github.com/instantcocoa/delos/cli/internal/output"
 	deployv1 "github.com/instantcocoa/delos/gen/go/deploy/v1"
 )
@@ -28,7 +28,7 @@ eval run and exits 0 (pass) or 1 (fail), so CI pipelines can block on it.`,
 }
 
 func getGateClient() (deployv1.DeployServiceClient, *grpc.ClientConn, error) {
-	conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := cpclient.Dial(cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to connect to control plane at %s: %w", cfg.ControlPlaneAddr, err)
 	}

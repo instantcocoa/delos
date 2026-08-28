@@ -8,9 +8,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
+	cpclient "github.com/instantcocoa/delos/cli/internal/client"
 	"github.com/instantcocoa/delos/cli/internal/output"
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
 )
@@ -38,7 +37,7 @@ var promptListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List prompts",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -94,7 +93,7 @@ var promptGetCmd = &cobra.Command{
 	Short: "Get a prompt",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -129,7 +128,7 @@ var promptCreateCmd = &cobra.Command{
 	Short: "Create a new prompt",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -186,7 +185,7 @@ var promptUpdateCmd = &cobra.Command{
 	Short: "Update a prompt (creates new version)",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -235,7 +234,7 @@ var promptDeleteCmd = &cobra.Command{
 	Short: "Delete a prompt",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -262,7 +261,7 @@ var promptHistoryCmd = &cobra.Command{
 	Short: "List prompt version history",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -318,7 +317,7 @@ var promptCompareCmd = &cobra.Command{
 	Short: "Compare two prompt versions",
 	Args:  cobra.ExactArgs(3),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}

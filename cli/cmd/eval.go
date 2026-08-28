@@ -8,9 +8,9 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	cpclient "github.com/instantcocoa/delos/cli/internal/client"
 	"github.com/instantcocoa/delos/cli/internal/output"
 	evalv1 "github.com/instantcocoa/delos/gen/go/eval/v1"
 	promptv1 "github.com/instantcocoa/delos/gen/go/prompt/v1"
@@ -67,7 +67,7 @@ the run is created, because the runner looks prompts up by ID.`,
 			name = fmt.Sprintf("eval-%s", time.Now().Format("20060102-150405"))
 		}
 
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -119,7 +119,7 @@ var evalListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List evaluation runs",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -180,7 +180,7 @@ var evalGetCmd = &cobra.Command{
 	Short: "Get evaluation run details",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -205,7 +205,7 @@ var evalCancelCmd = &cobra.Command{
 	Short: "Cancel an evaluation run",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -230,7 +230,7 @@ var evalResultsCmd = &cobra.Command{
 	Short: "Get evaluation results",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -264,7 +264,7 @@ var evalCompareCmd = &cobra.Command{
 	Short: "Compare two evaluation runs",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -291,7 +291,7 @@ var evalEvaluatorsCmd = &cobra.Command{
 	Use:   "evaluators",
 	Short: "List available evaluators",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := grpc.NewClient(cfg.ControlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := cpclient.Dial(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
