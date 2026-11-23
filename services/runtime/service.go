@@ -140,11 +140,15 @@ func cutProviderPrefix(model string) (provider, rest string, ok bool) {
 // wellKnownProvider maps well-known model name prefixes to provider names.
 func wellKnownProvider(model string) string {
 	switch {
+	// text-embedding-004 is Gemini's embedding model and must match before the
+	// generic OpenAI "text-embedding-" prefix would claim it.
+	case hasAnyPrefix(model, "text-embedding-004"):
+		return "gemini"
 	case hasAnyPrefix(model, "gpt-", "o1", "o3", "o4", "text-embedding-", "chatgpt-"):
 		return "openai"
 	case hasAnyPrefix(model, "claude-"):
 		return "anthropic"
-	case hasAnyPrefix(model, "gemini-", "text-embedding-004"):
+	case hasAnyPrefix(model, "gemini-"):
 		return "gemini"
 	case hasAnyPrefix(model, "anthropic.", "amazon.", "meta.", "us.", "eu."):
 		return "bedrock"
