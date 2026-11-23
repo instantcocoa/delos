@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"github.com/instantcocoa/delos/services/eval"
 	"github.com/instantcocoa/delos/services/observe"
 	"github.com/instantcocoa/delos/services/prompt"
+	"github.com/instantcocoa/delos/services/runtime"
 )
 
 const (
@@ -164,6 +166,27 @@ func Run() error {
 	}
 	promptHandler := prompt.NewHandler(promptStore, logger)
 
+	// Keys: the hub-facing KeyService over Bifrost governance. With Postgres the
+	// store opens Bifrost's config store (which migrates its own schema), applies
+	// Delos's key migrations, and copies legacy dk_ keys; without it, a memory
+	// store keeps the API working in dev mode.
+	keyStore := runtime.KeyServiceStore(runtime.NewMemoryKeyServiceStore())
+	if db != nil {
+		keyStore, err = runtime.OpenKeyServiceStore(ctx, db.DB, runtime.BifrostDBConfig{
+			Host:     cfg.DBHost,
+			Port:     strconv.Itoa(cfg.DBPort),
+			User:     cfg.DBUser,
+			Password: cfg.DBPassword,
+			DBName:   cfg.DBName,
+			SSLMode:  cfg.DBSSLMode,
+		}, logger)
+		if err != nil {
+			return fmt.Errorf("failed to open key store: %w", err)
+		}
+		defer func() { _ = keyStore.Close(context.Background()) }()
+	}
+	keyHandler := runtime.NewKeyHandler(keyStore, logger)
+
 	datasetsStore := datasets.NewMemoryStore()
 	datasetsService := datasets.NewDatasetsService(datasetsStore)
 	datasetsHandler := datasets.NewHandler(logger, datasetsService)
@@ -234,10 +257,11 @@ func Run() error {
 	datasetsHandler.Register(grpcServer)
 	evalHandler.Register(grpcServer)
 	deployHandler.Register(grpcServer)
+	keyHandler.Register(grpcServer)
 
 	healthServer := health.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthServer)
-	for _, name := range []string{"", "observe", "prompt", "datasets", "eval", "deploy"} {
+	for _, name := range []string{"", "observe", "prompt", "datasets", "eval", "deploy", "keys"} {
 		healthServer.SetServingStatus(name, healthpb.HealthCheckResponse_SERVING)
 	}
 	// Reflection enumerates every service and method, which is a map for an
