@@ -1,3 +1,5 @@
+//go:build delos_translators
+
 package runtime
 
 import (
