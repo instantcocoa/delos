@@ -1,5 +1,3 @@
-//go:build delos_translators
-
 package runtime
 
 import (
@@ -132,7 +130,7 @@ func TestListModelsRequiresAuth(t *testing.T) {
 	// triggers a live upstream call.
 	store := NewMemoryKeyStore()
 	secret, _ := newStoredKey(t, store, "team", 0, 0)
-	srv := authTestServer(t, store)
+	srv := NewLegacyHTTPServer(newTestService(chatProvider()), newTestLogger(), WithKeyStore(store))
 
 	rec, out := doJSON(t, srv, http.MethodGet, "/v1/models", "")
 	if rec.Code != http.StatusUnauthorized {
@@ -157,7 +155,7 @@ func TestListModelsRequiresAuth(t *testing.T) {
 func TestListModelsIsScopedToTheKey(t *testing.T) {
 	store := NewMemoryKeyStore()
 	secret, _ := newStoredKey(t, store, "scoped", 0, 0, "gpt-4o")
-	srv := authTestServer(t, store)
+	srv := NewLegacyHTTPServer(newTestService(chatProvider()), newTestLogger(), WithKeyStore(store))
 
 	req := jsonReq(http.MethodGet, "/v1/models", "")
 	req.Header.Set("Authorization", "Bearer "+secret)
@@ -210,7 +208,7 @@ func meteringServer(t *testing.T, p Provider) (*HTTPServer, KeyStore, string, *V
 	t.Helper()
 	store := NewMemoryKeyStore()
 	secret, key := newStoredKey(t, store, "metered", 0, 0)
-	srv := NewHTTPServer(newTestService(p), newTestLogger(), WithKeyStore(store))
+	srv := NewLegacyHTTPServer(newTestService(p), newTestLogger(), WithKeyStore(store))
 	return srv, store, secret, key
 }
 
@@ -327,7 +325,7 @@ func TestCacheHitIsNotBilledOverHTTP(t *testing.T) {
 	secret, key := newStoredKey(t, store, "cached", 0, 0)
 	svc := newTestService(p)
 	svc.SetCache(NewLRUCache(10), 0)
-	srv := NewHTTPServer(svc, newTestLogger(), WithKeyStore(store))
+	srv := NewLegacyHTTPServer(svc, newTestLogger(), WithKeyStore(store))
 
 	body := `{"model":"gpt-4o","temperature":0,"messages":[{"role":"user","content":"hi"}]}`
 	send := func() *httptest.ResponseRecorder {

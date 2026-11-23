@@ -44,6 +44,10 @@ type HTTPServer struct {
 	bifrostLogger schemas.Logger
 	bifrostOnce   sync.Once
 	bifrostErr    error
+
+	// bifrostKeys, when non-nil, switches authentication to the Bifrost
+	// governance store with a per-request is_active/expires_at re-check.
+	bifrostKeys *bifrostKeyAuthenticator
 }
 
 // HTTPServerOption configures the gateway HTTP API.
@@ -95,6 +99,17 @@ func NewBifrostHTTPServer(service *RuntimeService, logger *slog.Logger, opts ...
 	return s
 }
 
+// NewLegacyHTTPServer is the in-process hook for the legacy Delos translators:
+// it always serves them regardless of DELOS_GATEWAY_BIFROST. Used by the
+// translator tests and by DL-T's swap-parity suite to construct the pre-D1 path.
+func NewLegacyHTTPServer(service *RuntimeService, logger *slog.Logger, opts ...HTTPServerOption) *HTTPServer {
+	s := newHTTPServer(service, logger, opts...)
+	registerLegacyRoutes(s)
+	s.mux.HandleFunc("GET /v1/events", s.handleTailEvents)
+	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	return s
+}
+
 func newHTTPServer(service *RuntimeService, logger *slog.Logger, opts ...HTTPServerOption) *HTTPServer {
 	s := &HTTPServer{
 		service: service,
@@ -108,12 +123,9 @@ func newHTTPServer(service *RuntimeService, logger *slog.Logger, opts ...HTTPSer
 }
 
 // useBifrostPath reports whether this process serves requests through Bifrost.
-// Bifrost is always the default; a delos_translators build may select the
-// legacy translators by setting DELOS_GATEWAY_BIFROST=0/false/off.
+// Bifrost is the default; the legacy Delos translators (compiled into every
+// build) are selected by DELOS_GATEWAY_BIFROST=0/false/off.
 func useBifrostPath() bool {
-	if !legacyTranslatorsCompiled {
-		return true
-	}
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("DELOS_GATEWAY_BIFROST")))
 	return v != "0" && v != "false" && v != "off"
 }
@@ -163,6 +175,8 @@ func (s *HTTPServer) initBifrost(ctx context.Context) (*bifrost.Bifrost, error) 
 		Account: bifrostAccount{},
 		Logger:  s.bifrostLogger,
 		Tracer:  tr,
+		// Stamp key metadata (session/org/subject/labels) onto the root span.
+		LLMPlugins: []schemas.LLMPlugin{delosAttributionPlugin{}},
 	}
 
 	// Gap 4: point Bifrost's otel connector at Delos observe (OTLP). With no
@@ -265,6 +279,12 @@ func (s *HTTPServer) newBifrostContext(r *http.Request) *schemas.BifrostContext 
 	}
 	if rid := RequestID(r.Context()); rid != "" {
 		ctx.SetValue(schemas.BifrostContextKeyRequestID, rid)
+	}
+	// Carry the resolved key's metadata so the delosAttributionPlugin can stamp
+	// gen_ai.conversation.id / delos.org_id / delos.subject / delos.labels onto
+	// the request's root span.
+	if att := bifrostAttributionFromContext(r.Context()); !att.empty() {
+		ctx.SetValue(bifrostAttributionCtxKey{}, att)
 	}
 	return ctx
 }

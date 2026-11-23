@@ -1,5 +1,3 @@
-//go:build delos_translators
-
 package runtime
 
 import (
@@ -85,7 +83,7 @@ func TestUnsubscribeStopsDelivery(t *testing.T) {
 func tailServer(t *testing.T, providers ...Provider) (*HTTPServer, *TailBroadcaster) {
 	t.Helper()
 	b := NewTailBroadcaster(50)
-	return NewHTTPServer(newTestService(providers...), newTestLogger(), WithTailBroadcast(b)), b
+	return NewLegacyHTTPServer(newTestService(providers...), newTestLogger(), WithTailBroadcast(b)), b
 }
 
 func TestTailEventOnCompletion(t *testing.T) {
@@ -277,7 +275,7 @@ func TestTailEventsAreScopedToTheAuthenticatedKey(t *testing.T) {
 	secretB, keyB := newStoredKey(t, store, "tenant-b", 0, 0)
 
 	b := NewTailBroadcaster(50)
-	srv := NewHTTPServer(newTestService(chatProvider()), newTestLogger(),
+	srv := NewLegacyHTTPServer(newTestService(chatProvider()), newTestLogger(),
 		WithKeyStore(store), WithTailBroadcast(b))
 	b.Publish(TailEvent{RequestID: "req_a", Model: "gpt-4o", Status: 200,
 		KeyName: keyA.Name, KeyID: keyA.ID, CostUSD: 1.23})

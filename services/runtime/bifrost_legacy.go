@@ -1,5 +1,3 @@
-//go:build delos_translators
-
 package runtime
 
 import (
@@ -8,10 +6,10 @@ import (
 	"net/http"
 )
 
-// legacyTranslatorsCompiled gates the DELOS_GATEWAY_BIFROST runtime switch: the
-// legacy translators only exist in a -tags=delos_translators build, so a build
-// without the tag always serves Bifrost.
-const legacyTranslatorsCompiled = true
+// The legacy Delos translators are compiled into the default build so that
+// cross-provider routes (and a DELOS_GATEWAY_BIFROST=0 deployment) keep working
+// without a separate build flag. They stay reachable through the runtime switch
+// for one release, then are deleted.
 
 // registerLegacyRoutes wires the legacy Delos translator handlers onto the
 // shared mux. /v1/events and /healthz are shared and registered by NewHTTPServer.
@@ -38,6 +36,8 @@ func (s *HTTPServer) serveLegacyRoute(w http.ResponseWriter, r *http.Request, bo
 	case "/v1/embeddings":
 		s.handleEmbeddings(w, r)
 		return true
+	case "/v1/responses":
+		// No legacy Responses translator exists; handled below by the caller.
 	}
 	return false
 }

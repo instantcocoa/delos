@@ -13,7 +13,7 @@ import (
 // (keys_test.go, DL-K), so they live untagged.
 
 func newTestHTTPServer(providers ...Provider) *HTTPServer {
-	return NewHTTPServer(newTestService(providers...), newTestLogger())
+	return NewLegacyHTTPServer(newTestService(providers...), newTestLogger())
 }
 
 func chatProvider() *mockProvider {
