@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 env:
-  GO_VERSION: '1.25'
+  GO_VERSION: '1.27.4'
   BUF_VERSION: '1.47.2'
   # Both binaries ship CGO-free; build and test that way everywhere. The one
   # exception is the -race step below, which requires cgo.
