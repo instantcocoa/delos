@@ -12,16 +12,16 @@ import (
 // TestAnthropicMessagesFidelityBifrost pins the D1 contract for
 // POST /v1/messages (note 0001 §"Wire behavior changes", gap 1). It replaces
 // the D0 baseline test of the same name, which recorded the OLD behavior
-// (thinking/cache_control/metadata/beta silently dropped). The D0 baseline
-// pinning lives on team/dl-t/d0-baseline; on this branch the expected behavior
-// is the post-D1 one:
+// (thinking/cache_control/metadata/document/beta silently dropped or rejected).
+// The D0 baseline pinning lives on team/dl-t/d0-baseline; on this branch the
+// expected behavior is the post-D1 one:
 //
 //   - same-provider (Anthropic→Anthropic) routes go through Bifrost
 //     PassthroughStream: the request body and anthropic-* headers are
-//     forwarded as sent, so thinking, cache_control and metadata pass through,
-//     and an anthropic-beta header reaches the provider.
-//   - a document content block is still rejected with a structured 400
-//     (invalid_request_error).
+//     forwarded as sent, so thinking, cache_control, metadata and document
+//     blocks pass through, and an anthropic-beta header reaches the provider.
+//     The legacy translator's "document → structured 400" rejection does not
+//     apply on the passthrough path.
 //
 // The test is hermetic: a fake Anthropic Messages upstream records exactly what
 // the gateway forwards, so pass-through versus drop is observed on the wire
@@ -29,7 +29,7 @@ import (
 // path being enabled because the old translators still drop these fields.
 func TestAnthropicMessagesFidelityBifrost(t *testing.T) {
 	if !bifrostEnabled() {
-		t.Skipf("Bifrost path disabled: set %s=1 to run (old translators still drop these fields)", bifrostEnv)
+		t.Skipf("Bifrost path disabled: set %s=1 to run (old translators still drop or reject these fields)", bifrostEnv)
 	}
 
 	const model = "claude-sonnet-4-5"
@@ -94,7 +94,7 @@ func TestAnthropicMessagesFidelityBifrost(t *testing.T) {
 			wantUpBody: []string{`"metadata"`, `user_id`},
 		},
 		{
-			name: "document content block is still rejected with a structured 400",
+			name: "document content block passes through",
 			body: map[string]any{
 				"model":      model,
 				"max_tokens": 64,
@@ -106,9 +106,9 @@ func TestAnthropicMessagesFidelityBifrost(t *testing.T) {
 					}},
 				}},
 			},
-			wantStatus: http.StatusBadRequest,
-			wantCall:   false, // rejected locally, before any provider call
-			wantBody:   []string{`invalid_request_error`, `document`},
+			wantStatus: http.StatusOK,
+			wantCall:   true,
+			wantUpBody: []string{`"document"`, `"media_type"`},
 		},
 		{
 			name: "anthropic-beta header passes through",

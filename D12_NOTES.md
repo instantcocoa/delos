@@ -12,8 +12,9 @@ These are raw notes backing the DL-T report to LEAD. Delete before any merge.
   must provide.
 - `tests/conformance/messages_fidelity_test.go` — the D1 contract for `/v1/messages`,
   replacing the D0 baseline pinning (which lives on `team/dl-t/d0-baseline`): thinking /
-  cache_control / metadata / anthropic-beta pass through; `document` still 400s. Gated
-  on the Bifrost switch.
+  cache_control / metadata / document / anthropic-beta ALL pass through (byte-faithful
+  same-provider passthrough; the legacy `document → 400` is dropped). Gated on the
+  Bifrost switch.
 - `tests/integration/key_lifecycle_test.go` — D2 key-lifecycle table (expired, revoked,
   wrong model, over daily budget, over total budget) + revoke-propagation ≤1 s across
   replicas. Scaffold: gated on `DELOS_KEYS_ENABLED=1`; the three wire helpers are
@@ -27,9 +28,10 @@ These are raw notes backing the DL-T report to LEAD. Delete before any merge.
 
 ## Coordination points / blockers for LEAD
 
-1. **The Bifrost switch flag name is provisional.** I used `DELOS_GATEWAY_BIFROST=1`
-   (const `bifrostEnv` in `swap_parity_test.go`). Confirm the real flag with DL-G and
-   update the const.
+1. **The Bifrost switch flag name — CONFIRMED.** LEAD relayed to DL-G:
+   `DELOS_GATEWAY_BIFROST=1` (const `bifrostEnv` in `swap_parity_test.go`), the
+   in-process `bifrostGateway()` hook, and the Anthropic/OpenAI base-URL override.
+   Treat as confirmed unless DL-G reports otherwise.
 2. **`bifrostGateway()` is a placeholder.** It `t.Fatal`s if the switch is enabled before
    DL-G exposes the in-process hook (HTTPServerOption / RuntimeService mode) that builds
    the Bifrost path. DL-G owns `services/runtime`; they should implement this helper or
@@ -41,10 +43,10 @@ These are raw notes backing the DL-T report to LEAD. Delete before any merge.
 4. **KeyService (proto/keys/v1) is not landed.** `key_lifecycle_test.go` is a scaffold;
    DL-K/DL-T wire `mintKeyForTest` / `revokeKeyForTest` / `seedUsageForTest` /
    `startGatewayReplicas` at D2 integration.
-5. **`document` contract ambiguity.** Note 0001 §"Wire behavior changes" says documents
-   pass through on same-provider passthrough ("those fields pass through"). The
-   coordinator's instruction says `document` still 400s. I followed the coordinator in
-   `messages_fidelity_test.go`. Confirm with DL-G/LEAD which is right before integration.
+5. **`document` contract — RESOLVED.** LEAD corrected the earlier "document still 400s":
+   note 0001 and gap 1 are byte-faithful same-provider passthrough, so `document` blocks
+   pass through like everything else. `messages_fidelity_test.go` now asserts pass-through
+   for all five (thinking / cache_control / metadata / document / anthropic-beta).
 
 ## Verification run (all green)
 
