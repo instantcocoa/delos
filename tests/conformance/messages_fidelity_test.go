@@ -12,26 +12,22 @@ import (
 // TestAnthropicMessagesFidelityBifrost pins the D1 contract for
 // POST /v1/messages (note 0001 §"Wire behavior changes", gap 1). It replaces
 // the D0 baseline test of the same name, which recorded the OLD behavior
-// (thinking/cache_control/metadata/document/beta silently dropped or rejected).
-// The D0 baseline pinning lives on team/dl-t/d0-baseline; on this branch the
-// expected behavior is the post-D1 one:
+// (thinking/cache_control/metadata/document/beta silently dropped or
+// rejected) on team/dl-t/d0-baseline. The post-D1 behavior on the Bifrost
+// path is byte-faithful same-provider passthrough:
 //
 //   - same-provider (Anthropic→Anthropic) routes go through Bifrost
 //     PassthroughStream: the request body and anthropic-* headers are
 //     forwarded as sent, so thinking, cache_control, metadata and document
-//     blocks pass through, and an anthropic-beta header reaches the provider.
-//     The legacy translator's "document → structured 400" rejection does not
-//     apply on the passthrough path.
+//     blocks all pass through, and an anthropic-beta header reaches the
+//     provider unchanged.
 //
-// The test is hermetic: a fake Anthropic Messages upstream records exactly what
-// the gateway forwards, so pass-through versus drop is observed on the wire
-// rather than inferred from the request struct. It is gated on the Bifrost
-// path being enabled because the old translators still drop these fields.
+// The test is hermetic: a fake Anthropic Messages upstream records exactly
+// what the gateway forwards, so pass-through versus drop is observed on the
+// wire rather than inferred from the request struct. It drives the Bifrost
+// path directly via NewBifrostHTTPServer and points Bifrost's env account at
+// the fake upstream (DELOS_BIFROST_ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY).
 func TestAnthropicMessagesFidelityBifrost(t *testing.T) {
-	if !bifrostEnabled() {
-		t.Skipf("Bifrost path disabled: set %s=1 to run (old translators still drop or reject these fields)", bifrostEnv)
-	}
-
 	const model = "claude-sonnet-4-5"
 
 	cases := []struct {
@@ -39,12 +35,10 @@ func TestAnthropicMessagesFidelityBifrost(t *testing.T) {
 		body        map[string]any
 		header      http.Header
 		wantStatus  int
-		wantBody    []string // substrings the gateway response must contain
 		wantCall    bool     // whether the gateway should reach the provider
 		wantUpBody  []string // substrings the forwarded request must contain
 		wantNotBody []string // substrings the forwarded request must NOT contain
 		wantHeader  []string // header names the forwarded request must carry
-		wantNotHdr  []string // header names the forwarded request must NOT carry
 	}{
 		{
 			name: "thinking block passes through",
@@ -108,7 +102,7 @@ func TestAnthropicMessagesFidelityBifrost(t *testing.T) {
 			},
 			wantStatus: http.StatusOK,
 			wantCall:   true,
-			wantUpBody: []string{`"document"`, `"media_type"`},
+			wantUpBody: []string{`"document"`, `media_type`},
 		},
 		{
 			name: "anthropic-beta header passes through",
@@ -127,19 +121,15 @@ func TestAnthropicMessagesFidelityBifrost(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			up := newAnthropicFidelityUpstream(t)
-			spec := providerSpecs["anthropic"]
-			provider := spec.build(up.baseURL(), spec.replayKey)
-			gwURL, stop := serveGateway(provider)
+			t.Setenv("ANTHROPIC_API_KEY", "sk-ant-conformance")
+			t.Setenv("DELOS_BIFROST_ANTHROPIC_BASE_URL", up.baseURL())
+
+			gwURL, stop := serveBifrostService(newService())
 			t.Cleanup(stop)
 
 			resp := postAnthropicFidelity(t, gwURL, tc.body, tc.header)
 			if resp.Status != tc.wantStatus {
 				t.Fatalf("status = %d, want %d\nbody: %s", resp.Status, tc.wantStatus, truncate(resp.Body, 2000))
-			}
-			for _, want := range tc.wantBody {
-				if !strings.Contains(resp.Body, want) {
-					t.Errorf("gateway response does not contain %q\nbody: %s", want, truncate(resp.Body, 2000))
-				}
 			}
 
 			calls := up.calls()
@@ -167,11 +157,6 @@ func TestAnthropicMessagesFidelityBifrost(t *testing.T) {
 			for _, want := range tc.wantHeader {
 				if call.header.Get(want) == "" {
 					t.Errorf("forwarded request is missing the %s header (headers: %v)", want, call.header)
-				}
-			}
-			for _, unwanted := range tc.wantNotHdr {
-				if call.header.Get(unwanted) != "" {
-					t.Errorf("forwarded request carries %s, which must not be forwarded", unwanted)
 				}
 			}
 		})

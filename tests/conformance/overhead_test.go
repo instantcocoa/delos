@@ -1,6 +1,7 @@
 package conformance
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,8 +12,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/instantcocoa/delos/services/runtime"
 )
 
 // The gateway's headline claim is that it costs almost nothing to put in
@@ -44,18 +43,39 @@ func p99Budget(t *testing.T) time.Duration {
 	return defaultP99Budget
 }
 
+// benchModel is the model the overhead bench requests. It is OpenAI-recognized
+// so the Bifrost path takes same-provider passthrough (the post-D1 default)
+// rather than the legacy translator fallback.
+const benchModel = "gpt-4o"
+
+// benchChatRequest builds a chat-completion payload for the overhead bench.
+func benchChatRequest(stream bool) []byte {
+	body := map[string]any{
+		"model":    benchModel,
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	if stream {
+		body["stream"] = true
+	}
+	out, _ := json.Marshal(body)
+	return out
+}
+
 // benchEnv starts an instant upstream and a gateway in front of it, returning
 // the gateway URL and the upstream URL. Measuring both lets the test report
-// the gateway's own cost rather than the machine's loopback latency.
+// the gateway's own cost rather than the machine's loopback latency. The
+// gateway runs the Bifrost path: its env account is pointed at the upstream.
 func benchEnv(t *testing.T) (gateway, upstream string) {
 	t.Helper()
-	body := fmt.Sprintf(`{"id":"chatcmpl-bench","object":"chat.completion","created":1730000000,"model":%q,"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}`, failModel)
+	body := fmt.Sprintf(`{"id":"chatcmpl-bench","object":"chat.completion","created":1730000000,"model":%q,"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}`, benchModel)
 	upstream = compatUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, body)
 	})
-	// No cache is configured: every request pays the full provider path.
-	gateway = routedGateway(t, nil, runtime.NewOpenAICompatProvider("primary", upstream+"/v1", "k"))
+	t.Setenv("OPENAI_API_KEY", "k")
+	t.Setenv("DELOS_BIFROST_OPENAI_BASE_URL", upstream)
+	gateway, stop := serveBifrostService(newService())
+	t.Cleanup(stop)
 	return gateway, upstream
 }
 
@@ -113,7 +133,7 @@ func TestGatewayOverheadP99(t *testing.T) {
 	gw, upstream := benchEnv(t)
 	direct := upstream + "/v1/chat/completions"
 	client := benchClient()
-	payload := chatRequest(false)
+	payload := benchChatRequest(false)
 
 	for i := 0; i < overheadWarmup; i++ {
 		if _, err := oneRequest(client, gw, payload); err != nil {
@@ -201,7 +221,7 @@ func TestGatewaySoak(t *testing.T) {
 	}
 	gw := instantGateway(t)
 	client := benchClient()
-	payload := chatRequest(false)
+	payload := benchChatRequest(false)
 
 	for i := 0; i < overheadWarmup; i++ {
 		if _, err := oneRequest(client, gw, payload); err != nil {
