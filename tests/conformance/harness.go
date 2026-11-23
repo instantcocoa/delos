@@ -302,10 +302,22 @@ func ReadStream(surface, body string) StreamView {
 	return view
 }
 
-// serveService starts the production gateway HTTP surface over a configured
-// service and returns its base URL plus a shutdown func.
+// serveService starts the gateway HTTP surface over a configured service and
+// returns its base URL plus a shutdown func. It uses the legacy Delos
+// translators: the cassettes and the failure-injection tests pin the pre-D1
+// behavior, which the Bifrost swap must not change. The Bifrost path is
+// exercised by serveBifrostService (swap-parity and fidelity suites).
 func serveService(svc *runtime.RuntimeService, opts ...runtime.HTTPServerOption) (string, func()) {
-	ts := httptest.NewServer(runtime.NewHTTPServer(svc, discardLogger(), opts...))
+	ts := httptest.NewServer(runtime.NewLegacyHTTPServer(svc, discardLogger(), opts...))
+	return ts.URL, ts.Close
+}
+
+// serveBifrostService starts the gateway's Bifrost path over a configured
+// service. Provider credentials and base URLs come from the environment
+// (bifrostAccount), so callers must t.Setenv the provider key and the
+// DELOS_BIFROST_<PROVIDER>_BASE_URL override before the first request.
+func serveBifrostService(svc *runtime.RuntimeService, opts ...runtime.HTTPServerOption) (string, func()) {
+	ts := httptest.NewServer(runtime.NewBifrostHTTPServer(svc, discardLogger(), opts...))
 	return ts.URL, ts.Close
 }
 
