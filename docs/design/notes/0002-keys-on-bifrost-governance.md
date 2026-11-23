@@ -1,6 +1,6 @@
 # 0002 — Keys on Bifrost governance (D2)
 
-Status: **draft** (awaiting R-REVIEW). Team: DL-K. Surface: **wire + DB schema**. Gap closed: 4.
+Status: **approved** (R-REVIEW, 2026-11-23). Team: DL-K. Surface: **wire + DB schema**. Gap closed: 4.
 
 ## Decision
 
@@ -129,7 +129,7 @@ migrations), then applies Delos's `keys` migration set.
 Both are enforced by the gateway's Bifrost governance wiring (DL-G), reading the
 tables this note defines. See Open questions: Bifrost's OSS governance store
 loads keys into memory once at init and has no built-in poll, so the gateway
-must re-read key state from Postgres per request or poll it.
+re-reads key state from Postgres per request (no cache; see Open questions).
 
 ## Open questions
 

@@ -8,3 +8,4 @@ team, the affected surface, and its status.
 | # | Title | Surface | Team | Status |
 | --- | --- | --- | --- | --- |
 | 0001 | Gateway HTTP surfaces on Bifrost (D1) | wire behavior | DL-G | **approved** (R-REVIEW) |
+| 0002 | Keys on Bifrost governance (D2) | wire + DB schema | DL-K | **approved** (R-REVIEW) |
