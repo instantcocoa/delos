@@ -1,5 +1,6 @@
 .PHONY: all build build-delos build-gateway
 .PHONY: test test-unit test-integration test-integration-full test-ollama test-coverage
+.PHONY: test-require-db
 .PHONY: test-deps-up test-deps-wait
 .PHONY: conformance conformance-record bench soak compat vulncheck
 .PHONY: lint proto proto-lint proto-breaking proto-format docs-test
@@ -37,6 +38,13 @@ test: test-deps-up test-deps-wait
 # Run unit tests only (no external dependencies)
 test-unit:
 	@go test -race -cover ./...
+
+# Run the suite and FAIL when a database-backed test skips (CI parity).
+# Plain `make test` / `make test-unit` still allow skips, so local development
+# without Postgres works as before. This target is what CI runs: it wraps
+# `go test -json` and fails on any skip in a Postgres-backed package.
+test-require-db:
+	@DELOS_TEST_REQUIRE_DB=1 go run ./tests/skipguard ./...
 
 # Run tests with coverage report
 test-coverage: test-deps-up test-deps-wait
@@ -241,6 +249,7 @@ help:
 	@echo "Testing:"
 	@echo "  make test               Run tests (starts postgres/localstack)"
 	@echo "  make test-unit          Run tests without starting deps"
+	@echo "  make test-require-db    Run tests, fail if a DB test skips (CI parity)"
 	@echo "  make test-integration   Run integration tests (requires the stack)"
 	@echo "  make test-ollama        Run Ollama integration tests only"
 	@echo "  make test-coverage      Generate HTML coverage report"

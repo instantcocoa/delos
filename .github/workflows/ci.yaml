@@ -135,8 +135,14 @@ jobs:
           # The race detector is the one thing that needs cgo; everything
           # else in this workflow builds with CGO_ENABLED=0.
           CGO_ENABLED: '1'
+          # Postgres is up in this job, so a database-backed test that skips
+          # means the database path silently did not run. tests/skipguard
+          # turns any skip in a Postgres-backed package into a failure when
+          # this is set; local `make test` keeps the skip-friendly behavior.
+          DELOS_TEST_REQUIRE_DB: '1'
         run: |
-          go test -v -race -coverpkg=./... -coverprofile=coverage.out -covermode=atomic ./...
+          go run ./tests/skipguard \
+            -race -coverpkg=./... -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Upload coverage
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
