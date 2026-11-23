@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package delos.keys.v1;
+
+option go_package = "github.com/instantcocoa/delos/proto/keys/v1;keysv1";
+
+import "google/protobuf/timestamp.proto";
+
+// KeyService is the hub-facing API over Bifrost governance virtual keys.
+//
+// The hub mints a short-lived, session-scoped key when a session starts,
+// revokes it when the session ends, and reads usage to keep budget accounting
+// in the hub's event log. The `delos key` CLI is a thin client of this API.
+service KeyService {
+  // MintKey creates a virtual key. The plaintext secret is returned exactly
+  // once, in MintKeyResponse.secret.
+  rpc MintKey(MintKeyRequest) returns (MintKeyResponse);
+
+  // RevokeKey deactivates a virtual key so it stops authenticating on every
+  // gateway replica as soon as the replica observes the change.
+  rpc RevokeKey(RevokeKeyRequest) returns (RevokeKeyResponse);
+
+  // GetKeyUsage reports a key's current budget and rate-limit consumption.
+  rpc GetKeyUsage(GetKeyUsageRequest) returns (GetKeyUsageResponse);
+
+  // ListKeys returns every key, in creation order, without secrets.
+  rpc ListKeys(ListKeysRequest) returns (ListKeysResponse);
+}
+
+// Budget sets a spending limit with a reset window. reset_duration is a
+// Bifrost duration string ("30s", "1h", "1d", "1w", "1M", "1Q", "1Y"); empty
+// means total (never resets within the key's life).
+message Budget {
+  double max_limit_usd = 1;
+  string reset_duration = 2;
+}
+
+// RateLimit sets token and/or request limits with their own reset windows.
+// A zero max means unlimited on that axis.
+message RateLimit {
+  int64 token_max_limit = 1;
+  string token_reset_duration = 2;
+  int64 request_max_limit = 3;
+  string request_reset_duration = 4;
+}
+
+message MintKeyRequest {
+  // Session attribution: stamped on spans as gen_ai.conversation.id,
+  // delos.org_id and delos.subject respectively.
+  string session_id = 1;
+  string org_id = 2;
+  string subject = 3;
+
+  // Free-form labels carried on the key for cost attribution.
+  map<string, string> labels = 4;
+
+  // Optional display name; defaults to a generated one when empty.
+  string name = 5;
+
+  // Optional expiry; nil means the key never expires.
+  google.protobuf.Timestamp expires_at = 6;
+
+  // Models this key may use; empty means all models. Supports "provider/*"
+  // wildcards. Enforced by the gateway from the key's metadata.
+  repeated string models = 7;
+
+  // Budgets with reset intervals (daily, monthly, total, ...).
+  repeated Budget budgets = 8;
+
+  // Optional token/request rate limits.
+  RateLimit rate_limit = 9;
+}
+
+message MintKeyResponse {
+  Key key = 1;
+  // secret is the plaintext key, returned exactly once at creation.
+  string secret = 2;
+}
+
+// Key is the stored record; it never carries the secret after mint.
+message Key {
+  string id = 1;
+  string name = 2;
+  string session_id = 3;
+  string org_id = 4;
+  string subject = 5;
+  map<string, string> labels = 6;
+  repeated string models = 7;
+  repeated Budget budgets = 8;
+  RateLimit rate_limit = 9;
+  google.protobuf.Timestamp expires_at = 10;
+  bool active = 11;
+  google.protobuf.Timestamp created_at = 12;
+}
+
+message RevokeKeyRequest {
+  string id = 1;
+}
+
+message RevokeKeyResponse {
+  Key key = 1;
+}
+
+message GetKeyUsageRequest {
+  string id = 1;
+}
+
+message GetKeyUsageResponse {
+  string key_id = 1;
+  repeated BudgetUsage budgets = 2;
+  RateLimitUsage rate_limit = 3;
+}
+
+message BudgetUsage {
+  string id = 1;
+  double max_limit_usd = 2;
+  string reset_duration = 3;
+  double current_usage_usd = 4;
+  google.protobuf.Timestamp last_reset = 5;
+}
+
+message RateLimitUsage {
+  string id = 1;
+  int64 token_max_limit = 2;
+  int64 token_current_usage = 3;
+  int64 request_max_limit = 4;
+  int64 request_current_usage = 5;
+}
+
+message ListKeysRequest {}
+
+message ListKeysResponse {
+  repeated Key keys = 1;
+}
