@@ -542,7 +542,13 @@ func (s *HTTPServer) passthrough(w http.ResponseWriter, r *http.Request, provide
 		resp, bErr := b.Passthrough(ctx, provider, req)
 		if bErr != nil {
 			s.writeBifrostError(w, r, bErr, anthSurface)
-			s.tailFailure(r, bErr.EffectiveHTTPStatus(), "", bErr.GetErrorString())
+			return
+		}
+		if resp.StatusCode >= 400 {
+			// Bifrost returns the provider's 4xx/5xx as a response, not an error.
+			// Map it onto the Delos envelope rather than forwarding the raw body.
+			s.writeProviderErrorEnvelope(w, r, resp.StatusCode, string(provider),
+				passthroughErrorMessage(resp.Body), anthSurface)
 			return
 		}
 		if resp.PassthroughUsage != nil {
@@ -556,7 +562,6 @@ func (s *HTTPServer) passthrough(w http.ResponseWriter, r *http.Request, provide
 	stream, bErr := b.PassthroughStream(ctx, provider, req)
 	if bErr != nil {
 		s.writeBifrostError(w, r, bErr, anthSurface)
-		s.tailFailure(r, bErr.EffectiveHTTPStatus(), "", bErr.GetErrorString())
 		return
 	}
 
@@ -572,6 +577,11 @@ func (s *HTTPServer) passthrough(w http.ResponseWriter, r *http.Request, provide
 	resp := first.BifrostPassthroughResponse
 	if resp == nil {
 		http.Error(w, "passthrough stream returned empty first chunk", http.StatusBadGateway)
+		return
+	}
+	if resp.StatusCode >= 400 {
+		s.writeProviderErrorEnvelope(w, r, resp.StatusCode, string(provider),
+			passthroughErrorMessage(resp.Body), anthSurface)
 		return
 	}
 	var lastUsage *schemas.BifrostPassthroughUsage
@@ -789,23 +799,69 @@ func writeBifrostResponse(w http.ResponseWriter, status int, headers map[string]
 	_, _ = w.Write(body)
 }
 
-// writeBifrostError maps a Bifrost error onto the surface's error envelope.
+// writeBifrostError maps a Bifrost error onto the surface's error envelope,
+// matching the legacy translators' provider-error contract (note 0001: error
+// shapes keep Delos behavior).
 func (s *HTTPServer) writeBifrostError(w http.ResponseWriter, r *http.Request, bErr *schemas.BifrostError, anthSurface bool) {
-	status := bErr.EffectiveHTTPStatus()
-	msg := bErr.GetErrorString()
-	if anthSurface {
-		typ := "api_error"
-		if status < 500 {
-			typ = "invalid_request_error"
+	raw := 0
+	provider := ""
+	msg := ""
+	if bErr != nil {
+		if bErr.StatusCode != nil {
+			raw = *bErr.StatusCode
 		}
-		s.writeAnthropicError(w, r, status, typ, msg)
+		provider = string(bErr.ExtraFields.Provider)
+		msg = bErr.GetErrorString()
+	}
+	if provider == "" {
+		if anthSurface {
+			provider = "anthropic"
+		} else {
+			provider = "openai"
+		}
+	}
+	s.writeProviderErrorEnvelope(w, r, raw, provider, msg, anthSurface)
+}
+
+// writeProviderErrorEnvelope maps a provider failure (raw upstream status,
+// provider name, upstream message) onto the surface's error envelope exactly
+// as the legacy translators do: OpenAI gets code "provider_error"; Anthropic
+// maps 429->rate_limit_error and 4xx->invalid_request_error; both prefix the
+// message "provider <name>: ".
+func (s *HTTPServer) writeProviderErrorEnvelope(w http.ResponseWriter, r *http.Request, rawStatus int, provider, msg string, anthSurface bool) {
+	if anthSurface {
+		status, typ := http.StatusBadGateway, "api_error"
+		switch rawStatus {
+		case http.StatusTooManyRequests:
+			status, typ = http.StatusTooManyRequests, "rate_limit_error"
+		case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity:
+			status, typ = http.StatusBadRequest, "invalid_request_error"
+		}
+		s.writeAnthropicError(w, r, status, typ, fmt.Sprintf("provider %s: %s", provider, msg))
 		return
 	}
-	code := "provider_error"
-	if status < 500 {
-		code = "invalid_request"
+	status := http.StatusBadGateway
+	switch rawStatus {
+	case http.StatusTooManyRequests:
+		status = http.StatusTooManyRequests
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity:
+		status = http.StatusBadRequest
 	}
-	s.writeOpenAIError(w, r, status, code, msg)
+	s.writeOpenAIError(w, r, status, "provider_error", fmt.Sprintf("provider %s: %s", provider, msg))
+}
+
+// passthroughErrorMessage extracts the provider's error message from a raw
+// error body. Both OpenAI and Anthropic wrap it in error.message.
+func passthroughErrorMessage(body []byte) string {
+	var m struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &m); err == nil && m.Error.Message != "" {
+		return m.Error.Message
+	}
+	return strings.TrimSpace(string(body))
 }
 
 func deref(s *string) string {
