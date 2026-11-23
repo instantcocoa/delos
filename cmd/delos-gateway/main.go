@@ -252,6 +252,22 @@ func run() error {
 
 	api := runtime.NewHTTPServer(svc, logger, apiOpts...)
 
+	// Bifrost spike (D0): when built with -tags=bifrost, /v1/messages and the
+	// OpenAI-compatible passthrough routes are served by Bifrost core; every
+	// other path falls through to the Delos runtime handler.
+	handler := http.Handler(api)
+	if bh := bifrostHandler(); bh != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/v1/messages", bh)
+		mux.Handle("/v1/messages/", bh)
+		mux.Handle("/v1/chat/completions", bh)
+		mux.Handle("/v1/responses", bh)
+		mux.Handle("/v1/responses/", bh)
+		mux.Handle("/", api)
+		handler = mux
+		logger.Info("bifrost passthrough enabled (spike, -tags=bifrost)")
+	}
+
 	// ---- exposure check: never front provider credentials anonymously ----
 	//
 	// With no key store every /v1 request is accepted, so a gateway holding
@@ -300,7 +316,7 @@ func run() error {
 
 	server := &http.Server{
 		Addr:    bind.Addr(),
-		Handler: api,
+		Handler: handler,
 		// WriteTimeout is 0 on purpose: it is a deadline on the whole
 		// response, and SSE completions legitimately stream for minutes.
 		// DELOS_REQUEST_TIMEOUT (default 5m) is the real per-request budget,
