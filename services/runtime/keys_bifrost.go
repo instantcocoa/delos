@@ -368,6 +368,10 @@ func (s *BifrostKeyStore) MintKey(ctx context.Context, spec MintSpec) (string, *
 	}
 	keyID := uuid.NewString()
 	now := time.Now().UTC()
+	name := spec.Name
+	if name == "" {
+		name = "key-" + keyID[:8]
+	}
 
 	md, err := metadataFor(spec)
 	if err != nil {
@@ -393,15 +397,15 @@ func (s *BifrostKeyStore) MintKey(ctx context.Context, spec MintSpec) (string, *
 	// leaves an inactive key (never a live key with no budgets).
 	active := false
 	vk := &tables.TableVirtualKey{
-		ID:               keyID,
-		Name:             spec.Name,
-		Value:            *schemas.NewSecretVar(secret),
-		IsActive:         &active,
+		ID:                keyID,
+		Name:              name,
+		Value:             *schemas.NewSecretVar(secret),
+		IsActive:          &active,
 		AllowAllProviders: len(spec.Models) == 0,
-		RateLimitID:      rateLimitID,
-		Metadata:         md,
-		CreatedAt:        now,
-		UpdatedAt:        now,
+		RateLimitID:       rateLimitID,
+		Metadata:          md,
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 	if !spec.ExpiresAt.IsZero() {
 		exp := spec.ExpiresAt.UTC()
@@ -427,7 +431,13 @@ func (s *BifrostKeyStore) MintKey(ctx context.Context, spec MintSpec) (string, *
 		return "", nil, fmt.Errorf("activating virtual key: %w", err)
 	}
 
-	return secret, tableToRecord(vk), nil
+	// Re-read the persisted row so the returned record carries the budgets and
+	// rate limit (preloaded by GetVirtualKey), not just the in-memory struct.
+	persisted, err := s.cs.GetVirtualKey(ctx, keyID)
+	if err != nil {
+		return "", nil, fmt.Errorf("reading minted key: %w", err)
+	}
+	return secret, tableToRecord(persisted), nil
 }
 
 func (s *BifrostKeyStore) buildBudget(keyID string, spec BudgetSpec, now time.Time) (*tables.TableBudget, error) {

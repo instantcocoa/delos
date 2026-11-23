@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -94,6 +95,23 @@ func MigrateLegacyKeys(ctx context.Context, db *sql.DB, cs configstore.ConfigSto
 		}
 		if done {
 			continue
+		}
+
+		// Idempotency beyond the ledger: if a previous attempt created the
+		// governance key but died before recording the ledger row, do not
+		// collide on the deterministic IDs below; treat it as done.
+		if _, err := cs.GetVirtualKey(ctx, k.id); err == nil {
+			if _, err := db.ExecContext(ctx, `
+				INSERT INTO key_migration (old_id, old_prefix, new_id, note)
+				VALUES ($1, $2, $3, $4) ON CONFLICT (old_id) DO NOTHING`,
+				k.id, k.prefix, k.id,
+				"migrated dk_ key; plaintext secret unrecoverable (argon2id), created inactive",
+			); err != nil {
+				return migrated, fmt.Errorf("recording key_migration row: %w", err)
+			}
+			continue
+		} else if !errors.Is(err, configstore.ErrNotFound) {
+			return migrated, fmt.Errorf("checking governance key %s: %w", k.id, err)
 		}
 
 		name := k.name
