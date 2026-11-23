@@ -66,6 +66,14 @@ skipped test still reports `ok`. To see what actually ran, use `go test -v`
 and look for `--- SKIP`. CI creates that database, so the database paths are
 exercised there even when they skip locally.
 
+Local skips are tolerated on purpose. CI does not tolerate them: the `test`
+job runs `go run ./tests/skipguard` with `DELOS_TEST_REQUIRE_DB=1`, which
+wraps `go test -json` and fails the build if any test in a Postgres-backed
+package (`pkg/database`, `services/prompt`, `services/runtime`) skips — a
+skip there in CI means Postgres was missing and the database path silently
+did not run. To get the same gate locally (e.g. with `make test-deps-up`
+running), use `make test-require-db`.
+
 ### 2. Integration Tests (`make test-integration`)
 
 Tests that require the running stack. Built with the `integration` build tag; they hit the gateway over HTTP and the control plane over gRPC. Run `./tests/integration/run.sh --help` for the runner's options.
