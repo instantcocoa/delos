@@ -1,6 +1,6 @@
 # 0001 — Gateway HTTP surfaces on Bifrost (D1)
 
-Status: draft — awaiting R-REVIEW approval. Teams: DL-G (implementation), DL-T (tests), LEAD (this note). Surface: **wire behavior**. Gaps closed: 1, 2, 3, 5, 6.
+Status: **approved** (R-REVIEW, 2026-11-23). Teams: DL-G (implementation), DL-T (tests), LEAD (this note). Surface: **wire behavior**. Gaps closed: 1, 2, 3, 5, 6.
 
 ## Decision
 
@@ -35,7 +35,7 @@ Per the 2026-11-23 decision, `delos-gateway` embeds Bifrost's Go core. D0 confir
 
 ## Toolchain (gap 6)
 
-Go 1.27.4 and `CGO_ENABLED=0` builds on all four release targets landed in D0 (DL-S). Remaining before D1 exit: generate the real syft SBOM diff, add Bifrost's Apache-2.0 NOTICE/attribution, and record the binary-size change (tracked in `docs/plans/spike-report-d0.md` §6). The CI/release/nightly `GO_VERSION` pins are bumped to 1.27.4 (DL-T).
+Go 1.27.4 and `CGO_ENABLED=0` builds on all four release targets landed in D0 (DL-S). Remaining before D1 exit: generate the real syft SBOM diff, add Bifrost's Apache-2.0 NOTICE/attribution, and record the binary-size change (tracked in `docs/plans/spike-report-d0.md` §6). The CI/release/nightly `GO_VERSION` pins have been bumped to 1.27.4 (DL-T, commit `e188098`).
 
 ## Rollout
 

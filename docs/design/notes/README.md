@@ -7,4 +7,4 @@ team, the affected surface, and its status.
 
 | # | Title | Surface | Team | Status |
 | --- | --- | --- | --- | --- |
-| 0001 | Gateway HTTP surfaces on Bifrost (D1) | wire behavior | DL-G | draft — awaiting R-REVIEW |
+| 0001 | Gateway HTTP surfaces on Bifrost (D1) | wire behavior | DL-G | **approved** (R-REVIEW) |
