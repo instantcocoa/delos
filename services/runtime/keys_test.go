@@ -114,7 +114,7 @@ func TestAuthenticator(t *testing.T) {
 // authTestServer builds an HTTP server with key enforcement and one provider.
 func authTestServer(t *testing.T, store KeyStore) *HTTPServer {
 	t.Helper()
-	return NewHTTPServer(newTestService(chatProvider()), newTestLogger(), WithKeyStore(store))
+	return NewLegacyHTTPServer(newTestService(chatProvider()), newTestLogger(), WithKeyStore(store))
 }
 
 func TestHTTPAuthRequired(t *testing.T) {
@@ -177,7 +177,7 @@ func TestHTTPBudgetExceeded(t *testing.T) {
 
 	provider := chatProvider()
 	// rebuild server with a provider we can observe
-	srv = NewHTTPServer(newTestService(provider), newTestLogger(), WithKeyStore(store))
+	srv = NewLegacyHTTPServer(newTestService(provider), newTestLogger(), WithKeyStore(store))
 
 	req := jsonReq(http.MethodPost, "/v1/chat/completions",
 		`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
