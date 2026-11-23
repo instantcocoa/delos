@@ -2,6 +2,7 @@
 .PHONY: test test-unit test-integration test-integration-full test-ollama test-coverage
 .PHONY: test-deps-up test-deps-wait
 .PHONY: conformance conformance-record bench soak compat vulncheck
+.PHONY: test-agent
 .PHONY: lint proto proto-lint proto-breaking proto-format docs-test
 .PHONY: up up-all down logs clean tools help
 .PHONY: run-gateway run-control-plane run-all stop-all
@@ -97,6 +98,11 @@ soak:
 # anthropic (Python) clients against a real gateway over a mock upstream.
 compat:
 	@./tests/compat/run.sh
+
+# Agent end-to-end: unmodified Claude Code + Codex, headless, against a real
+# gateway over a mock upstream (live/record half). Cassette replay is keyless.
+test-agent:
+	@./tests/agent/run.sh
 
 # Supply-chain hygiene: report known vulnerabilities in our dependency graph.
 vulncheck:
@@ -252,6 +258,7 @@ help:
 	@echo "  make bench              Gateway overhead benchmark (p99 < 5ms gate)"
 	@echo "  make soak               10s soak: goroutine and FD leak check"
 	@echo "  make compat             Official openai/anthropic clients vs the gateway"
+	@echo "  make test-agent         Headless Claude Code + Codex vs the gateway"
 	@echo "  make vulncheck          govulncheck over the module"
 	@echo ""
 	@echo "Proto/Lint:"
