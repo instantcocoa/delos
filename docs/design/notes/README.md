@@ -7,4 +7,4 @@ team, the affected surface, and its status.
 
 | # | Title | Surface | Team | Status |
 | --- | --- | --- | --- | --- |
-| — | (none yet — D0 spike lands no wire/schema/config change) | — | — | — |
+| 0001 | Gateway HTTP surfaces on Bifrost (D1) | wire behavior | DL-G | draft — awaiting R-REVIEW |

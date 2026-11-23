@@ -6,17 +6,17 @@ Teams, ownership, and branches:
 
 | Team | Owns | Branch | Status |
 | --- | --- | --- | --- |
-| LEAD | Plan, task list, gates, reports (`docs/plans/`, `docs/design/notes/` index) | `team/lead/d0` | active — at gate G0 |
+| LEAD | Plan, task list, gates, reports (`docs/plans/`, `docs/design/notes/` index) | `team/lead/d0` | active — D1 kickoff |
 | DL-S | `go.mod`, `go.sum`, `.goreleaser.yaml`, `Dockerfile*`, `cmd/delos-gateway/main.go` wiring | `team/dl-s/d0-spike` | **D0 done** (`24c7844`) |
-| DL-T | `tests/`, `Makefile` (test/bench targets), `.github/workflows/` | `team/dl-t/d0-baseline` | **D0 done** (`677650a`) |
-| DL-G | `services/runtime/` except keys, `pkg/semconv/` | `team/dl-g/<topic>` | D1 |
-| DL-K | `services/runtime/keys*`, `proto/keys/v1`, `cli/cmd/key*`, key migrations | `team/dl-k/<topic>` | D2 |
-| R-REVIEW | Review every PR against the brief | — | at PR time |
+| DL-T | `tests/`, `Makefile` (test/bench targets), `.github/workflows/` | `team/dl-t/d0-baseline` | **D0 done** (`677650a`); GO_VERSION follow-up routed |
+| DL-G | `services/runtime/` except keys, `pkg/semconv/` | `team/dl-g/<topic>` | D1 — pending R-REVIEW note approval |
+| DL-K | `services/runtime/keys*`, `proto/keys/v1`, `cli/cmd/key*`, key migrations | `team/dl-k/<topic>` | D2 — pending |
+| R-REVIEW | Review every PR against the brief | — | reviewing note 0001 now |
 
 ## Milestones
 
-- **D0** — DL-T ∥ DL-S: **done**. **Gate G0: awaiting Eric's approval** (report: `docs/plans/spike-report-d0.md`).
-- **D1** — DL-G + DL-T (gaps 1, 2, 3, 5, 6). Not started (blocked on G0).
+- **D0** — DL-T ∥ DL-S: **done**. **Gate G0: approved by Eric** (report: `docs/plans/spike-report-d0.md`).
+- **D1** — DL-G + DL-T (gaps 1, 2, 3, 5, 6). Kickoff: design note 0001 drafted (`docs/design/notes/0001-gateway-on-bifrost.md`), R-REVIEW reviewing; DL-T GO_VERSION bump routed.
 - **D2** — DL-K + DL-T (gap 4). Gate G1 after D2.
 - **D3–D5** — not started this round.
 
@@ -34,13 +34,19 @@ Teams, ownership, and branches:
 - [x] `/v1/messages` baseline test (`tests/conformance/messages_fidelity_test.go`).
 - [x] Pre-Bifrost bench baseline: p99 **2.36 ms** (PASS vs 5 ms).
 
-## D0 follow-ups (before or during D1)
+## D0 follow-ups
 
-- [ ] **DL-T**: bump `GO_VERSION` `1.25` → `1.27.4` in `.github/workflows/ci.yaml` + `release.yaml` (DL-S's go.mod bump requires it; DL-S can't touch DL-T's files).
-- [ ] **DL-S** (needs valid `sk-ant-` key): finish live catalog-price ≤1% check + a real-provider headless turn.
-- [ ] **DL-S**: generate a real syft SBOM diff (tooling not installed; currently approximated via `go list -m all` + license scan).
+- [ ] **DL-T (routed)**: bump `GO_VERSION` `1.25` → `1.27.4` in `.github/workflows/{ci,release,nightly}.yaml`.
+- [ ] **DL-S** (needs valid `sk-ant-` key): finish live catalog-price ≤1% check + a real-provider headless turn — fold into D1 exit checks.
+- [ ] **DL-S**: generate a real syft SBOM diff (tooling not installed; currently approximated).
 - [ ] **LEAD**: drop `D0_SPIKE_NOTES.md` / `D0_BASELINE_NOTES.md` scratch files from any merge.
-- [ ] Decide branch push/PR policy at G0.
+
+## D1 kickoff (gaps 1, 2, 3, 5, 6)
+
+- [ ] **R-REVIEW**: approve design note 0001 (in flight).
+- [ ] **LEAD**: on approval, launch DL-G (gateway on Bifrost) and DL-K (D2 keys) in parallel, DL-T writing suites alongside.
+- [ ] **LEAD**: decide D1 integration base (stack on `team/dl-s/d0-spike` go.mod work) and record it here.
+- Keys needed later (not now): valid `ANTHROPIC_API_KEY` (`sk-ant-…`) and `OPENAI_API_KEY` for D1 exit checks (live Claude Code/Codex sessions, ≤1% cost). Cassettes/mocks run keyless.
 
 ## Rules every team follows
 - Branch from `d0-baseline`; commit on `team/<id>/<topic>`; do **not** push (LEAD pushes after review).
@@ -50,5 +56,5 @@ Teams, ownership, and branches:
 - Where this document and the code disagree, the code wins; record the difference.
 
 ## Gates
-- **G0** — LEAD presents the D0 spike report to Eric; wait for approval before D1. (current)
+- **G0** — approved (Eric).
 - **G1** — after D2; LEAD stops and reports.
