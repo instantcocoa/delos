@@ -127,9 +127,19 @@ func baseURLFor(providerKey schemas.ModelProvider) string {
 }
 
 func (bifrostAccount) GetConfigForProvider(providerKey schemas.ModelProvider) (*schemas.ProviderConfig, error) {
-	cfg := &schemas.ProviderConfig{
-		NetworkConfig: schemas.NetworkConfig{BaseURL: baseURLFor(providerKey)},
+	nc := schemas.NetworkConfig{BaseURL: baseURLFor(providerKey)}
+	if providerKey == schemas.Anthropic {
+		// User-scoped keys (sk-ant-usr-…) are not bound to a workspace, so
+		// api.anthropic.com requires the anthropic-workspace-id header on every
+		// call. Workspace-scoped keys don't need it; the header is harmless and
+		// only added when the operator sets it.
+		if ws := os.Getenv("DELOS_BIFROST_ANTHROPIC_WORKSPACE_ID"); ws != "" {
+			nc.ExtraHeaders = map[string]schemas.SecretVar{
+				"anthropic-workspace-id": *schemas.NewSecretVar(ws),
+			}
+		}
 	}
+	cfg := &schemas.ProviderConfig{NetworkConfig: nc}
 	cfg.CheckAndSetDefaults()
 	return cfg, nil
 }
