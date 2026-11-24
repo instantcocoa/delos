@@ -57,12 +57,18 @@ Test evidence (default = Bifrost path, `CGO_ENABLED=0`):
 - **Streaming byte order**: Bifrost passthrough does not re-sort SSE keys the way the legacy translator did; note 0001 allows this on passthrough. **Kept: passthrough is byte-faithful.**
 - **Retry count**: Bifrost owns retries; the 429 retry-count expectation is dropped on the Bifrost side. **Kept: Bifrost behavior.**
 
-## 5. Open questions for Eric
+## 5. Decisions and remaining input
 
-1. **`dk_` migration sign-off (gate condition):** migrated keys become inactive (argon2id secret unrecoverable) and must be re-minted via the hub. Approve "migrate to inactive + ledger", or keep the legacy argon2id path for one release? (note 0002, Open question 2.)
-2. **Live provider keys:** the `sk-ant-oat01-…` key returns 401 from api.anthropic.com, and the env `OPENAI_API_KEY` also 401s at OpenAI. Live Claude Code/Codex end-to-end + ≤1% cost checks are blocked on valid `ANTHROPIC_API_KEY` (`sk-ant-…`) and `OPENAI_API_KEY`. Everything else is proven keyless (cassettes + mock upstream).
-3. **PR shape:** I opened one integration PR (#13, draft) covering gaps 1–6 rather than one PR per gap. Split, or review as-is?
-4. **Open decisions from the brief still unresolved:** Bifrost version policy (recommend monthly upgrade-gate PR), semantic cache (off until agent suites green), spans via OTLP, transcript content = `(session_id, seq)` refs only, budget authority (Delos refuses model spend).
+Decided (Eric delegated to LEAD, 2026-11-24):
+
+1. **`dk_` migration** — migrate to inactive + ledger (option a); re-mint via the hub. Non-destructive; rollback clean.
+2. **PR shape** — single integrated PR #13; #10–#12 closed.
+3. **OpenAI key** — skipped; Codex is proven keyless (live Codex session deferred).
+4. **Policy defaults** — Bifrost upgraded monthly via an upgrade-gate PR; semantic cache off until agent suites are green; spans via OTLP; transcript content = `(session_id, seq)` refs only; Delos refuses model spend, the hub refuses compute.
+
+Remaining input (only this):
+
+- **Anthropic workspace ID** (or a workspace-scoped key). The `sk-ant-usr-…` key is **valid but user-scoped**, so api.anthropic.com requires an `anthropic-workspace-id` header; the org/account UUIDs in the local Claude config are not valid workspace IDs. Need either the workspace ID, or a workspace-scoped `sk-ant-api03-…` key (which needs no header).
 
 ## Remaining after sign-off
 
