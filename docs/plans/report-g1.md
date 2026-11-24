@@ -24,6 +24,7 @@ Test evidence (default = Bifrost path, `CGO_ENABLED=0`):
 - `go vet ./...` → exit 0. `go build ./...` and `go build -tags=delos_translators ./...` → exit 0.
 - `make bench` (Bifrost inside): p99 overhead **1.105 ms / 1.418 ms** (gate 5 ms) — below the 2.36 ms pre-Bifrost baseline.
 - Keyless agent e2e (`DELOS_AGENT_E2E=1 tests/agent/run.sh`, mock upstream): **both Claude Code and Codex complete end-to-end** through the integrated gateway.
+- **Live Claude Code session through Delos** (real api.anthropic.com, user-scoped key + `DELOS_BIFROST_ANTHROPIC_WORKSPACE_ID`): completes (`AGENT-LIVE-OK`, exit 0), and **prompt caching hits** — turn 2 reports `cache_read_input_tokens: 2862` after turn 1's `cache_creation_input_tokens: 2862`.
 - Revoke/expiry: per-request Postgres re-check of `is_active`/`expires_at` (no cache), `services/runtime/bifrost_auth.go` → well under the 1 s target.
 
 ## 2. Delegation table — D1/D2 rows
@@ -70,6 +71,8 @@ Remaining input (only this):
 
 - **Anthropic workspace ID** (or a workspace-scoped key). The `sk-ant-usr-…` key is **valid but user-scoped**, so api.anthropic.com requires an `anthropic-workspace-id` header; the org/account UUIDs in the local Claude config are not valid workspace IDs. Need either the workspace ID, or a workspace-scoped `sk-ant-api03-…` key (which needs no header).
 
+**Resolved (2026-11-24):** workspace ID `wrkspc_011iNZJvEBKYj32usSyoBbCn` works; the gateway now sends it via a new env var `DELOS_BIFROST_ANTHROPIC_WORKSPACE_ID` (commit `ade200e`). Live Claude Code session + prompt caching verified. Live Codex remains deferred (OpenAI key skipped).
+
 ## Remaining after sign-off
 
-- Live end-to-end + cost accuracy once keys land; full syft SBOM diff (DL-S follow-up); Bifrost upgrade-gate + nightly re-record CI (DL-T, D0 follow-ups). D3–D5 intentionally not started.
+- Full syft SBOM diff (DL-S follow-up); Bifrost upgrade-gate + nightly re-record CI (DL-T, D0 follow-ups); live Codex session (optional — OpenAI key skipped); exact dollar-cost-to-provider-invoice comparison (usage mapping already asserted by the cassettes and live usage incl. cache tokens). D3–D5 intentionally not started.
