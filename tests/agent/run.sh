@@ -86,6 +86,9 @@ echo "==> Starting delos-gateway on :$GATEWAY_PORT"
     DELOS_COMPAT_BASE_URL="$MOCK_URL/v1" \
     ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-mock-key}" \
     ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-$MOCK_URL}" \
+    OPENAI_API_KEY="${OPENAI_API_KEY:-mock-key}" \
+    DELOS_BIFROST_ANTHROPIC_BASE_URL="${DELOS_BIFROST_ANTHROPIC_BASE_URL:-$MOCK_URL}" \
+    DELOS_BIFROST_OPENAI_BASE_URL="${DELOS_BIFROST_OPENAI_BASE_URL:-$MOCK_URL/v1}" \
     DELOS_CACHE=off \
     DELOS_STORAGE_BACKEND=memory \
     DELOS_ALLOW_UNAUTHENTICATED=true \
@@ -114,9 +117,20 @@ run_agent() {
     # in the working directory and the run is fully non-interactive.
     local task_dir="$WORKDIR/$name-task"
     mkdir -p "$task_dir"
-    if ! "$cli" -p "create a file named done.txt containing the word ok" \
-        --dangerously-skip-permissions \
-        --output-format json > "$WORKDIR/$name.log" 2>&1; then
+    local prompt="create a file named done.txt containing the word ok"
+    local -a cmd
+    if [[ "$cli" == "codex" ]]; then
+        export CODEX_HOME="$WORKDIR/codex-home"
+        mkdir -p "$CODEX_HOME"
+        printf 'model = "gpt-4o"\nmodel_provider = "delos"\n\n[model_providers.delos]\nname = "delos"\nbase_url = "%s/v1"\nenv_key = "OPENAI_API_KEY"\nwire_api = "responses"\n' "$GATEWAY_URL" > "$CODEX_HOME/config.toml"
+        export OPENAI_API_KEY="mock-key"
+        cmd=(codex exec "$prompt" --dangerously-bypass-approvals-and-sandbox)
+    else
+        export ANTHROPIC_BASE_URL="$GATEWAY_URL"
+        export ANTHROPIC_API_KEY="mock-key"
+        cmd=("$cli" -p "$prompt" --model claude-sonnet-4-5 --dangerously-skip-permissions --output-format json)
+    fi
+    if ! "${cmd[@]}" > "$WORKDIR/$name.log" 2>&1; then
         echo "$name session FAILED" >&2
         tail -n 30 "$WORKDIR/$name.log" >&2 || true
         status=1
