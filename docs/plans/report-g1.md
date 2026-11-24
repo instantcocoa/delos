@@ -23,6 +23,7 @@ Test evidence (default = Bifrost path, `CGO_ENABLED=0`):
 - `go test ./tests/conformance/ -run TestAnthropicMessagesFidelityBifrost -count=1` → **5/5** (thinking / cache_control / metadata / document / anthropic-beta pass through).
 - `go vet ./...` → exit 0. `go build ./...` and `go build -tags=delos_translators ./...` → exit 0.
 - `make bench` (Bifrost inside): p99 overhead **1.105 ms / 1.418 ms** (gate 5 ms) — below the 2.36 ms pre-Bifrost baseline.
+- Keyless agent e2e (`DELOS_AGENT_E2E=1 tests/agent/run.sh`, mock upstream): **Claude Code completes end-to-end** through the integrated gateway; **Codex correctly targets and routes through the gateway** (its remaining 404 is a mock `/v1/responses` path convention vs Bifrost's upstream URL, not a gateway defect).
 - Revoke/expiry: per-request Postgres re-check of `is_active`/`expires_at` (no cache), `services/runtime/bifrost_auth.go` → well under the 1 s target.
 
 ## 2. Delegation table — D1/D2 rows
@@ -65,4 +66,4 @@ Test evidence (default = Bifrost path, `CGO_ENABLED=0`):
 
 ## Remaining after sign-off
 
-- Live end-to-end + cost accuracy once keys land; full syft SBOM diff (DL-S follow-up); Bifrost upgrade-gate + nightly re-record CI (DL-T, D0 follow-ups). D3–D5 intentionally not started.
+- Live end-to-end + cost accuracy once keys land; full syft SBOM diff (DL-S follow-up); Bifrost upgrade-gate + nightly re-record CI (DL-T, D0 follow-ups). Codex keyless e2e: align `tests/compat/mockupstream`'s `/v1/responses` path with Bifrost's Responses upstream URL (DL-T), then the mock agent e2e is 2/2. D3–D5 intentionally not started.
