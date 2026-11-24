@@ -749,13 +749,6 @@ func encodeFloat32Base64(values []float32) string {
 
 // ---- models ----
 
-type modelObject struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
-}
-
 // handleListModels serves GET /v1/models.
 //
 // Discovery is authenticated like every other /v1 endpoint: the listing names
@@ -804,29 +797,4 @@ func (s *HTTPServer) handleGetModel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.writeOpenAIError(w, r, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q does not exist", want))
-}
-
-// withKey attaches the authenticated virtual key to the request context.
-// Handlers receive the key as a value, but the error-envelope writers do not:
-// they recover it from the context to attribute the tail event to the tenant
-// that made the request. Without this, every failed request belongs to nobody
-// and is invisible to the one subscriber entitled to see it.
-func withKey(r *http.Request, key *VirtualKey) *http.Request {
-	if key == nil {
-		return r
-	}
-	return r.WithContext(WithAuthedKey(r.Context(), key))
-}
-
-// keyAllowsModel reports whether a key may see or use a model. A nil key is
-// dev mode (no virtual keys configured), which scopes nothing.
-func keyAllowsModel(key *VirtualKey, model string) bool {
-	return key == nil || key.AllowsModel(model)
-}
-
-func orDefault(v, fallback string) string {
-	if v == "" {
-		return fallback
-	}
-	return v
 }

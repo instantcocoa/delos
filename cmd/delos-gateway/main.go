@@ -205,7 +205,24 @@ func run() error {
 			return fmt.Errorf("failed to apply gateway migrations: %w", err)
 		}
 		apiOpts = append(apiOpts, runtime.WithKeyStore(runtime.NewPostgresKeyStore(db.DB)))
-		logger.Info("virtual keys enforced (postgres)")
+		// Bifrost governance keys (the default path): every request re-checks
+		// is_active/expires_at against Postgres, so revoke/expiry propagates on
+		// the next request on every replica. The Bifrost config store opens its
+		// own pool against the same database.
+		bifrostKeys, err := runtime.OpenBifrostKeyStore(ctx, runtime.BifrostDBConfig{
+			Host:     cfg.DBHost,
+			Port:     strconv.Itoa(cfg.DBPort),
+			User:     cfg.DBUser,
+			Password: cfg.DBPassword,
+			DBName:   cfg.DBName,
+			SSLMode:  cfg.DBSSLMode,
+		}, logger)
+		if err != nil {
+			return fmt.Errorf("failed to open Bifrost key store: %w", err)
+		}
+		defer bifrostKeys.Close(ctx)
+		apiOpts = append(apiOpts, runtime.WithBifrostKeyStore(bifrostKeys))
+		logger.Info("virtual keys enforced (postgres + bifrost governance)")
 	} else {
 		logger.Info("dev mode: no database configured, virtual keys are NOT enforced - any api_key (e.g. \"delos-dev\") is accepted")
 	}
@@ -251,6 +268,22 @@ func run() error {
 	}
 
 	api := runtime.NewHTTPServer(svc, logger, apiOpts...)
+
+	// Bifrost spike (D0): when built with -tags=bifrost, /v1/messages and the
+	// OpenAI-compatible passthrough routes are served by Bifrost core; every
+	// other path falls through to the Delos runtime handler.
+	handler := http.Handler(api)
+	if bh := bifrostHandler(); bh != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/v1/messages", bh)
+		mux.Handle("/v1/messages/", bh)
+		mux.Handle("/v1/chat/completions", bh)
+		mux.Handle("/v1/responses", bh)
+		mux.Handle("/v1/responses/", bh)
+		mux.Handle("/", api)
+		handler = mux
+		logger.Info("bifrost passthrough enabled (spike, -tags=bifrost)")
+	}
 
 	// ---- exposure check: never front provider credentials anonymously ----
 	//
@@ -300,7 +333,7 @@ func run() error {
 
 	server := &http.Server{
 		Addr:    bind.Addr(),
-		Handler: api,
+		Handler: handler,
 		// WriteTimeout is 0 on purpose: it is a deadline on the whole
 		// response, and SSE completions legitimately stream for minutes.
 		// DELOS_REQUEST_TIMEOUT (default 5m) is the real per-request budget,

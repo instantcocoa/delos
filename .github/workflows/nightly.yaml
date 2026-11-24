@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: '1.25'
+  GO_VERSION: '1.27.4'
   CGO_ENABLED: '0'
 
 # Every `uses:` is pinned to a full commit SHA; the trailing comment records

@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 env:
-  GO_VERSION: '1.25'
+  GO_VERSION: '1.27.4'
   BUF_VERSION: '1.47.2'
   # Both binaries ship CGO-free; build and test that way everywhere. The one
   # exception is the -race step below, which requires cgo.
@@ -155,8 +155,17 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      # The gateway does not depend on generated proto code, so this job needs
-      # no buf step: it replays cassettes through services/runtime directly.
+      - name: Setup Buf
+        uses: bufbuild/buf-setup-action@9672cee01808979ea1249f81d6d321217b9a10f6 # v1.47.2
+        with:
+          version: ${{ env.BUF_VERSION }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # services/runtime now imports gen/go/keys/v1 (the KeyService), so the
+      # generated proto code must exist before this job builds the gateway.
+      - name: Generate proto code
+        run: buf generate
+
       - name: Replay provider cassettes
         run: go test ./tests/conformance/ -count=1 -v
 
@@ -195,6 +204,15 @@ jobs:
       - name: Build binaries
         run: make build
 
+      # Bifrost's config store (keys) lives in its own database so Bifrost's
+      # migrations cannot collide with Delos's tables. The postgres service
+      # only creates `delos`, so create `delos_bifrost` here.
+      - name: Create Bifrost config-store database
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+          PGPASSWORD=delos psql -h localhost -U delos -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'delos_bifrost'" | grep -q 1 || \
+            PGPASSWORD=delos psql -h localhost -U delos -d postgres -c "CREATE DATABASE delos_bifrost"
+
       # The suite exercises both binaries over their real network surfaces,
       # so they run as processes here rather than in-process fixtures.
       - name: Start the stack
@@ -229,6 +247,16 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup Buf
+        uses: bufbuild/buf-setup-action@9672cee01808979ea1249f81d6d321217b9a10f6 # v1.47.2
+        with:
+          version: ${{ env.BUF_VERSION }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # tests/compat/run.sh builds the gateway, which imports gen/go/keys/v1.
+      - name: Generate proto code
+        run: buf generate
 
       - name: Set up uv (Python clients)
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5

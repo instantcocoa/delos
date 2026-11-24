@@ -36,30 +36,47 @@ func presentedKey(r *http.Request) string {
 
 // authenticate resolves the request's key. In dev mode it returns (nil, true).
 func (s *HTTPServer) authenticate(w http.ResponseWriter, r *http.Request, anthSurface bool) (*VirtualKey, bool) {
+	// Bifrost governance keys (the default path): every request re-reads the
+	// key's is_active/expires_at from Postgres, so revoke/expiry propagates on
+	// the next request on every replica (one DB round-trip, far under 1s).
+	if s.bifrostKeys != nil && useBifrostPath() {
+		rec, err := s.bifrostKeys.Authenticate(r.Context(), presentedKey(r))
+		if err != nil {
+			s.writeAuthError(w, r, anthSurface, err)
+			return nil, false
+		}
+		*r = *withBifrostAttribution(r, rec)
+		// Map to the legacy VirtualKey shape for model scope; budgets and rate
+		// limits are enforced by Bifrost governance, not the Delos ledger.
+		return &VirtualKey{ID: rec.ID, Name: rec.Name, Models: rec.Models}, true
+	}
 	if s.auth == nil {
 		return nil, true
 	}
 	key, err := s.auth.Authenticate(r.Context(), presentedKey(r))
 	if err != nil {
-		// "We could not check your key" is not "your key is invalid". Telling
-		// a caller with a perfectly good key that it is invalid, because
-		// Postgres hiccuped, sends them rotating credentials to fix an outage
-		// on our side. It is a 503, and it is retryable.
-		status, code, anthCode := http.StatusUnauthorized, "invalid_api_key", "authentication_error"
-		msg := "invalid or missing API key; pass a Delos virtual key as a Bearer token or x-api-key header"
-		if errors.Is(err, ErrKeyStoreUnavailable) {
-			status, code, anthCode = http.StatusServiceUnavailable, "key_store_unavailable", "api_error"
-			msg = "could not verify the API key: the key store is unavailable; retry shortly"
-			s.logger.ErrorContext(r.Context(), "key verification unavailable", "error", err)
-		}
-		if anthSurface {
-			s.writeAnthropicError(w, r, status, anthCode, msg)
-		} else {
-			s.writeOpenAIError(w, r, status, code, msg)
-		}
+		s.writeAuthError(w, r, anthSurface, err)
 		return nil, false
 	}
 	return key, true
+}
+
+// writeAuthError maps an authentication failure onto the surface's envelope.
+// "We could not check your key" is not "your key is invalid": a Postgres blip
+// is a retryable 503, not a 401 telling the caller to rotate a good credential.
+func (s *HTTPServer) writeAuthError(w http.ResponseWriter, r *http.Request, anthSurface bool, err error) {
+	status, code, anthCode := http.StatusUnauthorized, "invalid_api_key", "authentication_error"
+	msg := "invalid or missing API key; pass a Delos virtual key as a Bearer token or x-api-key header"
+	if errors.Is(err, ErrKeyStoreUnavailable) {
+		status, code, anthCode = http.StatusServiceUnavailable, "key_store_unavailable", "api_error"
+		msg = "could not verify the API key: the key store is unavailable; retry shortly"
+		s.logger.ErrorContext(r.Context(), "key verification unavailable", "error", err)
+	}
+	if anthSurface {
+		s.writeAnthropicError(w, r, status, anthCode, msg)
+	} else {
+		s.writeOpenAIError(w, r, status, code, msg)
+	}
 }
 
 // budgetError describes why a request was refused before reaching a provider.
@@ -153,8 +170,15 @@ func budgetStatus(be *budgetError) int {
 // recordUsage adds a completed request's consumption to the key's month and
 // releases the reservation that admitted it. The reservation is released after
 // the write, so the key is never momentarily unaccounted for.
+//
+// Bifrost-governance keys are skipped: their usage is charged by Bifrost's
+// governance store, not the legacy Delos ledger (which is keyed by legacy dk_
+// key IDs).
 func (s *HTTPServer) recordUsage(ctx context.Context, key *VirtualKey, usage Usage) {
 	if key == nil || s.keyStore == nil {
+		return
+	}
+	if s.bifrostKeys != nil && useBifrostPath() {
 		return
 	}
 	total := usage.withDerivedTotals()

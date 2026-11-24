@@ -39,6 +39,17 @@ const (
 	GenAIUsageInputTokens  = "gen_ai.usage.input_tokens"
 	GenAIUsageOutputTokens = "gen_ai.usage.output_tokens"
 
+	// Cache-token usage attributes. These follow the current (pre-stable)
+	// GenAI semantic conventions' flat namespace and match the attribute names
+	// Bifrost's otel connector emits, so spans from the Bifrost path join the
+	// same queries as the Delos translator spans.
+	GenAIUsageCacheReadInputTokens     = "gen_ai.usage.cache_read.input_tokens"
+	GenAIUsageCacheCreationInputTokens = "gen_ai.usage.cache_creation.input_tokens"
+
+	// GenAIConversationID is the session/conversation the request belongs to
+	// (gen_ai.conversation.id in the current GenAI semantic conventions).
+	GenAIConversationID = "gen_ai.conversation.id"
+
 	// Content attributes. These carry prompt and completion text and are
 	// only emitted when content capture is explicitly enabled.
 	GenAIPrompt     = "gen_ai.prompt"
@@ -62,4 +73,13 @@ const (
 	// DelosProviderAttempts counts provider attempts made before the
 	// request succeeded or finally failed.
 	DelosProviderAttempts = "delos.provider_attempts"
+	// DelosOrgID is the organisation the request's key belongs to
+	// (stamped from the key's metadata in D2).
+	DelosOrgID = "delos.org_id"
+	// DelosSubject is the subject (user/principal) the request's key acts for
+	// (stamped from the key's metadata in D2).
+	DelosSubject = "delos.subject"
+	// DelosLabels carries the key's labels as a JSON object (stamped from the
+	// key's metadata in D2).
+	DelosLabels = "delos.labels"
 )
