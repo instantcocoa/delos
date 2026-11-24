@@ -172,13 +172,18 @@ func Run() error {
 	// store keeps the API working in dev mode.
 	keyStore := runtime.KeyServiceStore(runtime.NewMemoryKeyServiceStore())
 	if db != nil {
+		bifrostDB := os.Getenv("DELOS_BIFROST_DB_NAME")
+		if bifrostDB == "" {
+			bifrostDB = cfg.DBName + "_bifrost"
+		}
 		keyStore, err = runtime.OpenKeyServiceStore(ctx, db.DB, runtime.BifrostDBConfig{
-			Host:     cfg.DBHost,
-			Port:     strconv.Itoa(cfg.DBPort),
-			User:     cfg.DBUser,
-			Password: cfg.DBPassword,
-			DBName:   cfg.DBName,
-			SSLMode:  cfg.DBSSLMode,
+			Host:          cfg.DBHost,
+			Port:          strconv.Itoa(cfg.DBPort),
+			User:          cfg.DBUser,
+			Password:      cfg.DBPassword,
+			DBName:        cfg.DBName,
+			SSLMode:       cfg.DBSSLMode,
+			BifrostDBName: bifrostDB,
 		}, logger)
 		if err != nil {
 			return fmt.Errorf("failed to open key store: %w", err)

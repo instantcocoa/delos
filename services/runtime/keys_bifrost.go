@@ -168,14 +168,17 @@ func NewBifrostKeyStore(cs configstore.ConfigStore) *BifrostKeyStore {
 func (s *BifrostKeyStore) ConfigStore() configstore.ConfigStore { return s.cs }
 
 // BifrostDBConfig is the Postgres target for the Bifrost config store. The
-// control plane reuses the same DELOS_DB_* values it already connects with.
+// control plane reuses the same DELOS_DB_* values it already connects with,
+// but the Bifrost config store lives in its own database so Bifrost's own
+// migrations (prompt repos and the like) cannot collide with Delos's tables.
 type BifrostDBConfig struct {
-	Host     string
-	Port     string
-	User     string
-	Password string
-	DBName   string
-	SSLMode  string
+	Host          string
+	Port          string
+	User          string
+	Password      string
+	DBName        string
+	SSLMode       string
+	BifrostDBName string // defaults to DBName + "_bifrost" when empty
 }
 
 // OpenBifrostKeyStore opens Bifrost's Postgres config store (running Bifrost's
@@ -183,12 +186,16 @@ type BifrostDBConfig struct {
 // migrations (003) are applied by the caller once Bifrost's tables exist; see
 // OpenKeyServiceStore.
 func OpenBifrostKeyStore(ctx context.Context, cfg BifrostDBConfig, logger *slog.Logger) (*BifrostKeyStore, error) {
+	bifrostDB := cfg.BifrostDBName
+	if bifrostDB == "" {
+		bifrostDB = cfg.DBName + "_bifrost"
+	}
 	pc := &postgresconn.Config{
 		Host:     schemas.NewSecretVar(cfg.Host),
 		Port:     schemas.NewSecretVar(cfg.Port),
 		User:     schemas.NewSecretVar(cfg.User),
 		Password: schemas.NewSecretVar(cfg.Password),
-		DBName:   schemas.NewSecretVar(cfg.DBName),
+		DBName:   schemas.NewSecretVar(bifrostDB),
 		SSLMode:  schemas.NewSecretVar(cfg.SSLMode),
 	}
 	csCfg := &configstore.Config{
